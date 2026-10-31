@@ -1,0 +1,26 @@
+{
+  "name": "color-mix-lab",
+  "private": true,
+  "version": "0.8.4",
+  "type": "module",
+  "license": "SEE LICENSE IN ../LICENSE.md",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "jszip": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "three": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.184.1",
+    "vitest": "^5.0.1"
+  },
+  "description": "규로마 계산 엔진 — Color Mix Lab(MIT)에서 갈라져 나온 부분과 규로마가 더한 부분"
+}

@@ -1,0 +1,14 @@
+{
+  "name": "gyuroma",
+  "private": true,
+  "workspaces": [
+    "color-mix-lab",
+    "rodin-pipeline"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace rodin-pipeline",
+    "test": "npm test --workspace color-mix-lab",
+    "dev:pipeline": "npm run dev --workspace rodin-pipeline",
+    "start": "npm run start --workspace rodin-pipeline"
+  }
+}
