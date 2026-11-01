@@ -337,6 +337,152 @@ export function highlightGeometry(model: MeshModel, mask: Uint8Array, normals?: 
   return { fill, fillNormals, edges, edgeNormals, edgeInside, faceCount };
 }
 
+/** The faces cut along the border lines, as the result view shows them (@core/borderCut's BorderCut). */
+export interface HighlightCut {
+  addedVertices: Float64Array;
+  pieces: Int32Array;
+  pieceGroups: Int32Array;
+  pieceFaces: Int32Array;
+  replaced: Int32Array;
+}
+
+/** Per cut: which faces it replaces, and a normal for each added vertex (one of its piece's own corners). */
+const cutLookup = new WeakMap<HighlightCut, { replaced: Uint8Array; addedNormalFrom: Int32Array }>();
+function lookupOf(cut: HighlightCut, faceCount: number, vertexCount: number) {
+  const known = cutLookup.get(cut);
+  if (known && known.replaced.length === faceCount) return known;
+  const replaced = new Uint8Array(faceCount);
+  for (const f of cut.replaced) replaced[f] = 1;
+  const addedNormalFrom = new Int32Array(cut.addedVertices.length / 3).fill(-1);
+  for (let p = 0; p < cut.pieceGroups.length; p++) {
+    let own = -1;
+    for (let k = 0; k < 3; k++) if (cut.pieces[p * 3 + k] < vertexCount) own = cut.pieces[p * 3 + k];
+    if (own < 0) continue;
+    for (let k = 0; k < 3; k++) {
+      const v = cut.pieces[p * 3 + k] - vertexCount;
+      if (v >= 0 && addedNormalFrom[v] < 0) addedNormalFrom[v] = own;
+    }
+  }
+  const out = { replaced, addedNormalFrom };
+  cutLookup.set(cut, out);
+  return out;
+}
+
+/**
+ * highlightGeometry for a model shown cut along its border lines: the faces
+ * the cut replaces are their pieces, so the outline runs along the line, as
+ * the colours do.  A piece belongs to the region when its group is one of the
+ * region's and its face is in the region or touches it (the line gave it a
+ * piece of the face next door).
+ */
+export function highlightGeometryCut(model: MeshModel, mask: Uint8Array, cut: HighlightCut, labels: ArrayLike<number>, normals?: Float32Array): HighlightGeometry {
+  const { offsets, faces, triangles, positions } = vertexFaces(model);
+  const vertexCount = model.vertices.length;
+  const faceCount = model.triangles.length;
+  const { replaced, addedNormalFrom } = lookupOf(cut, faceCount, vertexCount);
+  const added = cut.addedVertices;
+  const groups = new Set<number>();
+  for (let f = 0; f < mask.length; f++) if (mask[f]) groups.add(labels[f]);
+  const touches = (face: number) => {
+    for (let k = 0; k < 3; k++) {
+      const v = triangles[face * 3 + k];
+      for (let j = offsets[v]; j < offsets[v + 1]; j++) if (mask[faces[j]]) return true;
+    }
+    return false;
+  };
+  const kept: number[] = [];
+  for (let p = 0; p < cut.pieceGroups.length; p++) {
+    const parent = cut.pieceFaces[p];
+    if (groups.has(cut.pieceGroups[p]) && (mask[parent] || touches(parent))) kept.push(p);
+  }
+  let whole = 0;
+  for (let f = 0; f < mask.length; f++) if (mask[f] && !replaced[f]) whole++;
+  const count = whole + kept.length;
+  const fill = new Float32Array(count * 9);
+  const fillNormals = new Float32Array(count * 9);
+  const point = (v: number, out: Float32Array, at: number) => {
+    if (v < vertexCount) {
+      out[at] = positions[v * 3];
+      out[at + 1] = positions[v * 3 + 1];
+      out[at + 2] = positions[v * 3 + 2];
+    } else {
+      const a = (v - vertexCount) * 3;
+      out[at] = added[a];
+      out[at + 1] = added[a + 1];
+      out[at + 2] = added[a + 2];
+    }
+  };
+  const normalOf = (v: number, out: Float32Array, at: number) => {
+    if (!normals) return;
+    const from = v < vertexCount ? v : addedNormalFrom[v - vertexCount];
+    if (from < 0) return;
+    out[at] = normals[from * 3];
+    out[at + 1] = normals[from * 3 + 1];
+    out[at + 2] = normals[from * 3 + 2];
+  };
+  // Edges found once by the whole faces (their neighbour across was cut) or by a
+  // piece: shared by two in the region = inside, found once = the outline.
+  const total = vertexCount + added.length / 3;
+  const near = new Map<number, number>(); // edge key → its entry in `pending`, -1 once seen twice
+  const pending: number[] = []; // a, b, inside corner
+  const boundary: number[] = [];
+  const meet = (a: number, b: number, c: number) => {
+    const key = a < b ? a * total + b : b * total + a;
+    const at = near.get(key);
+    if (at === undefined) {
+      near.set(key, pending.length);
+      pending.push(a, b, c);
+    } else near.set(key, -1);
+  };
+  let p = 0;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i] || replaced[i]) continue;
+    for (let k = 0; k < 3; k++) {
+      const a = triangles[i * 3 + k];
+      normalOf(a, fillNormals, p);
+      point(a, fill, p);
+      p += 3;
+      const b = triangles[i * 3 + ((k + 1) % 3)];
+      const c = triangles[i * 3 + ((k + 2) % 3)];
+      if (a === b) continue;
+      let shared = false;
+      let cutNext = false;
+      for (let j = offsets[a]; j < offsets[a + 1]; j++) {
+        const g = faces[j];
+        if (g === i) continue;
+        if (triangles[g * 3] !== b && triangles[g * 3 + 1] !== b && triangles[g * 3 + 2] !== b) continue;
+        if (replaced[g]) cutNext = true;
+        else if (mask[g]) shared = true;
+      }
+      if (shared) continue;
+      if (cutNext) meet(a, b, c);
+      else boundary.push(a, b, c);
+    }
+  }
+  for (const q of kept) {
+    for (let k = 0; k < 3; k++) {
+      const a = cut.pieces[q * 3 + k];
+      normalOf(a, fillNormals, p);
+      point(a, fill, p);
+      p += 3;
+      meet(a, cut.pieces[q * 3 + ((k + 1) % 3)], cut.pieces[q * 3 + ((k + 2) % 3)]);
+    }
+  }
+  for (const at of near.values()) if (at >= 0) boundary.push(pending[at], pending[at + 1], pending[at + 2]);
+  const edgeCount = boundary.length / 3;
+  const edges = new Float32Array(edgeCount * 6);
+  const edgeNormals = new Float32Array(edgeCount * 6);
+  const edgeInside = new Float32Array(edgeCount * 3);
+  for (let n = 0; n < edgeCount; n++) {
+    point(boundary[n * 3 + 2], edgeInside, n * 3);
+    point(boundary[n * 3], edges, n * 6);
+    point(boundary[n * 3 + 1], edges, n * 6 + 3);
+    normalOf(boundary[n * 3], edgeNormals, n * 6);
+    normalOf(boundary[n * 3 + 1], edgeNormals, n * 6 + 3);
+  }
+  return { fill, fillNormals, edges, edgeNormals, edgeInside, faceCount: count };
+}
+
 /** Faces connected to `start` (sharing vertices) that carry the same label. */
 export function sameLabelComponent(
   adjacencyOffsets: Int32Array,

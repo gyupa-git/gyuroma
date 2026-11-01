@@ -175,3 +175,49 @@ export function connectedComponentsOfSubset(
   }
   return { componentOf, componentSizes: Int32Array.from(sizes), count };
 }
+
+/**
+ * Faces adjacent across a side (two shared vertices): at most three per face,
+ * a fraction of the memory of `buildFaceAdjacency` on a large mesh.  Takes the
+ * corners flat (3 vertex indices per face).
+ */
+export function buildEdgeAdjacency(corners: Int32Array, vertexCount: number): FaceAdjacency {
+  const faceCount = corners.length / 3;
+  // Faces at each vertex.
+  const start = new Int32Array(vertexCount + 1);
+  for (let c = 0; c < corners.length; c++) start[corners[c] + 1]++;
+  for (let v = 0; v < vertexCount; v++) start[v + 1] += start[v];
+  const fill = start.slice(0, vertexCount);
+  const facesAt = new Int32Array(corners.length);
+  for (let c = 0; c < corners.length; c++) facesAt[fill[corners[c]]++] = (c / 3) | 0;
+  // Every face sharing a side, however many (a side three faces share — a fin, a face
+  // doubled back — has them all, or a cut through it would leave one face uncut).
+  const stamp = new Int32Array(faceCount).fill(-1);
+  const each = (f: number, take: (n: number) => void) => {
+    for (let k = 0; k < 3; k++) {
+      const u = corners[f * 3 + k];
+      const v = corners[f * 3 + ((k + 1) % 3)];
+      for (let i = start[u]; i < start[u + 1]; i++) {
+        const n = facesAt[i];
+        if (n === f || stamp[n] === f) continue;
+        const a = corners[n * 3], b = corners[n * 3 + 1], c = corners[n * 3 + 2];
+        if (a !== v && b !== v && c !== v) continue;
+        stamp[n] = f;
+        take(n);
+      }
+    }
+  };
+  const offsets = new Int32Array(faceCount + 1);
+  for (let f = 0; f < faceCount; f++) {
+    let count = 0;
+    each(f, () => count++);
+    offsets[f + 1] = offsets[f] + count;
+  }
+  stamp.fill(-1);
+  const neighbours = new Int32Array(offsets[faceCount]);
+  for (let f = 0; f < faceCount; f++) {
+    let at = offsets[f];
+    each(f, (n) => (neighbours[at++] = n));
+  }
+  return { faceCount, offsets, neighbours };
+}

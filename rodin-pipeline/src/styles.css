@@ -1006,3 +1006,30 @@ mark.hl { background: #ffe066; color: #1b1b1d; border-radius: 3px; padding: 0 3p
   .gather-side { overflow: visible; }
 }
 .gather-joined { display: flex; flex-direction: column; gap: 4px; }
+
+/* "✂ 자르기 확정" beside the cut-along-the-line toggle. */
+.stage-toolbar .cut-confirm { height: 26px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--raised); color: var(--text); font-size: 12px; white-space: nowrap; cursor: pointer; }
+.stage-toolbar .cut-confirm:hover:not(:disabled) { border-color: var(--iris-300); }
+.stage-toolbar .cut-confirm:disabled { opacity: 0.45; cursor: default; }
+
+/* Gyupa's face turning: the one sign the app is working (ui/GyupaLoader.tsx); after five seconds its eyes spin too.
+   The pointer stays the plain arrow meanwhile — no spinning wheel of its own, no "not allowed" over the buttons waiting. */
+body.is-busy, body.is-busy * { cursor: default !important; }
+.gyupa-loader { position: absolute; left: 50%; top: 50%; z-index: 20; transform: translate(-50%, -50%); display: inline-flex; align-items: center; gap: 10px; padding: 9px 16px 9px 10px; border-radius: 999px; background: rgba(23, 23, 26, 0.86); border: 1px solid var(--border-strong); color: var(--text); font-size: 13px; pointer-events: none; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35); animation: gyupa-loader-in 0.2s ease-out both; }
+.gyupa-spin { position: relative; display: inline-block; flex: 0 0 auto; color: var(--text); }
+.gyupa-spin-face { position: absolute; inset: 0; display: block; will-change: transform; animation: gyupa-face-turn 1.1s linear infinite; }
+.gyupa-spin-face > svg { display: block; overflow: visible; }
+/* Five seconds in, the eyes turn into swirls that spin (dizzy) — at once, no fading; delays in CSS, so a busy page does not hold them up. */
+.gyupa-spin-eye { position: absolute; display: block; animation: gyupa-fade-out 0.01s steps(1, start) 5s forwards; }
+.gyupa-spin-swirl { position: absolute; display: block; opacity: 0; will-change: transform, opacity; animation: gyupa-fade-in 0.01s steps(1, start) 5s forwards, gyupa-eye-spin 0.7s linear 5s infinite; }
+span + span > .gyupa-spin-swirl { animation-direction: normal, reverse; }
+.gyupa-spin-swirl > svg { display: block; overflow: visible; }
+.gyupa-spin-eye > svg { display: block; overflow: visible; }
+@keyframes gyupa-face-turn { to { transform: rotate(360deg); } }
+@keyframes gyupa-eye-spin { to { transform: rotate(360deg); } }
+@keyframes gyupa-fade-out { to { opacity: 0; } }
+@keyframes gyupa-fade-in { to { opacity: 1; } }
+@keyframes gyupa-loader-in { from { opacity: 0; transform: translate(-50%, -50%) scale(0.92); } }
+@media (prefers-reduced-motion: reduce) {
+  .gyupa-spin-face, .gyupa-spin-eye, .gyupa-spin-swirl { animation: none; }
+}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { GyupaWaiting } from "./GyupaLoader";
 import { TIDY_CONSULT_PRESETS, TIDY_PRESETS, type ChangeLine, type TidyConsultPreset, type TidyLogEntry, type TidyPreset, type TidyScope } from "../engine/tidy";
 import type { TidyArea } from "../engine/tidyArea";
 import type { AiRoute, KeyUsage } from "../engine/aiClient";
@@ -346,7 +347,7 @@ export function TidyPanel({
                     ))}
                     {busy && (
                       <div className="tidy-msg working">
-                        <span className="spinner" aria-hidden="true" />
+                        <GyupaWaiting />
                         <span>
                           {busy} · {t("tidy.seconds", { n: elapsed })}
                         </span>

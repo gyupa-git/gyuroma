@@ -83,6 +83,12 @@ export interface ExportSettings {
   includePrinterConfig: boolean;
   /** Quality preset written into the exported printer config; null keeps the template's. */
   printPreset: "finest" | "high" | "normal" | "fast" | "draft" | null;
+  /**
+   * Faces along the colour borders cut along a smooth line through the border
+   * (@core/borderCut), shown so while working and written so: the window of
+   * that line in border edges; 0 = off (the faces as they are).
+   */
+  cutSpan: number;
 }
 
 /** Per palette colour (keyed by hex) merge decisions. */
@@ -147,6 +153,9 @@ export const FILAMENT_PRESETS: Array<{ name: string; hex: string[]; label: strin
 /** Export height used when nothing else is set; see export.targetHeight below. */
 export const DEFAULT_TARGET_HEIGHT = 70;
 
+/** The line's window when cutting along the borders is on (border edges): stairs shorter than this straighten. */
+export const CUT_SPAN = 16;
+
 export const DEFAULT_SETTINGS: PipelineSettings = {
   version: 1,
   filamentList: [],
@@ -206,6 +215,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     defaultExtruder: 1,
     includePrinterConfig: false,
     printPreset: null,
+    cutSpan: CUT_SPAN,
   },
   mergeFlags: {},
   manualPhysical: {},

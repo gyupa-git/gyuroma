@@ -38,21 +38,56 @@ export interface BorderLineOptions {
   span: number;
   /** 1 for groups whose borders stay as they are. */
   protectedGroup: Uint8Array;
+  /**
+   * Each face's group (any number standing for it) when the mesh was last cut
+   * along the lines (borderCut, confirmed).  A side that was a border then was
+   * cut along the line then: it is the line already, and stays — whatever the
+   * colours on either side have become since.  Omitted: every border is drawn afresh.
+   */
+  settled?: ArrayLike<number>;
 }
 
 /** Below this, the edges walked around a point (their directions summed, over their length) turn back on themselves. */
 const FOLD = 0.35;
 
-export function smoothBorderLines(
+/** The line drawn along the borders (steps 1 and 2), for the faces to be measured against. */
+export interface BorderLineTrace {
+  /** Mean length of a border edge. */
+  edgeLength: number;
+  /** How far a point of the line may lie from the border it was drawn from. */
+  maxMove: number;
+  /** The border edges: from vertex eu to ev, the lower group (eLeft) on the left, from face eFace. */
+  eu: number[];
+  ev: number[];
+  eLeft: number[];
+  eRight: number[];
+  eFace: number[];
+  /** The face on the other side of each border edge. */
+  eAcross: number[];
+  /** The border point at each end of an edge (an index into the per-point arrays). */
+  slotA: Int32Array;
+  slotB: Int32Array;
+  /** Per border point (x, y, z each): where the line passes it, and across the border towards the lower group. */
+  line: Float64Array;
+  across: Float64Array;
+  /** 1 where the line stays on the border itself (and `across` is not set). */
+  stays: Uint8Array;
+  /** 1 for faces with a side on a border. */
+  borderFace: Uint8Array;
+}
+
+export function traceBorderLine(
   adjacency: FaceAdjacency,
-  triangles: ArrayLike<Tri>,
-  vertices: ArrayLike<Vec3>,
+  triangles: MeshFaces,
+  vertices: MeshPoints,
   groups: Int32Array,
   options: BorderLineOptions,
-): number {
+): BorderLineTrace | null {
   const span = Math.max(0, options.span);
-  if (span === 0) return 0;
+  if (span === 0) return null;
   const { offsets, neighbours, faceCount } = adjacency;
+  const corners = flatCorners(triangles);
+  const positions = flatPositions(vertices);
   const isProtected = (group: number) => options.protectedGroup[group] === 1;
 
   // 1) Border edges.
@@ -61,21 +96,21 @@ export function smoothBorderLines(
   const eLeft: number[] = [];
   const eRight: number[] = [];
   const eFace: number[] = [];
+  const eAcross: number[] = [];
   const borderFace = new Uint8Array(faceCount);
   for (let f = 0; f < faceCount; f++) {
     const own = groups[f];
     let foreign = false;
     for (let i = offsets[f]; i < offsets[f + 1] && !foreign; i++) foreign = groups[neighbours[i]] !== own;
     if (!foreign) continue;
-    const t = triangles[f];
     for (let k = 0; k < 3; k++) {
-      const u = t[k];
-      const v = t[(k + 1) % 3];
+      const u = corners[f * 3 + k];
+      const v = corners[f * 3 + ((k + 1) % 3)];
       let across = -1;
       for (let i = offsets[f]; i < offsets[f + 1]; i++) {
         const n = neighbours[i];
-        const s = triangles[n];
-        if ((s[0] === u || s[1] === u || s[2] === u) && (s[0] === v || s[1] === v || s[2] === v)) {
+        const s0 = corners[n * 3], s1 = corners[n * 3 + 1], s2 = corners[n * 3 + 2];
+        if ((s0 === u || s1 === u || s2 === u) && (s0 === v || s1 === v || s2 === v)) {
           across = n;
           break;
         }
@@ -97,10 +132,11 @@ export function smoothBorderLines(
         eRight.push(own);
       }
       eFace.push(f);
+      eAcross.push(across);
     }
   }
   const edgeCount = eu.length;
-  if (edgeCount === 0) return 0;
+  if (edgeCount === 0) return null;
 
   // The border points, numbered, and the edges at each (in flat arrays: this runs on millions of faces).
   const slot = new Map<number, number>();
@@ -138,16 +174,27 @@ export function smoothBorderLines(
   let edgeLength = 0;
   for (let e = 0; e < edgeCount; e++) {
     pair[e] = eLeft[e] * 65536 + eRight[e];
-    const p = vertices[eu[e]];
-    const q = vertices[ev[e]];
-    lengthOf[e] = Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]);
+    const p = eu[e] * 3;
+    const q = ev[e] * 3;
+    lengthOf[e] = Math.hypot(positions[q] - positions[p], positions[q + 1] - positions[p + 1], positions[q + 2] - positions[p + 2]);
     edgeLength += lengthOf[e];
   }
   edgeLength /= edgeCount;
   const half = (span * edgeLength) / 2;
   const maxMove = Math.max(2, span / 4) * edgeLength;
 
-  // A point moves when its border edges are all of one unprotected pair and as many come in as go out.
+  // Settled: every border edge at the point was a border already when the mesh was last cut.
+  const settled = options.settled;
+  const settledAt = (s: number) => {
+    if (!settled) return false;
+    for (let k = edgeStart[s]; k < edgeStart[s + 1]; k++) {
+      const e = edgeList[k];
+      if (settled[eFace[e]] === settled[eAcross[e]]) return false;
+    }
+    return true;
+  };
+  // A point moves when its border edges are all of one unprotected pair and as many come in as go out
+  // (and they are not settled).
   const moves = new Uint8Array(count);
   for (let s = 0; s < count; s++) {
     let balance = 0;
@@ -158,10 +205,10 @@ export function smoothBorderLines(
       balance += slotA[e] === s ? 1 : -1;
       if (pair[e] !== p0) one = false;
     }
-    if (balance === 0 && one && !isProtected(Math.floor(p0 / 65536)) && !isProtected(p0 % 65536)) moves[s] = 1;
+    if (balance === 0 && one && !isProtected(Math.floor(p0 / 65536)) && !isProtected(p0 % 65536) && !settledAt(s)) moves[s] = 1;
   }
   const pos = new Float64Array(count * 3);
-  for (let s = 0; s < count; s++) pos.set(vertices[at[s]], s * 3);
+  for (let s = 0; s < count; s++) for (let c = 0; c < 3; c++) pos[s * 3 + c] = positions[at[s] * 3 + c];
   // A border shorter than two windows all round (a small island, a short stretch between
   // corners where three groups meet) cannot tell an even bend from a jagged one: it stays,
   // left to the teeth trim and the island cleanup.
@@ -217,11 +264,11 @@ export function smoothBorderLines(
         if (pair[e] !== p0) continue;
         if (edgeSeen[e] !== walkStamp) {
           edgeSeen[e] = walkStamp;
-          const p = vertices[eu[e]];
-          const q = vertices[ev[e]];
-          vx += q[0] - p[0];
-          vy += q[1] - p[1];
-          vz += q[2] - p[2];
+          const p = eu[e] * 3;
+          const q = ev[e] * 3;
+          vx += positions[q] - positions[p];
+          vy += positions[q + 1] - positions[p + 1];
+          vz += positions[q + 2] - positions[p + 2];
           walked += lengthOf[e];
         }
         const b = slotA[e] === a ? slotB[e] : slotA[e];
@@ -246,8 +293,7 @@ export function smoothBorderLines(
   const normalAt = new Float64Array(count * 3);
   for (let s = 0; s < count; s++) {
     for (let k = edgeStart[s]; k < edgeStart[s + 1]; k++) {
-      const t = triangles[eFace[edgeList[k]]];
-      const n = faceNormal(vertices[t[0]], vertices[t[1]], vertices[t[2]]);
+      const n = faceNormalAt(corners, positions, eFace[edgeList[k]]);
       normalAt[s * 3] += n[0];
       normalAt[s * 3 + 1] += n[1];
       normalAt[s * 3 + 2] += n[2];
@@ -310,6 +356,24 @@ export function smoothBorderLines(
     line[s * 3 + 1] = pos[s * 3 + 1] + move * across[s * 3 + 1];
     line[s * 3 + 2] = pos[s * 3 + 2] + move * across[s * 3 + 2];
   }
+  return { edgeLength, maxMove, eu, ev, eLeft, eRight, eFace, eAcross, slotA, slotB, line, across, stays, borderFace };
+}
+
+export function smoothBorderLines(
+  adjacency: FaceAdjacency,
+  triangles: MeshFaces,
+  vertices: MeshPoints,
+  groups: Int32Array,
+  options: BorderLineOptions,
+): number {
+  const corners = flatCorners(triangles);
+  const positions = flatPositions(vertices);
+  const trace = traceBorderLine(adjacency, corners, positions, groups, options);
+  if (!trace) return 0;
+  const { offsets, neighbours, faceCount } = adjacency;
+  const isProtected = (group: number) => options.protectedGroup[group] === 1;
+  const { edgeLength, maxMove, eu, eLeft, eRight, eFace, slotA, slotB, line, borderFace } = trace;
+  const edgeCount = eu.length;
 
   // The stretches of line, with the normal of the face each came from, in a grid of cells.
   const ax = new Float64Array(edgeCount * 3);
@@ -318,8 +382,7 @@ export function smoothBorderLines(
   for (let e = 0; e < edgeCount; e++) {
     ax.set(line.subarray(slotA[e] * 3, slotA[e] * 3 + 3), e * 3);
     bx.set(line.subarray(slotB[e] * 3, slotB[e] * 3 + 3), e * 3);
-    const t = triangles[eFace[e]];
-    nx.set(faceNormal(vertices[t[0]], vertices[t[1]], vertices[t[2]]), e * 3);
+    nx.set(faceNormalAt(corners, positions, eFace[e]), e * 3);
   }
   // Faces change only this near the border: no further than a point of the line can move.
   const reach = maxMove + edgeLength;
@@ -371,13 +434,12 @@ export function smoothBorderLines(
   band.forEach((f, index) => {
     const own = groups[f];
     if (isProtected(own)) return;
-    const t = triangles[f];
-    const p = vertices[t[0]];
-    const q = vertices[t[1]];
-    const r = vertices[t[2]];
-    const cx = (p[0] + q[0] + r[0]) / 3;
-    const cy = (p[1] + q[1] + r[1]) / 3;
-    const cz = (p[2] + q[2] + r[2]) / 3;
+    const a = corners[f * 3] * 3;
+    const b = corners[f * 3 + 1] * 3;
+    const c = corners[f * 3 + 2] * 3;
+    const cx = (positions[a] + positions[b] + positions[c]) / 3;
+    const cy = (positions[a + 1] + positions[b + 1] + positions[c + 1]) / 3;
+    const cz = (positions[a + 2] + positions[b + 2] + positions[c + 2]) / 3;
     const ix = Math.floor(cx / cell);
     const iy = Math.floor(cy / cell);
     const iz = Math.floor(cz / cell);
@@ -441,9 +503,46 @@ export function smoothBorderLines(
   return changed;
 }
 
-function faceNormal(a: Vec3, b: Vec3, c: Vec3): [number, number, number] {
-  const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
-  const vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+/** A mesh's faces: as corner triples, or flat (3 vertex indices per face). */
+export type MeshFaces = ArrayLike<Tri> | Int32Array;
+/** A mesh's vertices: as points, or flat (x, y, z per vertex). */
+export type MeshPoints = ArrayLike<Vec3> | Float64Array | Float32Array;
+
+/** The faces' corners as one flat array (as given when they already are). */
+export function flatCorners(triangles: MeshFaces): Int32Array {
+  if (ArrayBuffer.isView(triangles)) return triangles as Int32Array;
+  const list = triangles as ArrayLike<Tri>;
+  const out = new Int32Array(list.length * 3);
+  for (let f = 0; f < list.length; f++) {
+    const t = list[f];
+    out[f * 3] = t[0];
+    out[f * 3 + 1] = t[1];
+    out[f * 3 + 2] = t[2];
+  }
+  return out;
+}
+
+/** The vertices as one flat array (as given when they already are). */
+export function flatPositions(vertices: MeshPoints): Float64Array | Float32Array {
+  if (ArrayBuffer.isView(vertices)) return vertices as Float64Array | Float32Array;
+  const list = vertices as ArrayLike<Vec3>;
+  const out = new Float64Array(list.length * 3);
+  for (let v = 0; v < list.length; v++) {
+    const p = list[v];
+    out[v * 3] = p[0];
+    out[v * 3 + 1] = p[1];
+    out[v * 3 + 2] = p[2];
+  }
+  return out;
+}
+
+/** The unit normal of face f. */
+export function faceNormalAt(corners: ArrayLike<number>, positions: ArrayLike<number>, f: number): [number, number, number] {
+  const a = corners[f * 3] * 3;
+  const b = corners[f * 3 + 1] * 3;
+  const c = corners[f * 3 + 2] * 3;
+  const ux = positions[b] - positions[a], uy = positions[b + 1] - positions[a + 1], uz = positions[b + 2] - positions[a + 2];
+  const vx = positions[c] - positions[a], vy = positions[c + 1] - positions[a + 1], vz = positions[c + 2] - positions[a + 2];
   const x = uy * vz - uz * vy;
   const y = uz * vx - ux * vz;
   const z = ux * vy - uy * vx;

@@ -162,6 +162,7 @@ export async function idbDelete(key: string): Promise<void> {
 
 export const WORK_FILE_KEY = "work-file";
 export const WORK_COLOURS_KEY = "work-colours";
+export const WORK_CUTS_KEY = "work-cuts";
 
 export interface StoredWorkFile {
   /** Original file name, e.g. "typhoeus.3mf". */
@@ -180,6 +181,81 @@ export interface StoredWorkColours {
   /** 3 bytes per face, in face order. */
   colours: Uint8Array;
   savedAt: number;
+  /** How many of the stored cuts (StoredWorkCuts) the mesh these colours belong to was cut with; 0 or absent = the file as it is. */
+  cuts?: number;
+}
+
+/**
+ * One confirmed cut along the colour borders (@core/borderCut), as made on the
+ * mesh before it: enough to make it again, exactly, with meshWithCut.
+ */
+export interface StoredCut {
+  /** Faces and vertices of the mesh the cut was made on. */
+  faces: number;
+  vertices: number;
+  addedVertices: Float64Array;
+  pieces: Int32Array;
+  pieceGroups: Int32Array;
+  pieceFaces: Int32Array;
+  replaced: Int32Array;
+  /**
+   * Each face's group colour right after this cut (packRuns): the borders then
+   * were cut along their line, and are not cut again (borderCut `settled`).
+   */
+  settled?: Uint8Array;
+}
+
+/**
+ * The confirmed cuts of the stored work file, in the order they were made.
+ * The colours record says how many of them its mesh was cut with (undone
+ * cuts can stay at the end, unused).
+ */
+export interface StoredWorkCuts {
+  /** The work file they were made on. */
+  fileName: string;
+  cuts: StoredCut[];
+  savedAt: number;
+}
+
+/** 3 bytes a face, as runs of one colour: [count (4 bytes), r, g, b] each — a few runs where a mesh's faces go in order. */
+export function packRuns(rgb: Uint8Array): Uint8Array {
+  const runs: number[] = [];
+  for (let f = 0; f < rgb.length; f += 3) {
+    const n = runs.length;
+    if (n > 0 && runs[n - 3] === rgb[f] && runs[n - 2] === rgb[f + 1] && runs[n - 1] === rgb[f + 2]) runs[n - 4]++;
+    else runs.push(1, rgb[f], rgb[f + 1], rgb[f + 2]);
+  }
+  const out = new Uint8Array((runs.length / 4) * 7);
+  const view = new DataView(out.buffer);
+  for (let r = 0; r < runs.length / 4; r++) {
+    view.setUint32(r * 7, runs[r * 4], true);
+    out[r * 7 + 4] = runs[r * 4 + 1];
+    out[r * 7 + 5] = runs[r * 4 + 2];
+    out[r * 7 + 6] = runs[r * 4 + 3];
+  }
+  return out;
+}
+
+/** packRuns back to 3 bytes a face; null when it does not make `faceCount` faces. */
+export function unpackRuns(runs: Uint8Array, faceCount: number): Uint8Array | null {
+  if (runs.length % 7 !== 0) return null;
+  const out = new Uint8Array(faceCount * 3);
+  const view = new DataView(runs.buffer, runs.byteOffset, runs.byteLength);
+  let f = 0;
+  for (let r = 0; r < runs.length; r += 7) {
+    const count = view.getUint32(r, true);
+    if (f + count > faceCount) return null;
+    for (let k = 0; k < count; k++, f++) {
+      out[f * 3] = runs[r + 4];
+      out[f * 3 + 1] = runs[r + 5];
+      out[f * 3 + 2] = runs[r + 6];
+    }
+  }
+  return f === faceCount ? out : null;
+}
+
+export function isStoredWorkCuts(value: unknown): value is StoredWorkCuts {
+  return isRecord(value) && typeof value.fileName === "string" && Array.isArray(value.cuts);
 }
 
 export function packColours(colours: ArrayLike<RGB>): Uint8Array {
@@ -214,7 +290,7 @@ export function isStoredWorkColours(value: unknown): value is StoredWorkColours 
 }
 
 export async function clearStoredWork(): Promise<void> {
-  await Promise.all([idbDelete(WORK_FILE_KEY), idbDelete(WORK_COLOURS_KEY)]);
+  await Promise.all([idbDelete(WORK_FILE_KEY), idbDelete(WORK_COLOURS_KEY), idbDelete(WORK_CUTS_KEY)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,8 +340,38 @@ function unpackRecord(buffer: ArrayBuffer): { header: Record<string, unknown>; p
   return { header, payload: bytes.slice(8 + headerLength) };
 }
 
-/** Serialises the records the app stores (template, work file, work colours). */
-function serialiseRecord(value: unknown): Uint8Array | null {
+/** Typed arrays one after another, each starting on 8 bytes (so a Float64Array can be read in place). */
+function packBlocks(blocks: ArrayBufferView[]): Uint8Array {
+  const padded = (n: number) => Math.ceil(n / 8) * 8;
+  const out = new Uint8Array(blocks.reduce((sum, b) => sum + padded(b.byteLength), 0));
+  let at = 0;
+  for (const b of blocks) {
+    out.set(new Uint8Array(b.buffer, b.byteOffset, b.byteLength), at);
+    at += padded(b.byteLength);
+  }
+  return out;
+}
+
+/** Serialises the records the app stores (template, work file, work colours, work cuts). */
+export function serialiseRecord(value: unknown): Uint8Array | null {
+  if (isStoredWorkCuts(value)) {
+    const blocks: ArrayBufferView[] = [];
+    for (const cut of value.cuts) blocks.push(cut.addedVertices, cut.pieces, cut.pieceGroups, cut.pieceFaces, cut.replaced, cut.settled ?? new Uint8Array(0));
+    const header = {
+      type: "work-cuts",
+      fileName: value.fileName,
+      savedAt: value.savedAt,
+      cuts: value.cuts.map((cut) => ({
+        faces: cut.faces,
+        vertices: cut.vertices,
+        added: cut.addedVertices.length,
+        pieces: cut.pieceGroups.length,
+        replaced: cut.replaced.length,
+        settled: cut.settled?.length ?? 0,
+      })),
+    };
+    return packRecord(header, packBlocks(blocks));
+  }
   if (isStoredWorkFile(value)) {
     const palette = value.palette ?? new Uint8Array(0);
     const payload = new Uint8Array(palette.length + value.buffer.byteLength);
@@ -274,7 +380,7 @@ function serialiseRecord(value: unknown): Uint8Array | null {
     return packRecord({ type: "work-file", name: value.name, kind: value.kind, savedAt: value.savedAt, paletteLength: palette.length }, payload);
   }
   if (isStoredWorkColours(value)) {
-    return packRecord({ type: "work-colours", faceCount: value.faceCount, savedAt: value.savedAt }, value.colours);
+    return packRecord({ type: "work-colours", faceCount: value.faceCount, savedAt: value.savedAt, cuts: value.cuts ?? 0 }, value.colours);
   }
   if (isRecord(value) && typeof value.name === "string" && value.buffer instanceof ArrayBuffer) {
     return packRecord({ type: "template", name: value.name }, new Uint8Array(value.buffer));
@@ -282,10 +388,31 @@ function serialiseRecord(value: unknown): Uint8Array | null {
   return null;
 }
 
-function deserialiseRecord(buffer: ArrayBuffer): unknown {
+export function deserialiseRecord(buffer: ArrayBuffer): unknown {
   const record = unpackRecord(buffer);
   if (!record) return null;
   const { header, payload } = record;
+  if (header.type === "work-cuts") {
+    // payload is a copy of its own (unpackRecord slices it), so its buffer starts at 0: views can be made in place.
+    let at = 0;
+    const take = <T extends ArrayBufferView>(make: (buffer: ArrayBuffer, offset: number, length: number) => T, count: number, size: number): T => {
+      const view = make(payload.buffer as ArrayBuffer, payload.byteOffset + at, count);
+      at += Math.ceil((count * size) / 8) * 8;
+      return view;
+    };
+    const metas = Array.isArray(header.cuts) ? (header.cuts as Array<Record<string, number>>) : [];
+    const cuts: StoredCut[] = metas.map((m) => {
+      const addedVertices = take((b, o, n) => new Float64Array(b, o, n), m.added, 8);
+      const pieces = take((b, o, n) => new Int32Array(b, o, n), m.pieces * 3, 4);
+      const pieceGroups = take((b, o, n) => new Int32Array(b, o, n), m.pieces, 4);
+      const pieceFaces = take((b, o, n) => new Int32Array(b, o, n), m.pieces, 4);
+      const replaced = take((b, o, n) => new Int32Array(b, o, n), m.replaced, 4);
+      const settled = take((b, o, n) => new Uint8Array(b, o, n), Number(m.settled) || 0, 1);
+      return { faces: m.faces, vertices: m.vertices, addedVertices, pieces, pieceGroups, pieceFaces, replaced, settled: settled.length > 0 ? settled : undefined };
+    });
+    const out: StoredWorkCuts = { fileName: String(header.fileName), cuts, savedAt: Number(header.savedAt) || 0 };
+    return out;
+  }
   if (header.type === "work-file") {
     const paletteLength = Number(header.paletteLength) || 0;
     const palette = paletteLength > 0 ? payload.slice(0, paletteLength) : undefined;
@@ -300,7 +427,7 @@ function deserialiseRecord(buffer: ArrayBuffer): unknown {
     return out;
   }
   if (header.type === "work-colours") {
-    const out: StoredWorkColours = { faceCount: Number(header.faceCount) || 0, colours: payload, savedAt: Number(header.savedAt) || 0 };
+    const out: StoredWorkColours = { faceCount: Number(header.faceCount) || 0, colours: payload, savedAt: Number(header.savedAt) || 0, cuts: Number(header.cuts) || 0 };
     return out;
   }
   if (header.type === "template") {
@@ -332,22 +459,48 @@ export async function dataGet<T>(key: string): Promise<T | null> {
   return idbGet<T>(key);
 }
 
-export async function dataSet(key: string, value: unknown): Promise<boolean> {
+/** Writes to one key go one after another: an older write must not land after a newer one. */
+const writing = new Map<string, Promise<unknown>>();
+
+export function dataSet(key: string, value: unknown): Promise<boolean> {
+  const previous = writing.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => writeRecord(key, value));
+  writing.set(key, next);
+  void next.finally(() => {
+    if (writing.get(key) === next) writing.delete(key);
+  });
+  return next;
+}
+
+async function writeRecord(key: string, value: unknown): Promise<boolean> {
   if (await localServerAvailable()) {
     const bytes = serialiseRecord(value);
     if (bytes) {
+      // With the server up it is the only place read from: a write that fails there
+      // has failed (the browser's store would never be read back).
       try {
         const res = await fetch(dataUrl(key), { method: "PUT", body: bytes.buffer as ArrayBuffer, headers: { "Content-Type": "application/octet-stream" } });
-        if (res.ok) return true;
+        return res.ok;
       } catch {
-        // fall through
+        return false;
       }
     }
   }
   return idbSet(key, value);
 }
 
-export async function dataDelete(key: string): Promise<void> {
+/** Deletes go in the same line as writes to their key: a delete must not overtake an older write still on its way. */
+export function dataDelete(key: string): Promise<void> {
+  const previous = writing.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => deleteRecord(key));
+  writing.set(key, next);
+  void next.finally(() => {
+    if (writing.get(key) === next) writing.delete(key);
+  });
+  return next;
+}
+
+async function deleteRecord(key: string): Promise<void> {
   if (await localServerAvailable()) {
     try {
       await fetch(dataUrl(key), { method: "DELETE" });
@@ -359,7 +512,7 @@ export async function dataDelete(key: string): Promise<void> {
 }
 
 export async function clearStoredWorkEverywhere(): Promise<void> {
-  await Promise.all([dataDelete(WORK_FILE_KEY), dataDelete(WORK_COLOURS_KEY)]);
+  await Promise.all([dataDelete(WORK_FILE_KEY), dataDelete(WORK_COLOURS_KEY), dataDelete(WORK_CUTS_KEY)]);
 }
 
 /** Settings kept as JSON in the local server's folder (null when the server is not running or has none). */

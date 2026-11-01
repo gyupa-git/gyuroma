@@ -29,6 +29,7 @@ import { applyNomadObjToModel, buildNomadObj, parseNomadObj } from "@core/nomadR
 import { apparentLayerRgbs, deltaE2000, linearToSrgb, rgbToLab, srgbToLinear } from "@core/prusaFdmMixer";
 import { downloadBlob, downloadText } from "@core/exportCsv";
 import {
+  CUT_SPAN,
   DEFAULT_SETTINGS,
   MAX_PHYSICAL,
   MIN_PHYSICAL,
@@ -48,6 +49,7 @@ import {
   facesInSphere,
   hexToRgb,
   highlightGeometry,
+  highlightGeometryCut,
   smoothVertexNormals,
   type FaceGeometry,
   maskFromLabels,
@@ -71,13 +73,21 @@ import {
   settingsToJson,
   storeServerSettings,
   storeSettings,
+  isStoredWorkCuts,
+  packRuns,
   unpackColours,
+  unpackRuns,
   WORK_COLOURS_KEY,
+  WORK_CUTS_KEY,
   WORK_FILE_KEY,
+  type StoredCut,
   type StoredWorkColours,
+  type StoredWorkCuts,
   type StoredWorkFile,
 } from "./engine/storage";
-import { MeshViewer, type Callout, type FocusMode, type HighlightOverlay, type LayerPreview, type MeshViewerHandle, type PickInfo, type ViewerHit } from "./ui/MeshViewer";
+import { MeshViewer, type Callout, type FocusMode, type HighlightOverlay, type LayerPreview, type MeshViewerHandle, type PickInfo, type ViewerCut, type ViewerHit } from "./ui/MeshViewer";
+import { meshWithCut, type BorderCut } from "@core/borderCut";
+import { cutBorders, CutSuperseded } from "./engine/borderCutClient";
 import { ColourStrip, type StripOutput } from "./ui/ColourStrip";
 import { CleanupPanel } from "./ui/CleanupPanel";
 import { ColourMap, type ColourMapHandle } from "./ui/ColourMap";
@@ -85,6 +95,7 @@ import { loadStoredBackground, storeBackground, type ViewBackground } from "./ui
 import { blendRecipeText } from "./engine/plan";
 import { buildFaceAtlas, faceAtlasCentre, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
 import { HelpTip } from "./ui/HelpTip";
+import { GyupaLoader } from "./ui/GyupaLoader";
 import { LoadSection, type SourceInfo } from "./ui/LoadSection";
 import { FilamentSection } from "./ui/FilamentSection";
 import { MergeSection, type MergeReportData } from "./ui/MergeSection";
@@ -215,7 +226,28 @@ const GAP_PICK_ASK_SHARE = 0.02;
 const GAP_BIG_DIAMETER_MM = 1;
 /** Outline shapes kept per model (bytes): every colour of a million-face model fits. */
 const OVERLAY_SHAPE_BUDGET = 160 * 1024 * 1024;
-type UndoKind = "strip" | "colours";
+type UndoKind = "strip" | "colours" | "mesh";
+
+/** A confirmed cut as an undo step: the model before and after it, and the original colours of each. */
+interface MeshStep {
+  before: MeshModel;
+  after: MeshModel;
+  originalBefore: RGB[] | null;
+  originalAfter: RGB[] | null;
+  /** The cut as it was shown before the confirm: undone, it shows again at once (no flicker while it is worked out anew). */
+  shown: CutLayer;
+}
+
+/** A cut worked out for the result view, with what it was worked out for. */
+interface CutLayer {
+  triangles: MeshModel["triangles"];
+  /** The palette's colours in order (the cut's groups are positions in it). */
+  paletteKey: string;
+  labels: Int32Array;
+  cut: BorderCut;
+}
+/** Confirmed cuts kept for undo (each holds the model before it: ~30 MB of arrays at 2.4 million faces, its parts shared). */
+const MESH_UNDO_LIMIT = 5;
 /**
  * One change made in a recipe panel, for that panel's own undo (the work's
  * undo ⌘Z does not touch recipe choices): which panel, the colour it was made
@@ -793,6 +825,21 @@ export default function App() {
     }
   };
   const undoOrderRef = useRef<UndoKind[]>([]);
+  /** Confirmed cuts for undo and redo, and the order redo takes them in among colour steps. */
+  const meshUndoRef = useRef<MeshStep[]>([]);
+  const meshRedoRef = useRef<MeshStep[]>([]);
+  const redoOrderRef = useRef<Array<"colours" | "mesh">>([]);
+  /** The cuts confirmed into a mesh so far, in order (by its faces array): what autosave stores and a restore makes again. */
+  const cutLogRef = useRef(new WeakMap<MeshModel["triangles"], StoredCut[]>());
+  /** Each face's group colour right after its mesh was last cut (3 bytes a face, by the faces array). */
+  const settledRef = useRef(new WeakMap<MeshModel["triangles"], Uint8Array>());
+  const lastSavedCutsRef = useRef<StoredCut[] | null>(null);
+  /** Autosaves go one after another (saveLineRef); only the newest waiting one runs (saveTicketRef). */
+  const saveLineRef = useRef<Promise<void>>(Promise.resolve());
+  const saveTicketRef = useRef(0);
+  const settledKeysRef = useRef(new WeakMap<Uint8Array, Int32Array>());
+  /** Area weights worked out ahead for a mesh about to be shown (a confirmed cut), by its faces array. */
+  const areaWeightsAhead = useRef(new WeakMap<MeshModel["triangles"], Float32Array>());
   const mainRef = useRef<HTMLDivElement | null>(null);
   const matrixScrollRef = useRef<HTMLDivElement | null>(null);
   const linkRowRef = useRef<HTMLDivElement | null>(null);
@@ -913,7 +960,7 @@ export default function App() {
     return out;
   }, [geometryTriangles]);
   const areaWeights = useMemo(
-    () => (model ? triangleAreaWeights(model) : new Float32Array(0)),
+    () => (model ? (areaWeightsAhead.current.get(model.triangles) ?? triangleAreaWeights(model)) : new Float32Array(0)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [geometryVertices, geometryTriangles],
   );
@@ -1464,6 +1511,40 @@ export default function App() {
     [settings.mergeFlags],
   );
 
+  // ------------------------------------------------------------------
+  // Faces cut along the colour borders (@core/borderCut): worked out in a
+  // worker a moment after every change of the groups, shown in the result
+  // view in place of the faces they come from, and written so on export.
+  // The model itself keeps its faces: picking, the brush and undo go on as
+  // before.
+  // ------------------------------------------------------------------
+  const cutSpan = settings.export.cutSpan;
+  /** The last cut, with what it was worked out for. */
+  const [cutLayer, setCutLayer] = useState<CutLayer | null>(null);
+  /** The palette's colours in order: a cut's groups are positions in it. */
+  const paletteKey = useMemo(() => hexByPosition.join(","), [hexByPosition]);
+  const protectedKey = useMemo(() => hexByPosition.map((hex) => (protectedHexes.has(hex) ? "1" : "0")).join(""), [hexByPosition, protectedHexes]);
+  useEffect(() => {
+    if (!model || cutSpan <= 0 || palette.length === 0 || labels.length !== model.triangles.length || previewCuts) return;
+    let alive = true;
+    const shielded = protectedPositions();
+    const settled = settledFaces(model);
+    const timer = window.setTimeout(() => {
+      cutBorders(model, labels, shielded, cutSpan, settled)
+        .then((cut) => {
+          if (alive) setCutLayer({ triangles: model.triangles, paletteKey, labels, cut });
+        })
+        .catch((err) => {
+          if (!(err instanceof CutSuperseded)) console.warn("Border cut failed", err);
+        });
+    }, 150);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model, labels, palette, cutSpan, protectedKey, previewCuts]);
+
   // Face masks shared by the 3D outlines and the colour map.
   /** Which colours a mask stands for, so the outline geometry built for it can be reused. */
   const maskKeys = useRef(new WeakMap<Uint8Array, string>());
@@ -1674,7 +1755,8 @@ export default function App() {
   // turned off, a ring on each piece (up to 24, largest first), large colour or
   // small alike, so even a speck of 0.1 % is found.
   const callouts = useMemo<Callout[]>(() => {
-    if (!model) return [];
+    // Nothing picked or chosen: no tags, and no face geometry worked out for them (a new mesh waits for that).
+    if (!model || (pickedPatches.length === 0 && selectedHexes.length === 0)) return [];
     const { centroids } = faceGeometryFor(model);
     const at = (face: number): [number, number, number] => pointToView([centroids[face * 3], centroids[face * 3 + 1], centroids[face * 3 + 2]]);
     if (pickedPatches.length === 0) {
@@ -1731,10 +1813,18 @@ export default function App() {
   // Everything a highlight draws goes through toViewSpace — positions and
   // normals alike — so it sits on the model exactly as the model is shown.
   /** Outline geometry per colour set, valid until the faces or their labels change. */
+  /** The cut the result view shows now (worked out for exactly these groups): outlines follow its line too. */
+  const outlineCut = useMemo(
+    () =>
+      model && cutLayer && cutSpan > 0 && !dragColours && cutLayer.triangles === model.triangles && cutLayer.paletteKey === paletteKey && cutLayer.labels === labels
+        ? cutLayer.cut
+        : null,
+    [model, cutLayer, cutSpan, dragColours, paletteKey, labels],
+  );
   const overlayShapes = useMemo(
     () => new Map<string, Pick<HighlightOverlay, "fill" | "fillNormals" | "edges" | "edgeNormals" | "edgeInside">>(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [model?.triangles, labels, vertexNormals, toViewSpace],
+    [model?.triangles, labels, vertexNormals, toViewSpace, outlineCut],
   );
   const overlayFor = useCallback(
     (id: string, mask: Uint8Array, look: Pick<HighlightOverlay, "colour" | "line" | "rim" | "opacity" | "lineOpacity" | "pulse">): HighlightOverlay | null => {
@@ -1742,7 +1832,9 @@ export default function App() {
       const key = maskKeys.current.get(mask);
       let shape = key ? overlayShapes.get(key) : undefined;
       if (!shape) {
-        const { fill, fillNormals, edges, edgeNormals, edgeInside } = highlightGeometry(model, mask, vertexNormals ?? undefined);
+        const { fill, fillNormals, edges, edgeNormals, edgeInside } = outlineCut
+          ? highlightGeometryCut(model, mask, outlineCut, labels, vertexNormals ?? undefined)
+          : highlightGeometry(model, mask, vertexNormals ?? undefined);
         shape = { fill: toViewSpace(fill), fillNormals: toViewSpace(fillNormals), edges: toViewSpace(edges), edgeNormals: toViewSpace(edgeNormals), edgeInside: toViewSpace(edgeInside) };
         if (key) {
           overlayShapes.set(key, shape);
@@ -1759,7 +1851,7 @@ export default function App() {
       }
       return { id, pulse: true, ...look, ...shape };
     },
-    [model, vertexNormals, toViewSpace, overlayShapes],
+    [model, vertexNormals, toViewSpace, overlayShapes, outlineCut, labels],
   );
 
   const hoverOverlay = useMemo<HighlightOverlay | null>(
@@ -3144,6 +3236,10 @@ export default function App() {
     setHistory(options?.history ?? []);
     undoOrderRef.current = (options?.history ?? []).map(() => "colours");
     setFuture([]);
+    meshUndoRef.current = [];
+    meshRedoRef.current = [];
+    redoOrderRef.current = [];
+    lastSavedCutsRef.current = options?.restored ? (cutLogRef.current.get(next.triangles) ?? []) : null;
     setWorkRestored(options?.restored ?? false);
     setMergeReport(null);
     setNomadReport(null);
@@ -3190,8 +3286,8 @@ export default function App() {
   async function persistWorkFile(source: WorkSource, generation: number): Promise<boolean> {
     setAutosave({ state: "saving", at: null });
     try {
-      // The stored colours belong to the previous model; drop them before the new file lands.
-      await dataDelete(WORK_COLOURS_KEY);
+      // The stored colours and cuts belong to the previous model; drop them before the new file lands.
+      await Promise.all([dataDelete(WORK_COLOURS_KEY), dataDelete(WORK_CUTS_KEY)]);
       const buffer = await source.file.arrayBuffer();
       if (generation !== loadGenerationRef.current) return false;
       const record: StoredWorkFile = {
@@ -3210,12 +3306,41 @@ export default function App() {
     }
   }
 
-  async function persistWorkColours(colours: RGB[], generation: number): Promise<void> {
+  /**
+   * Stores the current colours, and first the cuts confirmed into the mesh
+   * they belong to (when those changed): a restore makes the cuts again on the
+   * file, then puts the colours on.
+   */
+  function persistWorkColours(colours: RGB[], generation: number, cuts: StoredCut[]): Promise<void> {
+    // One save after another, and only the newest of those waiting: an older save
+    // finishing last must not put back what a newer one replaced.
+    const ticket = ++saveTicketRef.current;
+    const run = () => saveWorkColours(colours, generation, cuts, ticket);
+    saveLineRef.current = saveLineRef.current.then(run, run);
+    return saveLineRef.current;
+  }
+
+  async function saveWorkColours(colours: RGB[], generation: number, cuts: StoredCut[], ticket: number): Promise<void> {
+    if (ticket !== saveTicketRef.current || generation !== loadGenerationRef.current) return;
     setAutosave({ state: "saving", at: null });
     let ok = true;
-    if (colours === originalColoursRef.current) await dataDelete(WORK_COLOURS_KEY);
+    // The cuts are a log the colours point into (their `cuts` = how many apply): a cut
+    // undone stays at the end, unused; only a log that does not start with these cuts is written.
+    const saved = lastSavedCutsRef.current;
+    const onDisk = cuts.length === 0 || (saved !== null && cuts.length <= saved.length && cuts.every((cut, i) => cut === saved[i]));
+    if (!onDisk) {
+      const record: StoredWorkCuts = { fileName: modelFileRef.current?.file.name ?? "", cuts, savedAt: Date.now() };
+      if (!(await dataSet(WORK_CUTS_KEY, record))) {
+        // The colours stay as they were on disk: they still match the cuts there.
+        if (generation === loadGenerationRef.current) setAutosave({ state: "failed", at: null });
+        return;
+      }
+      lastSavedCutsRef.current = cuts;
+    }
+    if (generation !== loadGenerationRef.current) return;
+    if (colours === originalColoursRef.current && cuts.length === 0) await dataDelete(WORK_COLOURS_KEY);
     else {
-      const record: StoredWorkColours = { faceCount: colours.length, colours: packColours(colours), savedAt: Date.now() };
+      const record: StoredWorkColours = { faceCount: colours.length, colours: packColours(colours), savedAt: Date.now(), cuts: cuts.length };
       ok = await dataSet(WORK_COLOURS_KEY, record);
     }
     if (generation === loadGenerationRef.current) setAutosave({ state: ok ? "saved" : "failed", at: Date.now() });
@@ -3229,9 +3354,10 @@ export default function App() {
     lastSavedColoursRef.current = colours;
     if (!settings.rememberWork) return;
     const generation = loadGenerationRef.current;
+    const cuts = cutLogRef.current.get(model.triangles) ?? [];
     // Show "saving" as soon as a change is pending, not only when the debounce fires.
     setAutosave({ state: "saving", at: null });
-    const timer = window.setTimeout(() => void persistWorkColours(colours, generation), 400);
+    const timer = window.setTimeout(() => void persistWorkColours(colours, generation, cuts), 400);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, settings.rememberWork]);
@@ -3253,7 +3379,12 @@ export default function App() {
     const generation = loadGenerationRef.current;
     void (async () => {
       if (!(await persistWorkFile(source, generation))) return;
-      if (model.triangleColors !== originalColoursRef.current) await persistWorkColours(model.triangleColors, generation);
+      lastSavedCutsRef.current = null;
+      // The model as it is now (it may have changed while the file was being stored).
+      const current = modelRef.current;
+      if (!current) return;
+      const cuts = cutLogRef.current.get(current.triangles) ?? [];
+      if (current.triangleColors !== originalColoursRef.current || cuts.length > 0) await persistWorkColours(current.triangleColors, generation, cuts);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.rememberWork]);
@@ -3279,18 +3410,41 @@ export default function App() {
     await yieldToUi();
     try {
       const storedColours = await dataGet<unknown>(WORK_COLOURS_KEY);
+      const storedCuts = await dataGet<unknown>(WORK_CUTS_KEY);
       const file = new File([stored.buffer], stored.name);
       const nomadPalette = stored.palette ? (unpackColours(stored.palette, Math.floor(stored.palette.length / 3)) ?? undefined) : undefined;
       const loaded = await parseModelFile(file, stored.kind, nomadPalette);
       if (loadGenerationRef.current !== 0) return;
-      const original = loaded.model.triangleColors;
+      // The cuts confirmed before, made again in order on the file (the colours belong to the cut mesh).
+      let base = loaded.model;
+      let original = loaded.model.triangleColors;
+      let log: StoredCut[] = [];
+      const wanted = isStoredWorkColours(storedColours) ? (storedColours.cuts ?? 0) : 0;
+      if (wanted > 0 && isStoredWorkCuts(storedCuts) && storedCuts.fileName === stored.name && storedCuts.cuts.length >= wanted) {
+        for (const made of storedCuts.cuts.slice(0, wanted)) {
+          if (made.faces !== base.triangles.length || made.vertices !== base.vertices.length) break;
+          const mesh = meshWithCut(base.vertices, base.triangles, made);
+          original = Array.from(mesh.originalFace, (f) => original[f]);
+          base = { ...base, vertices: mesh.vertices, triangles: mesh.triangles, triangleColors: original, stats: { ...base.stats, vertexCount: mesh.vertices.length, triangleCount: mesh.triangles.length } };
+          log = [...log, made];
+        }
+        if (log.length !== wanted) {
+          base = loaded.model;
+          original = loaded.model.triangleColors;
+          log = [];
+        }
+      }
+      cutLogRef.current.set(base.triangles, log);
+      const lastCut = log[log.length - 1];
+      const settledBack = lastCut?.settled ? unpackRuns(lastCut.settled, base.triangles.length) : null;
+      if (settledBack) settledRef.current.set(base.triangles, settledBack);
       const colours =
-        isStoredWorkColours(storedColours) && storedColours.faceCount === loaded.model.triangles.length
+        isStoredWorkColours(storedColours) && storedColours.faceCount === base.triangles.length
           ? unpackColours(storedColours.colours, storedColours.faceCount)
           : null;
       const restoredModel = colours
-        ? { ...loaded.model, triangleColors: colours, stats: { ...loaded.model.stats, uniqueFaceColors: countUniqueColours(colours) } }
-        : loaded.model;
+        ? { ...base, triangleColors: colours, stats: { ...base.stats, uniqueFaceColors: countUniqueColours(colours) } }
+        : base;
       installModel(
         restoredModel,
         { ...loaded.info, uniqueColours: restoredModel.stats.uniqueFaceColors },
@@ -3324,6 +3478,10 @@ export default function App() {
     setSourceInfo(null);
     setHistory([]);
     undoOrderRef.current = [];
+    meshUndoRef.current = [];
+    meshRedoRef.current = [];
+    redoOrderRef.current = [];
+    lastSavedCutsRef.current = null;
     setRecipeSteps([]);
     forgetTidyUndo();
     setTidyResult(null);
@@ -3371,9 +3529,12 @@ export default function App() {
   }
 
   function applyColours(current: MeshModel, next: RGB[], options?: { keepSelection?: boolean }): void {
+    if (history.length >= 20) forgetOldestUndo("colours");
     setHistory((prev) => [...prev.slice(-19), current.triangleColors]);
     pushUndo("colours");
     setFuture([]);
+    meshRedoRef.current = [];
+    redoOrderRef.current = [];
     setModel({ ...current, triangleColors: next, stats: { ...current.stats, uniqueFaceColors: countUniqueColours(next) } });
     // the palette may be numbered anew: earlier recipe choices no longer line up
     forgetRecipeUndo();
@@ -3392,10 +3553,13 @@ export default function App() {
     return geometry;
   }
 
-  // Default brush size follows the model size.
+  // Default brush size follows the model size (a mesh of the same size — a cut confirmed or undone — keeps the brush as it is).
+  const brushForRadius = useRef<number | null>(null);
   useEffect(() => {
     if (!model) return;
     const radius = faceGeometryFor(model).radius;
+    if (brushForRadius.current !== null && Math.abs(brushForRadius.current - radius) <= 1e-6 * radius) return;
+    brushForRadius.current = radius;
     setBrushRadius(Number((radius * 0.04).toPrecision(2)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometryTriangles]);
@@ -3441,9 +3605,14 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showMap, geometryTriangles]);
 
+  /** What the result view shows a face as, for the colour map (its group's colour, or the print's). */
+  const mapLookRef = useRef<{ palette: PaletteEntry[]; labels: Int32Array; mode: PreviewMode; effective: Map<number, RGB> } | null>(null);
   const colourOfFace = useCallback((face: number): RGB => {
     const stroke = strokeRef.current;
     if (stroke) return stroke.working[face];
+    const look = mapLookRef.current;
+    const entry = look && look.mode !== "source" && look.labels.length > face ? look.palette[look.labels[face]] : undefined;
+    if (entry) return (look?.mode === "print" && look.effective.get(entry.index)) || entry.rgb;
     return modelRef.current?.triangleColors[face] ?? [128, 128, 128];
   }, []);
 
@@ -3581,13 +3750,15 @@ export default function App() {
       const target = event.target as HTMLElement | null;
       if (typingIn(target)) return;
       event.preventDefault();
+      // Not while something is being worked on (or the tidy AI answering): it would come back to a different model.
+      if (busy !== null || tidyBusy !== null) return;
       if (isUndo) undoAny();
       else redo();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [history, future, model, stripUndo, committedCuts]);
+  }, [history, future, model, stripUndo, committedCuts, busy, tidyBusy]);
 
   /** Undo has two kinds of change (strip cuts, face colours); this is their order, newest last. */
   function pushUndo(kind: UndoKind): void {
@@ -3600,12 +3771,26 @@ export default function App() {
   }
   /** Undo whichever change was made last. */
   function undoAny(): void {
+    // The newest step whose list still has it and still fits the mesh; a step whose
+    // list was trimmed (or a colour step of another mesh) is dropped from the order —
+    // never swapped for a step of another kind out of turn.
+    for (;;) {
+      const order = undoOrderRef.current;
+      const last = order[order.length - 1];
+      if (last === undefined) return;
+      if (last === "strip" && stripUndo.length > 0) return undoStripCut();
+      const step = meshUndoRef.current[meshUndoRef.current.length - 1];
+      if (last === "mesh" && step && model && step.after.triangles === model.triangles) return undoMesh();
+      const colours = history[history.length - 1];
+      if (last === "colours" && colours && model && colours.length === model.triangles.length) return undoMerge();
+      undoOrderRef.current = order.slice(0, -1);
+    }
+  }
+  /** Takes the oldest step of a kind out of the undo order (its list dropped it). */
+  function forgetOldestUndo(kind: UndoKind): void {
     const order = undoOrderRef.current;
-    const last = order[order.length - 1];
-    if (last === "strip" && stripUndo.length > 0) return undoStripCut();
-    if (last === "colours" && history.length > 0) return undoMerge();
-    if (history.length > 0) return undoMerge();
-    if (stripUndo.length > 0) undoStripCut();
+    const at = order.indexOf(kind);
+    if (at >= 0) undoOrderRef.current = [...order.slice(0, at), ...order.slice(at + 1)];
   }
 
   /** A colour's recipe choice in words: a forced filament, a set mixture, or the automatic one. */
@@ -4061,6 +4246,8 @@ export default function App() {
    */
   function applyTidy(changes: TidyChanges, entryId: string, title: string, lines: ChangeLine[], dropped?: string[]): void {
     if (!model) return;
+    // A chain from before the mesh changed (a cut confirmed or undone) cannot be gone back to.
+    if (tidyChainRef.current && tidyChainRef.current.base.length !== model.triangles.length) tidyChainRef.current = null;
     const touchesClean = hasCleanChanges(changes);
     const chain = tidyChainRef.current;
     const showingTidy = chain !== null && chain.result === model.triangleColors;
@@ -4127,6 +4314,12 @@ export default function App() {
     const steps = tidyUndoRef.current;
     const saved = steps[steps.length - 1];
     if (!saved || !model) return;
+    if (saved.colours.length !== model.triangles.length) {
+      // Made on another mesh (before a cut was confirmed or undone): it cannot be gone back to.
+      tidyUndoRef.current = steps.slice(0, -1);
+      setTidyUndoCount(tidyUndoRef.current.length);
+      return;
+    }
     const chain = tidyChainRef.current;
     const expected = saved.result ?? chain?.result ?? saved.colours;
     if (model.triangleColors !== expected && model.triangleColors !== saved.colours && !window.confirm(t("tidy.undoConfirm"))) return;
@@ -4297,7 +4490,9 @@ export default function App() {
         dropped: dropped.length ? dropped : undefined,
       };
       setTidyLog((prev) => [...prev, entry]);
-      if (asked && lines.length > 0) applyTidy(changes, entry.id, t("tidy.byAi"), lines, dropped);
+      // The mesh may have changed while Claude was thinking (a cut confirmed or undone): then the answer is only kept as a suggestion.
+      const sameMesh = modelRef.current !== null && modelRef.current.triangles === model?.triangles;
+      if (asked && lines.length > 0 && sameMesh) applyTidy(changes, entry.id, t("tidy.byAi"), lines, dropped);
     } catch (err) {
       const stopped = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
       setTidyLog((prev) => [
@@ -4337,13 +4532,16 @@ export default function App() {
     setModel({ ...model, triangleColors: last, stats: { ...model.stats, uniqueFaceColors: countUniqueColours(last) } });
     setHistory((prev) => prev.slice(0, -1));
     dropUndo("colours");
+    redoOrderRef.current = [...redoOrderRef.current, "colours"];
     setMergeReport(null);
     setStatus(t("status.undone", { n: history.length - 1 }));
   }
 
   function redo(): void {
+    if (redoOrderRef.current[redoOrderRef.current.length - 1] === "mesh") return redoMesh();
     const next = future[future.length - 1];
     if (!model || !next || next.length !== model.triangles.length) return;
+    redoOrderRef.current = redoOrderRef.current.slice(0, -1);
     cutsBackWith(next);
     setHistory((prev) => [...prev.slice(-19), model.triangleColors]);
     pushUndo("colours");
@@ -4407,14 +4605,210 @@ export default function App() {
     );
   }
 
+  /**
+   * Each face's group colour (as a number) right after the mesh was last cut
+   * (a confirmed cut): the borders there were cut along their line then, and
+   * are not cut again — whatever their colours have become since.  Undefined
+   * before any cut.
+   */
+  function settledFaces(current: MeshModel): Int32Array | undefined {
+    const base = settledRef.current.get(current.triangles);
+    if (!base || base.length !== current.triangles.length * 3) return undefined;
+    const known = settledKeysRef.current.get(base);
+    if (known) return known;
+    const keys = new Int32Array(current.triangles.length);
+    for (let f = 0; f < keys.length; f++) keys[f] = (base[f * 3] << 16) | (base[f * 3 + 1] << 8) | base[f * 3 + 2];
+    settledKeysRef.current.set(base, keys);
+    return keys;
+  }
+
+  /**
+   * `current` with `cut` made (worked out for `groups`).  A piece on its face's
+   * own side keeps the face's colour; a piece on the other side takes that
+   * group's colour.
+   */
+  function cutModelOf(current: MeshModel, cut: BorderCut, groups: Int32Array) {
+    const mesh = meshWithCut(current.vertices, current.triangles, cut);
+    const triangleColors: RGB[] = new Array(mesh.triangles.length);
+    for (let i = 0; i < mesh.triangles.length; i++) {
+      const p = mesh.piece[i];
+      const from = mesh.originalFace[i];
+      const group = p >= 0 ? cut.pieceGroups[p] : -1;
+      triangleColors[i] = group >= 0 && group !== groups[from] ? (palette[group]?.rgb ?? current.triangleColors[from]) : current.triangleColors[from];
+    }
+    const model: MeshModel = {
+      ...current,
+      vertices: mesh.vertices,
+      triangles: mesh.triangles,
+      triangleColors,
+      stats: { ...current.stats, vertexCount: mesh.vertices.length, triangleCount: mesh.triangles.length, uniqueFaceColors: countUniqueColours(triangleColors) },
+    };
+    return { model, mesh };
+  }
+
+  /**
+   * The model as it goes out: with the faces along the borders cut along the
+   * line when that is on — what the result view shows.
+   */
+  async function modelForExport(current: MeshModel): Promise<MeshModel> {
+    if (cutSpan <= 0 || palette.length === 0 || labels.length !== current.triangles.length) return current;
+    let cut: BorderCut | null = null;
+    for (let attempt = 0; attempt < 3 && !cut; attempt++) {
+      try {
+        cut = await cutBorders(current, labels, protectedPositions(), cutSpan, settledFaces(current), "export");
+      } catch (err) {
+        if (!(err instanceof CutSuperseded)) throw err;
+      }
+    }
+    if (!cut || cut.replaced.length === 0) return current;
+    return cutModelOf(current, cut, labels).model;
+  }
+
+  /** The cut worked out for exactly what is shown now (null while it is being worked out). */
+  const cutFresh = model && cutSpan > 0 && cutLayer && cutLayer.triangles === model.triangles && cutLayer.paletteKey === paletteKey && cutLayer.labels === labels ? cutLayer : null;
+  /** The cut shown in the result view, ready to confirm. */
+  const cutReady = Boolean(cutFresh && cutFresh.cut.replaced.length > 0);
+
+  /**
+   * Confirm the cut shown: the model takes the cut faces for good (one undo
+   * step), so each piece can be picked, recoloured and merged like any face.
+   * Exactly the cut on screen — nothing is worked out again.
+   */
+  async function confirmCut(): Promise<void> {
+    if (!model || busy !== null || tidyBusy !== null || pendingTidy || previewCuts || gapReview || strokeRef.current) return;
+    const layer = cutLayer;
+    if (!cutReady || !layer) {
+      setStatus(t("status.cutNotReady"));
+      return;
+    }
+    setBusy(t("busy.cutConfirm"));
+    await yieldToUi();
+    try {
+      const started = performance.now();
+      const before = model;
+      const { cut } = layer;
+      const { model: after, mesh } = cutModelOf(before, cut, labels);
+      // What the faces' groups are right after: these are not cut again until they change.
+      const settled = new Uint8Array(after.triangles.length * 3);
+      for (let i = 0; i < after.triangles.length; i++) {
+        const p = mesh.piece[i];
+        const rgb = palette[p >= 0 ? cut.pieceGroups[p] : labels[mesh.originalFace[i]]]?.rgb;
+        if (rgb) settled.set(rgb, i * 3);
+      }
+      settledRef.current.set(after.triangles, settled);
+      cutLogRef.current.set(after.triangles, [
+        ...(cutLogRef.current.get(before.triangles) ?? []),
+        {
+          faces: before.triangles.length,
+          vertices: before.vertices.length,
+          addedVertices: cut.addedVertices,
+          pieces: cut.pieces,
+          pieceGroups: cut.pieceGroups,
+          pieceFaces: cut.pieceFaces,
+          replaced: cut.replaced,
+          settled: packRuns(settled),
+        },
+      ]);
+      // The spectrum keeps its groups: its cuts are worked out again for the new areas.
+      const weights = triangleAreaWeights(after);
+      areaWeightsAhead.current.set(after.triangles, weights);
+      const groupOfKey = new Map<number, string>();
+      for (const group of committedGroups) for (const colour of group.colours) groupOfKey.set(colour.key, `${group.family}:${group.index}`);
+      const strip = buildColourStrip(after.triangleColors, weights, pins);
+      const stored = stripStore(targetGroups, cutsKeepingGroups(strip, groupOfKey), livePins(storedStrip?.pins, strip), storedStrip?.from);
+      cutsWithColours.current.set(before.triangleColors, settings.stripByModel[stripKey] ?? null);
+      cutsWithColours.current.set(after.triangleColors, stored);
+      setSettings((prev) => ({ ...prev, stripByModel: { ...prev.stripByModel, [stripKey]: stored } }));
+      const originalBefore = originalColoursRef.current;
+      const originalAfter = originalBefore && originalBefore.length === before.triangles.length ? Array.from(mesh.originalFace, (f) => originalBefore[f]) : null;
+      if (meshUndoRef.current.length >= MESH_UNDO_LIMIT) forgetOldestUndo("mesh");
+      meshUndoRef.current = [...meshUndoRef.current.slice(-(MESH_UNDO_LIMIT - 1)), { before, after, originalBefore, originalAfter, shown: layer }];
+      meshRedoRef.current = [];
+      redoOrderRef.current = [];
+      setFuture([]);
+      pushUndo("mesh");
+      swapGeometry(after, originalAfter);
+      setStatus(
+        t("status.cutConfirmed", {
+          faces: cut.replaced.length.toLocaleString(),
+          pieces: cut.pieceGroups.length.toLocaleString(),
+          total: after.triangles.length.toLocaleString(),
+          ms: Math.round(performance.now() - started),
+        }),
+      );
+    } catch (err) {
+      setStatus(t("status.error", { message: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * The model's mesh changes (a cut confirmed, undone or redone).  Face numbers
+   * stay (meshWithCut keeps them), but a cut face is pieces now: whatever was
+   * picked, hovered or under way goes, and what was worked out per face is
+   * worked out again.  The camera stays where it is.
+   */
+  function swapGeometry(next: MeshModel, original: RGB[] | null): void {
+    adjacencyRef.current = null;
+    atlasRef.current = null;
+    faceGeometryRef.current = null;
+    strokeRef.current = null;
+    regrabRef.current = null;
+    edgeRepickRef.current = null;
+    hoverFaceRef.current = null;
+    edgeSessionRef.current = null;
+    tidyStableShotsRef.current = null;
+    dragBuffers.current = [];
+    setAtlas(null);
+    setCutLayer(null);
+    setGapReview(null);
+    setHoverPatch(null);
+    setMergeReport(null);
+    setPendingTidy(null);
+    clearPick();
+    endToneSession();
+    forgetTidyUndo();
+    forgetRecipeUndo();
+    originalColoursRef.current = original;
+    setModel(next);
+  }
+
+  function undoMesh(): void {
+    const step = meshUndoRef.current[meshUndoRef.current.length - 1];
+    if (!model || !step || model.triangles !== step.after.triangles) return;
+    meshUndoRef.current = meshUndoRef.current.slice(0, -1);
+    meshRedoRef.current = [...meshRedoRef.current, { ...step, after: model }];
+    redoOrderRef.current = [...redoOrderRef.current, "mesh"];
+    dropUndo("mesh");
+    cutsBackWith(step.before.triangleColors);
+    swapGeometry(step.before, step.originalBefore);
+    setCutLayer(step.shown);
+    setStatus(t("status.cutUndone", { total: step.before.triangles.length.toLocaleString() }));
+  }
+
+  function redoMesh(): void {
+    const step = meshRedoRef.current[meshRedoRef.current.length - 1];
+    if (!model || !step || model.triangles !== step.before.triangles) return;
+    meshRedoRef.current = meshRedoRef.current.slice(0, -1);
+    redoOrderRef.current = redoOrderRef.current.slice(0, -1);
+    meshUndoRef.current = [...meshUndoRef.current, step];
+    pushUndo("mesh");
+    cutsBackWith(step.after.triangleColors);
+    swapGeometry(step.after, step.originalAfter);
+    setStatus(t("status.cutRedone", { total: step.after.triangles.length.toLocaleString() }));
+  }
+
   async function exportColourFile(): Promise<void> {
     if (!model || palette.length === 0 || printer.kind !== "colour") return;
+    const source = model;
     setExportOutcome(null);
     setBusy(t("busy.exporting"));
     await yieldToUi();
     try {
       const e = settings.export;
       const format = e.colourFormat && printer.formats.includes(e.colourFormat) ? e.colourFormat : printer.formats[0];
+      const model = await modelForExport(source);
       const { transform } = buildTransform(model, null, {
         coordinateMode: e.coordinateMode,
         scale: e.scale,
@@ -4455,12 +4849,14 @@ export default function App() {
   async function export3mf(): Promise<void> {
     if (printer.kind === "colour") return exportColourFile();
     if (!model || !plan || palette.length === 0) return;
+    const source = model;
     setExportOutcome(null);
     setBusy(t("busy.exporting"));
     await yieldToUi();
     try {
       const e = settings.export;
       const prusa = printer.slicer === "prusa";
+      const model = await modelForExport(source);
       const fileName = (e.fileName.trim() || defaultFileName).replace(/\.3mf$/i, "") + ".3mf";
       const result = await buildPrusa3mfBlob({
         slicer: printer.slicer,
@@ -4688,6 +5084,10 @@ export default function App() {
   }
 
   const isBusy = busy !== null;
+  // While the app works the pointer is "working", not "not allowed" over the buttons it waits with.
+  useEffect(() => {
+    document.body.classList.toggle("is-busy", isBusy);
+  }, [isBusy]);
   const canFillPick =
     !isBusy && pickedPatches.length > 0 && Boolean(pickTarget) && !(pickTarget !== "__new__" && pickedHexes.length === 1 && pickTarget === pickedHexes[0]);
   fillPickRef.current = canFillPick ? applyPickColour : null;
@@ -4808,6 +5208,66 @@ export default function App() {
       </span>
     ) : undefined;
   const resultMode: PreviewMode = compareStep ? (previewMode === "source" ? "palette" : previewMode) : step === 4 ? "print" : singleMode;
+  // The colour map paints what the result view shows (it used to show the faces' own colours, like the original view).
+  mapLookRef.current = { palette, labels, mode: resultMode, effective: effectiveByIndex };
+  useEffect(() => {
+    setColoursVersion((v) => v + 1);
+  }, [palette, labels, resultMode, effectiveByIndex]);
+  /**
+   * The cut pieces for the result view.  Right after a change the last cut
+   * still stands where the faces kept their groups (the new one follows a
+   * moment later), so the line does not flicker back to the faces.
+   */
+  const viewerCut = useMemo<ViewerCut | null>(() => {
+    if (!model || !cutLayer || cutSpan <= 0 || dragColours || resultMode === "source") return null;
+    if (cutLayer.triangles !== model.triangles || cutLayer.paletteKey !== paletteKey) return null;
+    const { cut, labels: then } = cutLayer;
+    const vertexCount = model.vertices.length;
+    const kept: number[] = [];
+    for (let p = 0; p < cut.pieceGroups.length; p++) {
+      const f = cut.pieceFaces[p];
+      if (labels[f] === then[f] && palette[cut.pieceGroups[p]]) kept.push(p);
+    }
+    const linearOf = new Map<number, [number, number, number]>();
+    const colourOf = (position: number) => {
+      let lin = linearOf.get(position);
+      if (!lin) {
+        const entry = palette[position];
+        const rgb = (resultMode === "print" && effectiveByIndex.get(entry.index)) || entry.rgb;
+        lin = [srgbToLinear(rgb[0]), srgbToLinear(rgb[1]), srgbToLinear(rgb[2])];
+        linearOf.set(position, lin);
+      }
+      return lin;
+    };
+    const points = new Float32Array(kept.length * 9);
+    const colours = new Float32Array(kept.length * 9);
+    const parentFace = new Int32Array(kept.length);
+    const corners = new Int32Array(kept.length * 3);
+    kept.forEach((p, i) => {
+      const lin = colourOf(cut.pieceGroups[p]);
+      for (let k = 0; k < 3; k++) {
+        const v = cut.pieces[p * 3 + k];
+        const o = i * 9 + k * 3;
+        corners[i * 3 + k] = v;
+        if (v < vertexCount) {
+          const point = model.vertices[v];
+          points[o] = point[0];
+          points[o + 1] = point[1];
+          points[o + 2] = point[2];
+        } else {
+          const a = (v - vertexCount) * 3;
+          points[o] = cut.addedVertices[a];
+          points[o + 1] = cut.addedVertices[a + 1];
+          points[o + 2] = cut.addedVertices[a + 2];
+        }
+        colours[o] = lin[0];
+        colours[o + 1] = lin[1];
+        colours[o + 2] = lin[2];
+      }
+      parentFace[i] = cut.pieceFaces[p];
+    });
+    return { positions: toViewSpace(points), colours, parentFace, corners };
+  }, [model, cutLayer, cutSpan, dragColours, resultMode, palette, paletteKey, labels, effectiveByIndex, toViewSpace]);
   const paneCount = (showSource ? 1 : 0) + (showResult ? 1 : 0) + (showMap ? 1 : 0);
   // A chip about the 3D view keeps off the colour map (the last column).
   const chipStyle: CSSProperties | undefined = showMap && paneCount > 1 ? { right: `calc(${100 / paneCount}% + 12px)` } : undefined;
@@ -4896,11 +5356,11 @@ export default function App() {
         <StepNav steps={stepInfo} current={step} onChange={changeStep} />
         <div className="top-actions">
           {/* how many steps ⌘Z can still take back (colour changes and strip cuts), and ⇧⌘Z bring again */}
-          <button type="button" className="icon-btn with-count" aria-label={t("app.undo")} title={`${t("top.undo")} · ${t("top.stepsLeft", { n: history.length + stripUndo.length })}`} disabled={isBusy || (history.length === 0 && stripUndo.length === 0)} onClick={undoAny}>
+          <button type="button" className="icon-btn with-count" aria-label={t("app.undo")} title={`${t("top.undo")} · ${t("top.stepsLeft", { n: history.length + stripUndo.length + meshUndoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || (history.length === 0 && stripUndo.length === 0 && meshUndoRef.current.length === 0)} onClick={undoAny}>
             <Icon name="undo" />
-            {history.length + stripUndo.length > 0 && <span className="step-count mono">{history.length + stripUndo.length}</span>}
+            {history.length + stripUndo.length + meshUndoRef.current.length > 0 && <span className="step-count mono">{history.length + stripUndo.length + meshUndoRef.current.length}</span>}
           </button>
-          <button type="button" className="icon-btn with-count" aria-label={t("app.redo")} title={`${t("top.redo")} · ${t("top.stepsLeft", { n: future.length })}`} disabled={isBusy || future.length === 0} onClick={redo}>
+          <button type="button" className="icon-btn with-count" aria-label={t("app.redo")} title={`${t("top.redo")} · ${t("top.stepsLeft", { n: future.length + meshRedoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || (future.length === 0 && meshRedoRef.current.length === 0)} onClick={redo}>
             <Icon name="redo" />
             {future.length > 0 && <span className="step-count mono">{future.length}</span>}
           </button>
@@ -5173,6 +5633,7 @@ export default function App() {
         />
 
         <section ref={stageRef} className="stage" aria-label={t("view.compareAria")} style={{ "--matrix-h": `${(matrixShare * 100).toFixed(2)}%` } as CSSProperties}>
+          <GyupaLoader label={busy} />
           <div className="stage-toolbar">
             {compareStep ? (
               <>
@@ -5306,6 +5767,29 @@ export default function App() {
               >
                 <Icon name="soft" size={14} stroke={1.4} />
               </button>
+              <button
+                type="button"
+                className="icon-btn small"
+                aria-pressed={cutSpan > 0}
+                aria-label={t("view.cut")}
+                title={`${t("view.cut")} — ${t(cutSpan > 0 ? "view.cutOnHint" : "view.cutOffHint")}`}
+                onClick={() => patchSettings("export", { ...settings.export, cutSpan: cutSpan > 0 ? 0 : CUT_SPAN })}
+              >
+                <Icon name="cutLine" size={14} stroke={1.4} />
+              </button>
+              {cutSpan > 0 && model && compareStep && (
+                <button
+                  type="button"
+                  className="text-btn small cut-confirm"
+                  disabled={isBusy || !cutReady}
+                  title={t(cutReady ? "view.cutConfirmHint" : cutFresh ? "view.cutNothingHint" : "view.cutConfirmWait")}
+                  onClick={() => void confirmCut()}
+                >
+                  {cutReady && cutFresh
+                    ? t("view.cutConfirmN", { n: cutFresh.cut.replaced.length.toLocaleString() })
+                    : t(cutFresh ? "view.cutNothing" : "view.cutWorking")}
+                </button>
+              )}
               <Menu triggerClassName="icon-btn small" label={t("view.bgMenu")} title={t("view.backgroundHint")} trigger={<Icon name="background" size={14} stroke={1.4} />}>
                 <div className="menu-label">{t("view.background")}</div>
                 <label className="menu-row">
@@ -5629,6 +6113,7 @@ export default function App() {
               ref={viewerRef2}
               positions={positions}
               colours={coloursForMode(resultMode)}
+              cut={viewerCut}
               label={step === 4 && layerPreview ? t("layers.label", { h: shownLayerHeight.toFixed(2) }) : modeLabel[resultMode]}
               layers={step === 4 ? layerPreview : null}
               labelTools={paneTools(1)}

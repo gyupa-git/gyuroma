@@ -56,9 +56,15 @@ async function handle(req, res, next) {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
       await fs.mkdir(userDataDir, { recursive: true });
-      const tmp = `${file}.tmp`;
-      await fs.writeFile(tmp, Buffer.concat(chunks));
-      await fs.rename(tmp, file);
+      // A temporary file of its own: two writes to one key at once must not share one.
+      const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+      try {
+        await fs.writeFile(tmp, Buffer.concat(chunks));
+        await fs.rename(tmp, file);
+      } catch (err) {
+        await fs.rm(tmp, { force: true }).catch(() => undefined); // no half-written leftovers
+        throw err;
+      }
       res.statusCode = 204;
       res.end();
     } else if (req.method === "DELETE") {
@@ -70,7 +76,8 @@ async function handle(req, res, next) {
       res.end();
     }
   } catch (err) {
-    const missing = err && err.code === "ENOENT";
+    // Only a read (or a delete) of a missing key is "nothing there": a write that failed must say so.
+    const missing = err && err.code === "ENOENT" && req.method !== "PUT";
     // A missing key answers 204 (not 404) so the browser console stays free of failed-load noise.
     res.statusCode = missing ? 204 : 500;
     if (missing) res.setHeader("X-Rodin-Missing", "1");

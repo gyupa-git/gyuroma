@@ -32,6 +32,8 @@ const ICONS = {
   link: <><circle cx="5" cy="8" r="2.5" /><circle cx="11" cy="8" r="2.5" /><path d="M7.5 8h1" /></>,
   cube: <><path d="M8 1.8 13.5 5v6L8 14.2 2.5 11V5z" /><path d="M2.5 5 8 8.2 13.5 5M8 8.2v6" /></>,
   flat: <><circle cx="8" cy="8" r="5.5" /><path d="M8 2.5v11" /></>,
+  // A staircase of faces, faint, and the straight line it is cut along.
+  cutLine: <><path d="M2 13.5V11h3V8h3V5h3V2.5h3" strokeOpacity="0.4" /><path d="M2 12.5 13.5 3" /></>,
   soft: <><circle cx="8" cy="8" r="5.5" /><circle cx="8" cy="8" r="3.4" strokeOpacity="0.55" /><circle cx="8" cy="8" r="1.4" strokeOpacity="0.3" /></>,
   background: <><rect x="2.5" y="2.5" width="11" height="11" rx="1.5" /><path d="M2.5 8h11M8 2.5v11" /></>,
   xray: <><rect x="2.5" y="2.5" width="8" height="8" rx="1.2" strokeDasharray="2 1.6" /><rect x="5.5" y="5.5" width="8" height="8" rx="1.2" /></>,

@@ -143,6 +143,26 @@ export interface MeshViewerProps {
   softEdges?: boolean;
   /** The model vertex of each corner (3 per face, same order as `positions`), for soft colour borders. */
   cornerVertex?: Int32Array | null;
+  /**
+   * Faces cut along the border lines: the pieces are drawn in place of the
+   * faces they come from (those are still what a click or the brush takes).
+   */
+  cut?: ViewerCut | null;
+}
+
+export interface ViewerCut {
+  /** The pieces, 3 corners each (view space, like `positions`). */
+  positions: Float32Array;
+  /** Linear colour of every corner (3 per piece corner). */
+  colours: Float32Array;
+  /** The face of the model each piece comes from; the pieces of one face are listed together. */
+  parentFace: Int32Array;
+  /**
+   * The vertex at each piece corner (3 per piece): a model vertex, or one the cut
+   * added (numbered from the model's vertex count on).  With soft edges the
+   * colours meet at each vertex as they will once the cut is confirmed.
+   */
+  corners?: Int32Array;
 }
 
 export interface LayerPreview {
@@ -378,6 +398,16 @@ const XRAY_OPACITY = 0.14;
 /** The soft-edge strength, shared by every material of a viewer and changed in place. */
 type SoftUniforms = Record<"uSoftEdges", { value: number }>;
 
+/**
+ * A face whose colour is marked below zero is left out of the drawing (sent
+ * past the far plane): a face drawn cut along a border line (see ViewerCut),
+ * its pieces drawn instead.  The pick pass has its own shader and still takes it.
+ */
+const HIDE_MARKED_VERTEX = `#include <project_vertex>
+#ifdef USE_COLOR
+if (color.r < -0.5) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+#endif`;
+
 function makeMeshMaterial(flat: boolean, layers?: LayerUniforms | null, soft?: SoftUniforms | null): THREE.Material {
   const material = flat
     ? new THREE.MeshBasicMaterial({ vertexColors: true, color: 0xffffff, side: THREE.DoubleSide })
@@ -387,7 +417,8 @@ function makeMeshMaterial(flat: boolean, layers?: LayerUniforms | null, soft?: S
       Object.assign(shader.uniforms, layers);
       shader.vertexShader = shader.vertexShader
         .replace("#include <common>", "#include <common>\nattribute float recipe;\nvarying float vRecipe;\nvarying float vHeight;")
-        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvRecipe = recipe;\nvHeight = position.z;");
+        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvRecipe = recipe;\nvHeight = position.z;")
+        .replace("#include <project_vertex>", HIDE_MARKED_VERTEX);
       shader.fragmentShader = shader.fragmentShader
         .replace("#include <common>", `#include <common>\n${LAYER_FRAGMENT_HEAD}`)
         .replace("#include <color_fragment>", LAYER_FRAGMENT_BODY);
@@ -398,12 +429,18 @@ function makeMeshMaterial(flat: boolean, layers?: LayerUniforms | null, soft?: S
       Object.assign(shader.uniforms, soft);
       shader.vertexShader = shader.vertexShader
         .replace("#include <common>", "#include <common>\nattribute vec4 softColor;\nvarying vec3 vSoftColor;")
-        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvSoftColor = softColor.rgb;");
+        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvSoftColor = softColor.rgb;")
+        .replace("#include <project_vertex>", HIDE_MARKED_VERTEX);
       shader.fragmentShader = shader.fragmentShader
         .replace("#include <common>", "#include <common>\nuniform float uSoftEdges;\nvarying vec3 vSoftColor;")
         .replace("#include <color_fragment>", SOFT_COLOUR_FRAGMENT);
     };
     material.customProgramCacheKey = () => "soft";
+  } else {
+    material.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader.replace("#include <project_vertex>", HIDE_MARKED_VERTEX);
+    };
+    material.customProgramCacheKey = () => "plain";
   }
   return material;
 }
@@ -458,13 +495,17 @@ function softenVertex(table: VertexCorners, v: number, colours: Float32Array, ou
   let r = 0;
   let g = 0;
   let b = 0;
+  let n = 0;
   for (let i = start; i < end; i++) {
     const o = table.corners[i] * 3;
+    if (colours[o] < 0) continue; // a face left out of the drawing (cut along a border line)
     r += colours[o];
     g += colours[o + 1];
     b += colours[o + 2];
+    n++;
   }
-  const inv = 1 / (end - start);
+  if (n === 0) return;
+  const inv = 1 / n;
   const qr = Math.round(Math.min(1, r * inv) * 65535);
   const qg = Math.round(Math.min(1, g * inv) * 65535);
   const qb = Math.round(Math.min(1, b * inv) * 65535);
@@ -792,6 +833,10 @@ interface ViewerState {
   focusMask: Uint8Array | null;
   /** Faces painted since the colours last arrived, drawn over the model. */
   stroke: StrokePreview | null;
+  /** The pieces of the faces cut along the border lines, drawn in their place. */
+  cut: CutPieces | null;
+  /** The colours the mesh was built with (the colour effect has nothing to do for these). */
+  coloursBuilt: Float32Array | null;
   /** Tags over picked patches, placed after every frame. */
   callouts: PlacedCallout[];
   cursorGroup: THREE.Group;
@@ -925,6 +970,207 @@ function dropStrokePreview(state: ViewerState, flush: boolean): void {
   }
 }
 
+interface CutPieces {
+  mesh: THREE.Mesh;
+  /** Model faces left out of the drawing for them (colour marked below zero). */
+  hidden: Int32Array;
+  /** Model vertices whose soft colour takes the pieces in (worked out again when the pieces go). */
+  softened: Int32Array;
+  /** The first piece of each hidden face and how many: [face, first, count] runs. */
+  runs: Map<number, [number, number]>;
+}
+
+/**
+ * Takes the cut pieces away: the faces they stood for get their colours back
+ * from `colours` (the colours as given, without the marks).
+ */
+function dropCut(state: ViewerState, colours: Float32Array | null): void {
+  const cut = state.cut;
+  if (!cut) return;
+  state.scene.remove(cut.mesh);
+  cut.mesh.geometry.dispose();
+  state.cut = null;
+  const attribute = state.geometry?.getAttribute("color") as THREE.BufferAttribute | undefined;
+  if (!attribute || !colours || attribute.array.length !== colours.length) return;
+  const array = attribute.array as Float32Array;
+  for (const f of cut.hidden) array.set(colours.subarray(f * 9, f * 9 + 9), f * 9);
+  attribute.clearUpdateRanges();
+  attribute.needsUpdate = true;
+  const soft = state.geometry?.getAttribute("softColor") as THREE.BufferAttribute | undefined;
+  if (soft && state.softTable && cut.softened.length > 0) {
+    for (const v of cut.softened) softenVertex(state.softTable, v, array, soft.array as Uint16Array);
+    soft.clearUpdateRanges();
+    soft.needsUpdate = true;
+  }
+}
+
+/**
+ * Each face's own normal at its three corners (the faces are drawn apart, so
+ * this is what three's computeVertexNormals gives) — in one pass over the
+ * positions: seven times quicker on a million faces, which a confirmed cut
+ * (a new mesh of the same shape) waits for.
+ */
+function setFlatNormals(geometry: THREE.BufferGeometry, positions: Float32Array): void {
+  const normals = new Float32Array(positions.length);
+  for (let o = 0; o < positions.length; o += 9) {
+    const ux = positions[o + 3] - positions[o], uy = positions[o + 4] - positions[o + 1], uz = positions[o + 5] - positions[o + 2];
+    const vx = positions[o + 6] - positions[o], vy = positions[o + 7] - positions[o + 1], vz = positions[o + 8] - positions[o + 2];
+    let x = uy * vz - uz * vy;
+    let y = uz * vx - ux * vz;
+    let z = ux * vy - uy * vx;
+    const length = Math.hypot(x, y, z);
+    if (length > 0) {
+      x /= length;
+      y /= length;
+      z /= length;
+    }
+    normals[o] = normals[o + 3] = normals[o + 6] = x;
+    normals[o + 1] = normals[o + 4] = normals[o + 7] = y;
+    normals[o + 2] = normals[o + 5] = normals[o + 8] = z;
+  }
+  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+}
+
+/** The bounding sphere as three works it out (centre of the box, the farthest point from it), in plain loops. */
+function setBoundingSphere(geometry: THREE.BufferGeometry, positions: Float32Array): void {
+  let minX = Infinity, minY = Infinity, minZ = Infinity, maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let o = 0; o < positions.length; o += 3) {
+    const x = positions[o], y = positions[o + 1], z = positions[o + 2];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+  let far = 0;
+  for (let o = 0; o < positions.length; o += 3) {
+    const dx = positions[o] - cx, dy = positions[o + 1] - cy, dz = positions[o + 2] - cz;
+    const d = dx * dx + dy * dy + dz * dz;
+    if (d > far) far = d;
+  }
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(cx, cy, cz), Math.sqrt(far));
+}
+
+/** Draws `cut`'s pieces in place of the faces they come from. */
+function showCut(state: ViewerState, cut: ViewerCut): void {
+  const geometry = state.geometry;
+  if (!geometry || !state.mesh) return;
+  const attribute = geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
+  if (!attribute) return;
+  const pieceCount = cut.parentFace.length;
+  if (cut.positions.length !== pieceCount * 9 || cut.colours.length !== pieceCount * 9) return;
+  const runs = new Map<number, [number, number]>();
+  for (let p = 0; p < pieceCount; p++) {
+    const f = cut.parentFace[p];
+    if (f < 0 || f >= state.faceCount) return; // not this model's
+    const run = runs.get(f);
+    if (run) run[1]++;
+    else runs.set(f, [p, 1]);
+  }
+  const array = attribute.array as Float32Array;
+  const hidden = Int32Array.from(runs.keys());
+  for (const f of hidden) {
+    array[f * 9] = -1;
+    array[f * 9 + 3] = -1;
+    array[f * 9 + 6] = -1;
+  }
+  attribute.clearUpdateRanges();
+  attribute.needsUpdate = true;
+  const pieces = new THREE.BufferGeometry();
+  pieces.setAttribute("position", new THREE.BufferAttribute(cut.positions, 3));
+  pieces.setAttribute("color", new THREE.BufferAttribute(cut.colours.slice(), 3));
+  let softened = new Int32Array(0);
+  const mainSoft = geometry.getAttribute("softColor") as THREE.BufferAttribute | undefined;
+  if (mainSoft) {
+    const soft = new Uint16Array(pieceCount * 3 * SOFT_STRIDE);
+    const quantise = (x: number) => Math.round(Math.max(0, Math.min(1, x)) * 65535);
+    const table = state.softTable;
+    const corners = cut.corners && cut.corners.length === pieceCount * 3 ? cut.corners : null;
+    if (table && corners) {
+      // The soft colour at each vertex as the confirmed mesh will have it: the mean
+      // of every face there — the model's faces still drawn, and the pieces.
+      const vertexCount = table.offsets.length - 1;
+      const sums = new Map<number, number[]>();
+      const sum = (v: number) => {
+        let s = sums.get(v);
+        if (!s) {
+          s = [0, 0, 0, 0];
+          sums.set(v, s);
+          if (v < vertexCount)
+            for (let i = table.offsets[v]; i < table.offsets[v + 1]; i++) {
+              const o = table.corners[i] * 3;
+              if (array[o] < 0) continue; // drawn as pieces
+              s[0] += array[o];
+              s[1] += array[o + 1];
+              s[2] += array[o + 2];
+              s[3]++;
+            }
+        }
+        return s;
+      };
+      for (let c = 0; c < pieceCount * 3; c++) {
+        const s = sum(corners[c]);
+        s[0] += cut.colours[c * 3];
+        s[1] += cut.colours[c * 3 + 1];
+        s[2] += cut.colours[c * 3 + 2];
+        s[3]++;
+      }
+      const meanOf = (v: number, k: number) => {
+        const s = sums.get(v) as number[];
+        return quantise(s[k] / s[3]);
+      };
+      for (let c = 0; c < pieceCount * 3; c++) for (let k = 0; k < 3; k++) soft[c * SOFT_STRIDE + k] = meanOf(corners[c], k);
+      const out = mainSoft.array as Uint16Array;
+      const touched: number[] = [];
+      for (const v of sums.keys()) {
+        if (v >= vertexCount) continue;
+        touched.push(v);
+        for (let i = table.offsets[v]; i < table.offsets[v + 1]; i++) {
+          const o = table.corners[i] * SOFT_STRIDE;
+          for (let k = 0; k < 3; k++) out[o + k] = meanOf(v, k);
+        }
+      }
+      softened = Int32Array.from(touched);
+      mainSoft.clearUpdateRanges();
+      mainSoft.needsUpdate = true;
+    } else {
+      // No vertex numbers: each piece its own colour at its corners.
+      for (let c = 0; c < pieceCount * 3; c++) for (let k = 0; k < 3; k++) soft[c * SOFT_STRIDE + k] = quantise(cut.colours[c * 3 + k]);
+    }
+    pieces.setAttribute("softColor", new THREE.BufferAttribute(soft, SOFT_STRIDE, true));
+  }
+  pieces.computeVertexNormals();
+  pieces.boundingSphere = geometry.boundingSphere?.clone() ?? null;
+  const mesh = new THREE.Mesh(pieces, state.mesh.material);
+  mesh.frustumCulled = false;
+  mesh.visible = state.mesh.visible;
+  state.scene.add(mesh);
+  state.cut = { mesh, hidden, runs, softened };
+}
+
+/** While faces are painted, their pieces step aside so the paint shows (the next colours bring a new cut). */
+function hideCutPieces(state: ViewerState, faces: ArrayLike<number>): void {
+  const cut = state.cut;
+  if (!cut) return;
+  const attribute = cut.mesh.geometry.getAttribute("color") as THREE.BufferAttribute;
+  const array = attribute.array as Float32Array;
+  let changed = false;
+  for (let i = 0; i < faces.length; i++) {
+    const run = cut.runs.get(faces[i]);
+    if (!run || array[run[0] * 9] < 0) continue;
+    for (let p = run[0]; p < run[0] + run[1]; p++) {
+      array[p * 9] = -1;
+      array[p * 9 + 3] = -1;
+      array[p * 9 + 6] = -1;
+    }
+    attribute.addUpdateRange(run[0] * 9, run[1] * 9);
+    changed = true;
+  }
+  if (changed) attribute.needsUpdate = true;
+}
+
 function requestRender(state: ViewerState): void {
   state.needsRender = true;
   if (state.raf !== null) return;
@@ -935,6 +1181,10 @@ function requestRender(state: ViewerState): void {
     // The paint is drawn with whatever material shows those faces now.
     const under = state.focusMesh ?? state.mesh;
     if (state.stroke && under) state.stroke.mesh.material = under.material;
+    if (state.cut && state.mesh) {
+      state.cut.mesh.material = state.mesh.material;
+      state.cut.mesh.visible = state.mesh.visible;
+    }
     state.renderer.render(state.scene, state.camera);
     placeCallouts(state);
     // Camera position, readable from outside (debugging / tests).
@@ -1205,6 +1455,8 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   state.overlayGroup.visible = false;
   state.cursorGroup.visible = false;
   if (state.stroke) state.stroke.mesh.visible = false;
+  const cutShown = state.cut?.mesh.visible ?? false;
+  if (state.cut) state.cut.mesh.visible = false;
   renderer.setRenderTarget(state.pickTarget);
   renderer.setClearColor(0xffffff, 1);
   renderer.clear();
@@ -1221,6 +1473,7 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   state.overlayGroup.visible = true;
   state.cursorGroup.visible = true;
   if (state.stroke) state.stroke.mesh.visible = true;
+  if (state.cut) state.cut.mesh.visible = cutShown;
   const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;
   if (id === 0xffffff || id >= state.faceCount) return null;
 
@@ -1256,7 +1509,7 @@ function makeCursorLine(): THREE.LineLoop {
 }
 
 export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function MeshViewer(
-  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null },
+  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
   ref,
 ) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1324,6 +1577,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       }
       shown = Int32Array.from(around);
     }
+    hideCutPieces(state, faces);
     addToStrokePreview(state, shown);
     requestRender(state);
   }
@@ -1450,6 +1704,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       focusMesh: null,
       focusMask: null,
       stroke: null,
+      cut: null,
+      coloursBuilt: null,
       callouts: [],
       cursorGroup,
       cursorLine,
@@ -1602,6 +1858,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       renderer.domElement.removeEventListener("pointerleave", onPointerLeave);
       disposeOverlays(state);
       dropStrokePreview(state, false);
+      dropCut(state, null);
       controls.dispose();
       state.geometry?.dispose();
       (state.mesh?.material as THREE.Material | undefined)?.dispose();
@@ -1643,10 +1900,15 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const state = stateRef.current;
     if (!state) return;
     dropStrokePreview(state, false);
+    dropCut(state, null);
+    // The shape before: a mesh cut along its borders (or the cut undone) has the
+    // same shape and keeps the camera and the material (no shader built again).
+    const before = state.bounds;
+    let oldMaterial: THREE.Material | null = null;
     if (state.mesh) {
       state.scene.remove(state.mesh);
       state.geometry?.dispose();
-      (state.mesh.material as THREE.Material).dispose();
+      oldMaterial = state.mesh.material as THREE.Material;
       state.mesh = null;
       state.geometry = null;
       state.faceCount = 0;
@@ -1654,6 +1916,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       state.softTable = null;
     }
     if (!positions || positions.length === 0) {
+      oldMaterial?.dispose();
       requestRender(state);
       return;
     }
@@ -1664,6 +1927,11 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     // must not be the caller's own buffer (that would overwrite, say, the
     // palette colours with a drag preview and leave them that way).
     const colourArray = colours && colours.length === positions.length ? colours.slice() : new Float32Array(positions.length).fill(0.6);
+    // Only for the colour effect of this same commit (it runs right after, in the same task).
+    state.coloursBuilt = colours;
+    queueMicrotask(() => {
+      if (state.coloursBuilt === colours) state.coloursBuilt = null;
+    });
     geometry.setAttribute("color", new THREE.BufferAttribute(colourArray, 3));
     const ids = new Float32Array(faceCount * 3);
     for (let i = 0; i < faceCount; i++) {
@@ -1679,17 +1947,26 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       softenAll(state.softTable, colourArray, soft);
       geometry.setAttribute("softColor", new THREE.BufferAttribute(soft, SOFT_STRIDE, true));
     }
-    geometry.computeVertexNormals();
-    geometry.computeBoundingSphere();
+    setFlatNormals(geometry, positions);
+    setBoundingSphere(geometry, positions);
     const sphere = geometry.boundingSphere;
     state.bounds = sphere ? { center: sphere.center.clone(), radius: Math.max(1e-3, sphere.radius) } : null;
-    const material = makeMeshMaterial(flatRef.current, state.layerUniforms, state.softTable ? state.softUniforms : null);
+    const materialKey = `${flatRef.current}|${state.layerUniforms !== null}|${state.softTable !== null}`;
+    const reuse = oldMaterial !== null && oldMaterial.userData.key === materialKey;
+    if (oldMaterial && !reuse) oldMaterial.dispose();
+    const material = reuse && oldMaterial ? oldMaterial : makeMeshMaterial(flatRef.current, state.layerUniforms, state.softTable ? state.softUniforms : null);
+    material.userData.key = materialKey;
     const mesh = new THREE.Mesh(geometry, material);
     state.scene.add(mesh);
     state.mesh = mesh;
     state.geometry = geometry;
     state.faceCount = faceCount;
-    fitCamera(state, view);
+    const now = state.bounds;
+    const same = before && now && before.center.distanceTo(now.center) <= 1e-5 * now.radius && Math.abs(before.radius - now.radius) <= 1e-5 * now.radius;
+    if (same) {
+      fitClipPlanes(state);
+      requestRender(state);
+    } else fitCamera(state, view);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [positions]);
 
@@ -1853,6 +2130,13 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     if (!state || !state.geometry || !colours) return;
     // The new colours carry any paint the preview showed.
     dropStrokePreview(state, false);
+    // Just built with these (a new mesh and its colours arrive together): nothing to copy or soften again.
+    if (state.coloursBuilt === colours) {
+      state.coloursBuilt = null;
+      requestRender(state);
+      return;
+    }
+    state.coloursBuilt = null;
     const attribute = state.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
     if (attribute && attribute.array.length === colours.length) {
       (attribute.array as Float32Array).set(colours);
@@ -1869,6 +2153,19 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     }
     requestRender(state);
   }, [colours]);
+
+  // The faces cut along the border lines: their pieces in their place.  After
+  // the colours above (which come without the marks), and again with them.
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    // Not while a stroke is being painted (its colours are in the model's arrays, not yet
+    // in `colours`): the stroke's colours arrive when it ends, and the pieces with them.
+    if (state.stroke) return;
+    dropCut(state, colours);
+    if (cut && cut.parentFace.length > 0 && !state.layerUniforms) showCut(state, cut);
+    requestRender(state);
+  }, [cut, colours, positions, layers]);
 
   // Highlight overlays.  A highlight passed again (the same object) stays as
   // it is: rebuilding all of them on every hover re-uploaded a selection of
