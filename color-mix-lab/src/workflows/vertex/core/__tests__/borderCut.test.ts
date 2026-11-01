@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildEdgeAdjacency, buildFaceAdjacency } from "../meshAdjacency";
 import { flatCorners } from "../borderLines";
 import { cutAlongBorderLines, meshWithCut, type BorderCut } from "../borderCut";
-import { gridMesh } from "./fixtures";
+import { foldedGrid, gridMesh } from "./fixtures";
 import type { Tri, Vec3 } from "../types";
 
 // Two triangles per cell: face (i, j, k) = (j·nx + i)·2 + k.
@@ -276,4 +276,30 @@ describe("cutAlongBorderLines", () => {
       expect(touches).toBe(true);
     }
   });
+});
+
+describe("cutAlongBorderLines — along a fold (a part standing on another)", () => {
+  // The colour spilled over the crease (see foldedGrid).  Each point is measured in its own
+  // surface: no piece takes a group further than it reached before — onto the floor past the
+  // spills, up the wall past the notches.  Measured across the border edge's other face
+  // (square to it, or leaning over), some did.
+  for (const lean of [0, -0.3]) {
+    it(`takes no colour further than it reached (wall leaning ${lean})`, () => {
+      for (let seed = 1; seed <= 8; seed++) {
+        const fold = foldedGrid({ lean, jitter: 0.2, seed });
+        const sides = buildEdgeAdjacency(flatCorners(fold.triangles), fold.vertices.length);
+        const cut = cutAlongBorderLines(sides, fold.triangles, fold.vertices, fold.groups, { span: 16, protectedGroup: new Uint8Array(2) });
+        const made = meshWithCut(fold.vertices, fold.triangles, cut);
+        let further = 0;
+        for (let i = 0; i < made.triangles.length; i++) {
+          const from = made.originalFace[i];
+          const [ci, cj] = fold.cellOfFace[from];
+          if (ci < 2 || ci >= fold.nx - 2) continue;
+          const group = made.piece[i] >= 0 ? cut.pieceGroups[made.piece[i]] : fold.groups[from];
+          if ((group === 1 && cj < fold.crease - 2) || (group === 0 && cj > fold.crease)) further += area(made.vertices, made.triangles[i]);
+        }
+        expect(further).toBe(0);
+      }
+    });
+  }
 });

@@ -1,5 +1,5 @@
 import type { FaceAdjacency } from "./meshAdjacency";
-import { faceNormalAt, flatCorners, flatPositions, traceBorderLine, type BorderLineOptions, type MeshFaces, type MeshPoints } from "./borderLines";
+import { faceNormalAt, flatCorners, flatPositions, THIN_WALL, traceBorderLine, type BorderLineOptions, type MeshFaces, type MeshPoints } from "./borderLines";
 import type { Tri, Vec3 } from "./types";
 
 /**
@@ -8,7 +8,10 @@ import type { Tri, Vec3 } from "./types";
  * of along whole triangles.
  *
  * Every vertex near a border is measured against the line: how far it lies
- * from the nearest stretch, and on which side.  An edge whose two ends lie on
+ * from the nearest stretch, and on which side — told in the vertex's own
+ * surface (its normal), so where the border runs along a fold (a part standing
+ * on another) the points on either side of the fold are told apart as well.
+ * An edge whose two ends lie on
  * opposite sides of the same border gets a new point where the line crosses it
  * (a point very near the line counts as on it, so no sliver is cut off).  Each
  * face with such points is cut through them; each piece takes the group of its
@@ -63,36 +66,50 @@ export function cutAlongBorderLines(
   const { offsets, neighbours, faceCount } = adjacency;
   const vertexCount = positions.length / 3;
   const isProtected = (group: number) => options.protectedGroup[group] === 1;
-  const { edgeLength, maxMove, eLeft, eRight, eFace, eAcross, slotA, slotB, line, across, stays, borderFace } = trace;
+  const { edgeLength, maxMove, eLeft, eRight, eFace, eAcross, slotA, slotB, line, along, stays, borderFace } = trace;
   const edgeCount = eLeft.length;
   // Settled borders (a border already when the mesh was last cut) are the line
   // already: nothing is measured against them and nothing near them is cut again.
   const settled = options.settled;
   const edgeSettled = (e: number) => !!settled && settled[eFace[e]] !== settled[eAcross[e]];
 
-  // The stretches of line, with the normal of the face each came from, in a grid of cells.
+  // The stretches of line, with the normals of the two faces of the border edge each came from, in a grid of cells.
   const nx = new Float64Array(edgeCount * 3);
-  for (let e = 0; e < edgeCount; e++) nx.set(faceNormalAt(corners, positions, eFace[e]), e * 3);
-  // Left of each stretch (towards its lower group), in the surface; and at each
-  // point where the line stays on the border, the stretches there taken together
-  // — for a vertex nearest to that point itself, where one stretch alone could
-  // put it on the wrong side of a corner.
+  const na = new Float64Array(edgeCount * 3);
+  for (let e = 0; e < edgeCount; e++) {
+    nx.set(faceNormalAt(corners, positions, eFace[e]), e * 3);
+    na.set(faceNormalAt(corners, positions, eAcross[e]), e * 3);
+  }
+  // The way the line runs at each of its points where it stays on the border: the
+  // stretches there taken together (at the corner of a tooth they point every way)
+  // — for a vertex nearest to that point itself, where one stretch alone could put
+  // it on the wrong side of the corner.  Where the line moved, the window's way (`along`).
   const pointCount = line.length / 3;
-  const edgeLeft = new Float64Array(edgeCount * 3);
-  const pointLeft = new Float64Array(pointCount * 3);
+  const pointWay = new Float64Array(pointCount * 3);
   for (let e = 0; e < edgeCount; e++) {
     const a = slotA[e] * 3;
     const b = slotB[e] * 3;
     const sx = line[b] - line[a], sy = line[b + 1] - line[a + 1], sz = line[b + 2] - line[a + 2];
-    const n0 = nx[e * 3], n1 = nx[e * 3 + 1], n2 = nx[e * 3 + 2];
-    const lx = n1 * sz - n2 * sy, ly = n2 * sx - n0 * sz, lz = n0 * sy - n1 * sx;
-    const l = Math.hypot(lx, ly, lz);
+    const l = Math.hypot(sx, sy, sz);
     if (l === 0) continue;
-    edgeLeft[e * 3] = lx / l;
-    edgeLeft[e * 3 + 1] = ly / l;
-    edgeLeft[e * 3 + 2] = lz / l;
-    for (const p of [a, b])
-      for (let c = 0; c < 3; c++) pointLeft[p + c] += edgeLeft[e * 3 + c];
+    for (const p of [a, b]) {
+      pointWay[p] += sx / l;
+      pointWay[p + 1] += sy / l;
+      pointWay[p + 2] += sz / l;
+    }
+  }
+  // Each vertex's normal (its faces', by area): the surface it is measured in.
+  const vertexNormal = new Float32Array(vertexCount * 3);
+  for (let f = 0; f < faceCount; f++) {
+    const a = corners[f * 3] * 3, b = corners[f * 3 + 1] * 3, c = corners[f * 3 + 2] * 3;
+    const ux = positions[b] - positions[a], uy = positions[b + 1] - positions[a + 1], uz = positions[b + 2] - positions[a + 2];
+    const vx = positions[c] - positions[a], vy = positions[c + 1] - positions[a + 1], vz = positions[c + 2] - positions[a + 2];
+    const x = uy * vz - uz * vy, y = uz * vx - ux * vz, z = ux * vy - uy * vx;
+    for (const v of [a, b, c]) {
+      vertexNormal[v] += x;
+      vertexNormal[v + 1] += y;
+      vertexNormal[v + 2] += z;
+    }
   }
   const reach = maxMove + edgeLength;
   const cell = Math.max(1e-9, reach);
@@ -124,10 +141,24 @@ export function cutAlongBorderLines(
   const pairOf = new Map<number, number>();
   const distanceOf = new Map<number, number>();
   const tie = 0.05 * edgeLength;
-  const measure = (v: number, n0: number, n1: number, n2: number): number => {
+  const measure = (v: number, f0: number, f1: number, f2: number): number => {
     const known = pairOf.get(v);
     if (known !== undefined) return known;
     const px = positions[v * 3], py = positions[v * 3 + 1], pz = positions[v * 3 + 2];
+    let n0 = vertexNormal[v * 3], n1 = vertexNormal[v * 3 + 1], n2 = vertexNormal[v * 3 + 2];
+    const nl = Math.hypot(n0, n1, n2);
+    if (nl > 0) {
+      n0 /= nl;
+      n1 /= nl;
+      n2 /= nl;
+    }
+    // On the rim of a thin part the faces around a vertex face both ways and their
+    // normals cancel out: there, the asking face's own.
+    if (!(nl > 0) || n0 * f0 + n1 * f1 + n2 * f2 < 0.2) {
+      n0 = f0;
+      n1 = f1;
+      n2 = f2;
+    }
     const ix = Math.floor(px / cell);
     const iy = Math.floor(py / cell);
     const iz = Math.floor(pz / cell);
@@ -141,8 +172,8 @@ export function cutAlongBorderLines(
           const list = grid.get(keyOf(ix + dx, iy + dy, iz + dz));
           if (!list) continue;
           for (const e of list) {
-            // A border on the other side of a thin wall faces away: not this one.
-            if (nx[e * 3] * n0 + nx[e * 3 + 1] * n1 + nx[e * 3 + 2] * n2 <= 0) continue;
+            // A border on the other side of a thin wall: the point looks away from both its faces.
+            if (nx[e * 3] * n0 + nx[e * 3 + 1] * n1 + nx[e * 3 + 2] * n2 < -THIN_WALL && na[e * 3] * n0 + na[e * 3 + 1] * n1 + na[e * 3 + 2] * n2 < -THIN_WALL) continue;
             const A = slotA[e];
             const B = slotB[e];
             const ax = line[A * 3], ay = line[A * 3 + 1], az = line[A * 3 + 2];
@@ -154,26 +185,28 @@ export function cutAlongBorderLines(
             const qx = ax + sx * tt, qy = ay + sy * tt, qz = az + sz * tt;
             const d = Math.hypot(px - qx, py - qy, pz - qz);
             if (d > reach || d > best + tie) continue;
-            // Which side: across the border where the line moved (the window's way across,
-            // which holds along teeth); where it stayed on the border, the stretch's own
-            // left — or, nearest to an end of it, the left of every stretch at that end.
-            let wx = 0, wy = 0, wz = 0;
-            const leftAt = (point: number) => (stays[point] ? pointLeft : across);
+            // Which side: left of the way the line runs, in the vertex's own surface
+            // (normal × way).  The way: where the line moved, the window's (which holds
+            // along teeth); where it stayed on the border, the stretch's own — or, nearest
+            // to an end of it, every stretch at that end taken together.
+            let tx = 0, ty = 0, tz = 0;
+            const wayAt = (point: number) => (stays[point] ? pointWay : along);
             if (tt <= 0 || tt >= 1) {
               const point = tt <= 0 ? A : B;
-              const w = leftAt(point);
-              wx = w[point * 3];
-              wy = w[point * 3 + 1];
-              wz = w[point * 3 + 2];
+              const w = wayAt(point);
+              tx = w[point * 3];
+              ty = w[point * 3 + 1];
+              tz = w[point * 3 + 2];
             } else if (!stays[A] && !stays[B]) {
-              wx = across[A * 3] * (1 - tt) + across[B * 3] * tt;
-              wy = across[A * 3 + 1] * (1 - tt) + across[B * 3 + 1] * tt;
-              wz = across[A * 3 + 2] * (1 - tt) + across[B * 3 + 2] * tt;
+              tx = along[A * 3] * (1 - tt) + along[B * 3] * tt;
+              ty = along[A * 3 + 1] * (1 - tt) + along[B * 3 + 1] * tt;
+              tz = along[A * 3 + 2] * (1 - tt) + along[B * 3 + 2] * tt;
             } else {
-              wx = edgeLeft[e * 3];
-              wy = edgeLeft[e * 3 + 1];
-              wz = edgeLeft[e * 3 + 2];
+              tx = sx;
+              ty = sy;
+              tz = sz;
             }
+            const wx = n1 * tz - n2 * ty, wy = n2 * tx - n0 * tz, wz = n0 * ty - n1 * tx;
             const wl = Math.hypot(wx, wy, wz);
             if (wl === 0) continue;
             const signed = Math.sign((px - qx) * wx + (py - qy) * wy + (pz - qz) * wz) * d;

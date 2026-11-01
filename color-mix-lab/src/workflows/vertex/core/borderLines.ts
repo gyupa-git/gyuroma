@@ -24,8 +24,10 @@ import type { Tri, Vec3 } from "./types";
  *    further than a quarter window.
  * 3. The faces: near the border (no further than a point can move), each
  *    face's centre is measured against the nearest stretch of line; the side
- *    it is on gives its group (only between the two groups of that stretch — a
- *    third colour is left alone; a face as near to stretches that disagree is
+ *    it is on — told in the face's own surface, so where the border runs along
+ *    a fold (a part standing on another) a face on either side of the fold is
+ *    told apart as well — gives its group (only between the two groups of that
+ *    stretch — a third colour is left alone; a face as near to stretches that disagree is
  *    left too).  The changes are made nearest the border first and only where
  *    the new group already touches the face, so they grow from the border and
  *    never leave a strip of their own inside a part.  A tooth whose centre lies
@@ -50,6 +52,14 @@ export interface BorderLineOptions {
 /** Below this, the edges walked around a point (their directions summed, over their length) turn back on themselves. */
 const FOLD = 0.35;
 
+/**
+ * A border is behind a thin wall from a face (or point) whose normal points away
+ * from both faces of the border edge by more than this (as a cosine): the other
+ * side of a thin part, not the same surface.  Along a fold the faces stand at an
+ * angle, but one of them faces the same way.
+ */
+export const THIN_WALL = 0.3;
+
 /** The line drawn along the borders (steps 1 and 2), for the faces to be measured against. */
 export interface BorderLineTrace {
   /** Mean length of a border edge. */
@@ -70,6 +80,8 @@ export interface BorderLineTrace {
   /** Per border point (x, y, z each): where the line passes it, and across the border towards the lower group. */
   line: Float64Array;
   across: Float64Array;
+  /** Per border point (x, y, z each): the way the border runs over the window, lower group on the left (not set where the line stays). */
+  along: Float64Array;
   /** 1 where the line stays on the border itself (and `across` is not set). */
   stays: Uint8Array;
   /** 1 for faces with a side on a border. */
@@ -303,6 +315,7 @@ export function traceBorderLine(
   // normal × the way the border runs over the whole window (not just the edges at the
   // point — at the corner of a tooth those point every way).
   const across = new Float64Array(count * 3);
+  const along = new Float64Array(count * 3);
   // One walk per point: whether it stays (it does not move, or the border turns back on
   // itself within the window), which way is across, and its pull across the border —
   // how far the average of the points around it lies to one side.
@@ -327,6 +340,10 @@ export function traceBorderLine(
     across[s * 3] = cx / length;
     across[s * 3 + 1] = cy / length;
     across[s * 3 + 2] = cz / length;
+    const way = Math.hypot(heading[0], heading[1], heading[2]);
+    along[s * 3] = heading[0] / way;
+    along[s * 3 + 1] = heading[1] / way;
+    along[s * 3 + 2] = heading[2] / way;
     let sx = 0, sy = 0, sz = 0;
     for (const b of reached) {
       sx += pos[b * 3];
@@ -356,7 +373,7 @@ export function traceBorderLine(
     line[s * 3 + 1] = pos[s * 3 + 1] + move * across[s * 3 + 1];
     line[s * 3 + 2] = pos[s * 3 + 2] + move * across[s * 3 + 2];
   }
-  return { edgeLength, maxMove, eu, ev, eLeft, eRight, eFace, eAcross, slotA, slotB, line, across, stays, borderFace };
+  return { edgeLength, maxMove, eu, ev, eLeft, eRight, eFace, eAcross, slotA, slotB, line, across, along, stays, borderFace };
 }
 
 export function smoothBorderLines(
@@ -372,17 +389,19 @@ export function smoothBorderLines(
   if (!trace) return 0;
   const { offsets, neighbours, faceCount } = adjacency;
   const isProtected = (group: number) => options.protectedGroup[group] === 1;
-  const { edgeLength, maxMove, eu, eLeft, eRight, eFace, slotA, slotB, line, borderFace } = trace;
+  const { edgeLength, maxMove, eu, eLeft, eRight, eFace, eAcross, slotA, slotB, line, borderFace } = trace;
   const edgeCount = eu.length;
 
-  // The stretches of line, with the normal of the face each came from, in a grid of cells.
+  // The stretches of line, with the normals of the two faces of the border edge each came from, in a grid of cells.
   const ax = new Float64Array(edgeCount * 3);
   const bx = new Float64Array(edgeCount * 3);
   const nx = new Float64Array(edgeCount * 3);
+  const na = new Float64Array(edgeCount * 3);
   for (let e = 0; e < edgeCount; e++) {
     ax.set(line.subarray(slotA[e] * 3, slotA[e] * 3 + 3), e * 3);
     bx.set(line.subarray(slotB[e] * 3, slotB[e] * 3 + 3), e * 3);
     nx.set(faceNormalAt(corners, positions, eFace[e]), e * 3);
+    na.set(faceNormalAt(corners, positions, eAcross[e]), e * 3);
   }
   // Faces change only this near the border: no further than a point of the line can move.
   const reach = maxMove + edgeLength;
@@ -443,6 +462,7 @@ export function smoothBorderLines(
     const ix = Math.floor(cx / cell);
     const iy = Math.floor(cy / cell);
     const iz = Math.floor(cz / cell);
+    const [n0, n1, n2] = faceNormalAt(corners, positions, f);
     // The nearest stretches: the group each puts the face in.  The face is decided only
     // when it is one of their two groups and the near-equal ones agree.
     let bestDistance = Infinity;
@@ -461,10 +481,11 @@ export function smoothBorderLines(
         const qz = ax[e * 3 + 2] + sz * tt;
         const d = Math.hypot(cx - qx, cy - qy, cz - qz);
         if (d > reach || d > bestDistance + tie) continue;
-        // Left of the stretch = across the normal from its direction: n × (b − a).
-        const n0 = nx[e * 3];
-        const n1 = nx[e * 3 + 1];
-        const n2 = nx[e * 3 + 2];
+        // A border on the other side of a thin wall: the face looks away from both its faces.
+        if (n0 * nx[e * 3] + n1 * nx[e * 3 + 1] + n2 * nx[e * 3 + 2] < -THIN_WALL && n0 * na[e * 3] + n1 * na[e * 3 + 1] + n2 * na[e * 3 + 2] < -THIN_WALL) continue;
+        // Left of the stretch, in the face's own surface: its normal × (b − a).  Not the
+        // normal of the face the stretch came from: where the border runs along a fold,
+        // that face can stand square to this one, and the side would be a guess.
         const side = (cx - qx) * (n1 * sz - n2 * sy) + (cy - qy) * (n2 * sx - n0 * sz) + (cz - qz) * (n0 * sy - n1 * sx);
         if (side === 0) continue;
         candidates.push(side > 0 ? [d, eLeft[e], eRight[e]] : [d, eRight[e], eLeft[e]]);

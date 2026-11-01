@@ -30,6 +30,57 @@ export function gridMesh(nx: number, ny: number, size = 1): GridMesh {
   return { vertices, triangles, nx, ny, cellOfFace };
 }
 
+export interface FoldedGrid {
+  vertices: Vec3[];
+  triangles: Tri[];
+  /** Cell column and row of every face; rows below `crease` lie on the floor, the rest up the wall. */
+  cellOfFace: Array<[number, number]>;
+  /** Group 1 on the wall, 0 on the floor, spilled over the crease (see foldedGrid). */
+  groups: Int32Array;
+  nx: number;
+  crease: number;
+}
+
+/**
+ * A part standing on another: a grid folded along a crease into a floor (z = 0)
+ * and a wall rising from y = 0, leaning `lean` radians away from upright (less
+ * than 0: over the floor, as the underside of a round part meets what it lies
+ * on).  The colour spills over the crease as a texture's does: every 4th column
+ * runs two rows of faces down onto the floor, and the ones between leave a
+ * notch a row up the wall.  The points are moved by up to `jitter` and the
+ * faces come in a shuffled order, as in a real mesh (so which face of a border
+ * edge comes first says nothing about its side).
+ */
+export function foldedGrid(options: { lean?: number; jitter?: number; seed?: number; flip?: boolean } = {}): FoldedGrid {
+  const nx = 24;
+  const crease = 10;
+  const grid = gridMesh(nx, crease * 2);
+  let seed = options.seed ?? 1;
+  const rand = () => (seed = (seed * 1103515245 + 12345) >>> 0) / 4294967296;
+  const lean = options.lean ?? 0;
+  const jitter = options.jitter ?? 0;
+  const vertices: Vec3[] = grid.vertices.map(([x, j]) => {
+    const p: Vec3 = j <= crease ? [x, crease - j, 0] : [x, -(j - crease) * Math.sin(lean), (j - crease) * Math.cos(lean)];
+    if (jitter > 0 && j !== crease) for (let c = 0; c < 3; c++) p[c] += (rand() - 0.5) * 2 * jitter * (c === 0 ? 1 : 0.5);
+    return p;
+  });
+  const order = grid.triangles.map((_, f) => f);
+  for (let i = order.length - 1; i > 0; i--) {
+    const k = Math.floor(rand() * (i + 1));
+    [order[i], order[k]] = [order[k], order[i]];
+  }
+  const triangles: Tri[] = order.map((f) => {
+    const [a, b, c] = grid.triangles[f];
+    return options.flip ? [a, c, b] : [a, b, c];
+  });
+  const cellOfFace = order.map((f) => grid.cellOfFace[f]);
+  const inner = (i: number) => i > 1 && i < nx - 2;
+  const groups = Int32Array.from(
+    cellOfFace.map(([i, j]) => (j >= crease ? (inner(i) && i % 4 === 2 && j === crease ? 0 : 1) : inner(i) && i % 4 === 0 && j >= crease - 2 ? 1 : 0)),
+  );
+  return { vertices, triangles, cellOfFace, groups, nx, crease };
+}
+
 export function makeSlots(hexes: string[]): PhysicalSlot[] {
   return hexes.map((hex, index) => {
     const rgb: RGB = [

@@ -7,7 +7,7 @@ import {
   isLikelyProtectedColour,
   mergeWithReprojection,
 } from "../mergeReprojection";
-import { gridMesh } from "./fixtures";
+import { foldedGrid, gridMesh } from "./fixtures";
 
 describe("mesh adjacency", () => {
   it("connects faces that share a vertex", () => {
@@ -315,4 +315,33 @@ describe("mergeWithReprojection — borders cut and confirmed (settled)", () => 
     const result = tidy(new Int32Array(labels.length));
     expect([...result.groups].some((g, f) => g !== labels[f])).toBe(true);
   });
+});
+
+describe("mergeWithReprojection — along a fold (a part standing on another)", () => {
+  // The colour spilled over the crease (see foldedGrid).  Measured in a face's own surface,
+  // the smooth-borders preset brings the border back to the crease, wherever the wall leans;
+  // measured across the border edge's other face (square to it), it ran out onto the floor.
+  for (const lean of [0, -0.3, -0.5]) {
+    it(`puts every face back on its side of the crease (wall leaning ${lean})`, () => {
+      for (let seed = 1; seed <= 6; seed++) {
+        const fold = foldedGrid({ lean, jitter: 0.2, seed });
+        const adjacency = buildFaceAdjacency(fold.triangles, fold.vertices.length);
+        const result = mergeWithReprojection(adjacency, {
+          faceLabels: fold.groups,
+          labelToGroup: Int32Array.from([0, 1]),
+          groupCount: 2,
+          minBlob: 0,
+          smoothingRounds: 6,
+          trimRounds: 3,
+          lineSpan: 16,
+          geometry: { triangles: fold.triangles, vertices: fold.vertices },
+        });
+        let off = 0;
+        fold.cellOfFace.forEach(([i, j], f) => {
+          if (i >= 2 && i < fold.nx - 2 && (result.groups[f] === 1) !== j >= fold.crease) off++;
+        });
+        expect(off).toBe(0);
+      }
+    });
+  }
 });
