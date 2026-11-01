@@ -2663,22 +2663,31 @@ export default function App() {
   async function runGap(): Promise<void> {
     if (!model || busy !== null) return;
     const scope = gapScope;
-    const keptCount = new Set(pickedPatches.map((patch) => labels[patch.anchor])).size;
+    // Colours chosen on the spectrum (or in the table) count as picks of every place of them.
+    const chosenHexes = gapChosenHexes;
+    /** Every face of these palette colours. */
+    const facesOfColours = (hexes: string[]): Int32Array => {
+      const wanted = new Set(hexes.map((hex) => positionByHex.get(hex)).filter((p): p is number => p !== undefined));
+      const out: number[] = [];
+      for (let f = 0; f < labels.length; f++) if (wanted.has(labels[f])) out.push(f);
+      return Int32Array.from(out);
+    };
+    const keptCount = new Set([...pickedPatches.map((patch) => patch.hex), ...chosenHexes]).size;
     if (scope === "part" && keptCount < 2) {
       setStatus(t("gap.needTwo", { n: keptCount }));
       return;
     }
-    // "picked": the picked patches, and with a colour shown (double click) every place of it.
+    // "picked": the picked patches, and every place of a colour shown (double click) or chosen.
     const pickedFaces = (): Int32Array => {
       const take = new Uint8Array(labels.length);
       for (const patch of pickedPatches) for (let i = 0; i < patch.faces.length; i++) take[patch.faces[i]] = 1;
-      const shownPosition = shownHex ? positionByHex.get(shownHex) : undefined;
-      if (shownPosition !== undefined) for (let f = 0; f < labels.length; f++) if (labels[f] === shownPosition) take[f] = 1;
+      const whole = facesOfColours(shownHex ? [...chosenHexes, shownHex] : chosenHexes);
+      for (let i = 0; i < whole.length; i++) take[whole[i]] = 1;
       const out: number[] = [];
       for (let f = 0; f < take.length; f++) if (take[f]) out.push(f);
       return Int32Array.from(out);
     };
-    if (scope === "picked" && pickedPatches.length === 0 && !shownHex) {
+    if (scope === "picked" && pickedPatches.length === 0 && !shownHex && chosenHexes.length === 0) {
       setStatus(t("gap.needPick"));
       return;
     }
@@ -2707,7 +2716,7 @@ export default function App() {
       const result = cleanGaps(
         { adjacency: adjacencyFor(model), triangles: model.triangles, vertices: model.vertices, labels, colours: model.triangleColors, protectedLabels },
         scope === "part"
-          ? { kind: "between", patches: pickedPatches.map((patch) => patch.faces) }
+          ? { kind: "between", patches: [...pickedPatches.map((patch) => patch.faces), ...chosenHexes.map((hex) => facesOfColours([hex]))] }
           : scope === "picked"
             ? { kind: "picked", faces: melt ?? new Int32Array(0) }
             : { kind: "all" },
@@ -2722,6 +2731,8 @@ export default function App() {
         .join(" · ");
       // Between patches the same places stay picked: their outlines show the gap gone.
       if (scope === "part") regrabRef.current = pickedPatches.map((patch) => patch.anchor);
+      // Melted colours may be gone: the spectrum lets go of them.
+      if (scope === "picked") setSelectedHexes([]);
       applyColours(model, result.colours, { keepSelection: scope === "part" });
       const done = t(scope === "part" ? "gap.donePart" : scope === "picked" ? "gap.donePicked" : "gap.doneAll", { n: result.changed.length.toLocaleString(), detail });
       setStatus(result.left > 0 ? `${done} ${t("gap.leftPicked", { n: result.left.toLocaleString() })}` : done);
@@ -4544,9 +4555,13 @@ export default function App() {
   const canFillPick =
     !isBusy && pickedPatches.length > 0 && Boolean(pickTarget) && !(pickTarget !== "__new__" && pickedHexes.length === 1 && pickTarget === pickedHexes[0]);
   fillPickRef.current = canFillPick ? applyPickColour : null;
-  const gapHexes = [...new Set(pickedPatches.map((patch) => patch.hex))];
+  /** Colours chosen on the spectrum or in the table that the model has: the gap clean takes them too. */
+  const gapChosenHexes = selectedHexes.filter((hex) => positionByHex.has(hex));
+  const gapHexes = [...new Set([...pickedPatches.map((patch) => patch.hex), ...gapChosenHexes])];
   const canRunGap =
-    !isBusy && model !== null && (gapScope === "all" || (gapScope === "picked" ? pickedPatches.length > 0 || shownHex !== null : gapHexes.length >= 2));
+    !isBusy &&
+    model !== null &&
+    (gapScope === "all" || (gapScope === "picked" ? pickedPatches.length > 0 || shownHex !== null || gapChosenHexes.length > 0 : gapHexes.length >= 2));
   gapRunRef.current = canRunGap ? () => void runGap() : null;
   const setRecipeOverride = (paletteIndex: number, counts: Record<number, number> | null) => {
     setSettings((prev) => {
@@ -5282,8 +5297,8 @@ export default function App() {
                     {gapScope === "all"
                       ? t("gap.hintAll")
                       : gapScope === "picked"
-                        ? shownHex
-                          ? t("gap.hintPickedColour", { hex: shownHex })
+                        ? shownHex || gapChosenHexes.length > 0
+                          ? t("gap.hintPickedColour", { hex: [...new Set([...gapChosenHexes, ...(shownHex ? [shownHex] : [])])].slice(0, 3).join(" · ") })
                           : t(pickedPatches.length > 0 ? "gap.hintPickedReady" : "gap.hintPicked")
                         : t(gapHexes.length >= 2 ? "gap.hintPartReady" : "gap.hintPart")}
                   </span>
