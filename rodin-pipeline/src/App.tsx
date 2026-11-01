@@ -136,7 +136,7 @@ import { pickedOnly, pickedValueLines, type TidyArea } from "./engine/tidyArea";
 import { findPrintPreset } from "@core/printPresets";
 import { limitTidyToPicked } from "./engine/tidyArea";
 import { ExportSection, faceOnBed, type ExportCheck } from "./ui/ExportSection";
-import { NumberField, Swatch, pct } from "./ui/common";
+import { NumberField, Swatch, pct, pctNumber } from "./ui/common";
 import { Brand, Glossary, Icon, Intro, Menu, Segmented, StepNav, Welcome, supportLinks } from "./ui/Shell";
 import { ColourSelect } from "./ui/ColourSelect";
 import { ColourPicker } from "./ui/ColourPicker";
@@ -1629,7 +1629,7 @@ export default function App() {
    * preview looks the same, "off" the borders were straightened while the cut
    * is off) — null when closed.
    */
-  const [cutNotice, setCutNotice] = useState<"on" | "load" | "undone" | "off" | null>(null);
+  const [cutNotice, setCutNotice] = useState<"on" | "load" | "undone" | "off" | "piece" | null>(null);
   /** Each colour state's cut once worked out (by its colours array, as undo and redo bring it back). */
   const cutByColours = useRef(new WeakMap<RGB[], { layer: CutLayer; triangles: MeshModel["triangles"]; span: number; protectedKey: string }>());
   /** The palette's colours in order: a cut's groups are positions in it. */
@@ -1728,6 +1728,11 @@ export default function App() {
    * borders' preview whose group is not its face's (the face is cut, not yet
    * confirmed), a face of the piece's group beside it — so a hover or a click
    * takes the patch the piece shows as part of, not the colour under it.
+   */
+  /**
+   * The face a click on the result view means: on a preview piece, a face of the
+   * colour the piece shows (see faceOfGroupNear); -1 when that colour is in the
+   * preview only — no face of it near yet, until the cut is confirmed.
    */
   function faceShownAt(face: number, piece: number | undefined): number {
     const group = piece !== undefined ? viewerCut?.group?.[piece] : undefined;
@@ -2832,8 +2837,17 @@ export default function App() {
       setStatus(t("status.pickNothing"));
       return;
     }
-    const position = labels[faceIndex];
-    const hex = hexByPosition[position] ?? rgbToHex(current.triangleColors[faceIndex]);
+    samplePosition(labels[faceIndex], rgbToHex(current.triangleColors[faceIndex]));
+  }
+
+  /** The eyedropper's colour: a palette colour (or `fallback` when it is not one). */
+  function samplePosition(position: number, fallback?: string): void {
+    setEyedropper(false);
+    const hex = hexByPosition[position] ?? fallback;
+    if (!hex) {
+      setStatus(t("status.pickNothing"));
+      return;
+    }
     if (hexByPosition.includes(hex)) setPickTarget(hex);
     else {
       setPickTarget("__new__");
@@ -2845,7 +2859,22 @@ export default function App() {
   async function handlePick(faceIndex: number | null, info: PickInfo = { double: false, toggle: false }): Promise<void> {
     if (!model) return;
     // A click on a preview piece means the colour it shows (see faceShownAt): picking, the fill tool and the eyedropper alike.
-    if (faceIndex !== null && info.piece !== undefined) faceIndex = faceShownAt(faceIndex, info.piece);
+    if (faceIndex !== null && info.piece !== undefined) {
+      const shown = faceShownAt(faceIndex, info.piece);
+      if (shown < 0) {
+        // That colour is in the preview only: the eyedropper takes it; a pick or a fill would
+        // take the face's own colour under it — say so instead, beside the confirm button.
+        const group = viewerCut?.group?.[info.piece] ?? -1;
+        if ((info.alt || eyedropperRef.current) && group >= 0) {
+          samplePosition(group);
+          return;
+        }
+        if (cutSpan > 0) setCutNotice("piece");
+        setStatus(t("status.previewPiece"));
+        return;
+      }
+      faceIndex = shown;
+    }
     if (info.alt || eyedropperRef.current) {
       sampleFace(faceIndex);
       return;
@@ -2876,13 +2905,16 @@ export default function App() {
         setShownHex(patch.hex);
         setStatus(t("status.colourMode", { index: patch.index, hex: patch.hex, ...selectionSummary(next) }));
         focusPatch(patch, info.source, faceIndex);
-      } else if (info.toggle || shownHexRef.current !== null || gapModeRef.current) {
-        // (The gap clean needs two colours, so there a click adds.)
+      } else if (info.toggle || gapModeRef.current) {
+        // Shift (or ⌘, Ctrl) adds or takes away.  (The gap clean needs two colours, so there a click adds.)
         const next = exists ? current.filter((p) => p.id !== patch.id) : [...current, patch];
         setPickedPatches(next);
         setStatus(t(exists ? "status.pickRemoved" : "status.pickAdded", { index: patch.index, hex: patch.hex, ...selectionSummary(next) }));
         if (!exists) focusPatch(patch, info.source, faceIndex);
       } else {
+        // A plain click picks this patch alone, in colour mode too (it ends it): a double click
+        // made by chance must not leave every later click adding.
+        setShownHex(null);
         setPickedPatches([patch]);
         setStatus(t("status.picked", { index: patch.index, hex: patch.hex, n: patch.faces.length.toLocaleString(), pct: pct(patch.fraction), extruder: extruderText(patch.index) }));
         focusPatch(patch, info.source, faceIndex);
@@ -6395,7 +6427,7 @@ export default function App() {
                 <span className="sw" style={{ background: mixRow.hex }} />
                 <span className="mono">{mixRow.label}</span>
                 <span className="mono muted">
-                  {mixRow.hex} · {(mixRow.area * 100).toFixed(1)}%
+                  {mixRow.hex} · {pct(mixRow.area)}
                 </span>
               </span>
             )}
@@ -6496,7 +6528,7 @@ export default function App() {
                   {toast.kind === "merge" && (
                     <>
                       {" · "}
-                      {t("toast.area")} <span className="mono">{(toast.area[0] * 100).toFixed(1)} → {(toast.area[1] * 100).toFixed(1)}%</span>
+                      {t("toast.area")} <span className="mono">{pctNumber(toast.area[0])} → {pct(toast.area[1])}</span>
                       {" · "}
                       {toast.sameOutput ? t("toast.sameOutput", { out: toast.sameOutput }) : toast.outputs.length > 0 ? t("toast.outputs", { list: toast.outputs.join(" · ") }) : t("toast.replan")}
                     </>

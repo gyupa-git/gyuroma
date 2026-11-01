@@ -33,8 +33,22 @@ describe("a click on the preview's pieces", () => {
     expect(faceOfGroupNear(offsets, neighbours, labels, 1, 2)).toBe(4);
   });
 
-  it("keeps the face when it is of that group, or none is near", () => {
+  it("looks as far as a cut's line may lie from its border", () => {
+    // A strip of 32 faces, the group only from 20 on: 11 rings out is still near, 19 is not.
+    const n = 32;
+    const off = Int32Array.from({ length: n + 1 }, (_, i) => (i === 0 ? 0 : 2 * i - 1));
+    const nb: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (i > 0) nb.push(i - 1);
+      if (i < n - 1) nb.push(i + 1);
+    }
+    const strip = Array.from({ length: n }, (_, i) => (i >= 20 ? 1 : 0));
+    expect(faceOfGroupNear(off, Int32Array.from(nb), strip, 9, 1)).toBe(20);
+    expect(faceOfGroupNear(off, Int32Array.from(nb), strip, 1, 1)).toBe(-1);
+  });
+
+  it("keeps the face when it is of that group, and says when none is near (preview only)", () => {
     expect(faceOfGroupNear(offsets, neighbours, labels, 2, 1)).toBe(2);
-    expect(faceOfGroupNear(offsets, neighbours, labels, 0, 2, 2)).toBe(0);
+    expect(faceOfGroupNear(offsets, neighbours, labels, 0, 2, 2)).toBe(-1);
   });
 });

@@ -7,6 +7,7 @@ import type { PhysicalSlot, RGB } from "@core/types";
 import type { VirtualExtruderPlan } from "@core/virtualExtruders";
 import type { MixSettings } from "../engine/types";
 import { useT } from "../i18n";
+import { pct } from "./common";
 import { HelpTip } from "./HelpTip";
 import { deltaClass, SequenceBar, type MatrixRow } from "./MappingMatrix";
 import { Icon } from "./Shell";
@@ -177,7 +178,7 @@ export function RecipeDetail({
         <span className="row-card-text">
           <span className="pane-label">{t("recipe.selectedRow")}</span>
           <span>
-            <b className="mono">{row.hex}</b> <span className="mono muted">{(row.area * 100).toFixed(1)}%</span>
+            <b className="mono">{row.hex}</b> <span className="mono muted">{pct(row.area)}</span>
           </span>
         </span>
         <span className={`ve-chip${row.kind === "physical" ? " physical" : ""}`}>{row.label}</span>

@@ -42,11 +42,15 @@ function insideness(t: ArrayLike<number>, o: number, point: readonly [number, nu
 }
 
 /**
- * A face of `group` near `face` (a few rings of neighbours out), so a click on
- * a piece of that group takes the patch the piece shows as part of; `face`
- * itself when it is of that group already or none is near.
+ * A face of `group` near `face` (up to `rings` rings of neighbours out), so a
+ * click on a piece of that group takes the patch the piece shows as part of;
+ * `face` itself when it is of that group already, -1 when none is near: the
+ * colour is in the preview only, the model has no face of it there yet.  The
+ * line a cut follows may lie four border edges and more from the border, and
+ * round a fold further still: 3 rings missed the outer pieces of a patch drawn
+ * smooth, and a click there took the colour of the face under them.
  */
-export function faceOfGroupNear(offsets: Int32Array, neighbours: Int32Array, labels: ArrayLike<number>, face: number, group: number, rings = 3): number {
+export function faceOfGroupNear(offsets: Int32Array, neighbours: Int32Array, labels: ArrayLike<number>, face: number, group: number, rings = 12): number {
   if (labels[face] === group) return face;
   const seen = new Set<number>([face]);
   let ring = [face];
@@ -62,5 +66,5 @@ export function faceOfGroupNear(offsets: Int32Array, neighbours: Int32Array, lab
       }
     ring = next;
   }
-  return face;
+  return -1;
 }

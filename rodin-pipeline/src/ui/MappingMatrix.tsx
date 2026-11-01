@@ -6,6 +6,7 @@ import type { PaletteEntry, PhysicalSlot, RGB } from "@core/types";
 import type { PhysicalOnlyEntry, VirtualBlendEntry, VirtualExtruderPlan } from "@core/virtualExtruders";
 import type { MixSettings } from "../engine/types";
 import { useT } from "../i18n";
+import { pct } from "./common";
 import { HelpTip } from "./HelpTip";
 
 /** One palette colour and how it prints. */
@@ -256,7 +257,7 @@ export const MappingMatrix = forwardRef<HTMLDivElement, {
               <span className="group-cell">
                 <span className="sw" style={{ background: row.hex }} />
                 <span className="mono">{row.hex}</span>
-                <span className="mono area">{(row.area * 100).toFixed(1)}%</span>
+                <span className="mono area">{pct(row.area)}</span>
                 {row.edited && <span className="edited" title={t("matrix.edited")}>✎</span>}
                 {pointed?.includes(row.hex) && <span className="pin-mark" title={t("strip.pointed", { hex: row.hex })} aria-label={t("strip.pointed", { hex: row.hex })} />}
               </span>

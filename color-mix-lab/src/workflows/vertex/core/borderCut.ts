@@ -152,12 +152,13 @@ export function cutAlongBorderLines(
       n1 /= nl;
       n2 /= nl;
     }
-    // On the rim of a thin part the faces around a vertex face both ways and their
-    // normals cancel out: there, the asking face's own.
+    // On the rim of a thin part, or at the tip where a fan of thin faces meets, the faces
+    // around a vertex face every way and their normals cancel out: there is no surface to
+    // tell its side in (taken from the face that asks first, its fan grew spikes), and the
+    // vertex is left alone.
     if (!(nl > 0) || n0 * f0 + n1 * f1 + n2 * f2 < 0.2) {
-      n0 = f0;
-      n1 = f1;
-      n2 = f2;
+      pairOf.set(v, CLASH);
+      return CLASH;
     }
     const ix = Math.floor(px / cell);
     const iy = Math.floor(py / cell);

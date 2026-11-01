@@ -96,6 +96,20 @@ export function Swatch({ rgb, hex, title, size = 18 }: { rgb?: RGB; hex?: string
   return <span className="swatch" style={{ background: colour, width: size, height: size }} title={title ?? colour} />;
 }
 
-export function pct(fraction: number, digits = 1): string {
-  return `${(fraction * 100).toFixed(digits)}%`;
+/**
+ * A share as a number of percent: one decimal from 1 % up, two below, and
+ * "<0.01" for a sliver that would round to nothing — what is there never
+ * reads 0 (a colour shown at "0.0 %" while it is on the model, 11-02).
+ */
+export function pctNumber(fraction: number): string {
+  const value = fraction * 100;
+  if (value < 0) return `-${pctNumber(-fraction)}`;
+  if (!(value > 0)) return "0";
+  if (value >= 1) return value.toFixed(1);
+  if (value >= 0.01) return value.toFixed(2);
+  return "<0.01";
+}
+
+export function pct(fraction: number): string {
+  return `${pctNumber(fraction)}%`;
 }

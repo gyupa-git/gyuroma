@@ -5,6 +5,7 @@ import { deltaE2000, rgbToLab } from "@core/prusaFdmMixer";
 import type { RGB } from "@core/types";
 import { useT } from "../i18n";
 import { HelpTip } from "./HelpTip";
+import { pctNumber } from "./common";
 import { Icon, Segmented } from "./Shell";
 
 /**
@@ -81,9 +82,7 @@ function luminance(rgb: RGB): number {
 function textOn(rgb: RGB): string {
   return luminance(rgb) > 0.55 ? "rgba(20,20,21,0.75)" : "rgba(255,255,255,0.85)";
 }
-function pctText(fraction: number): string {
-  return (fraction * 100).toFixed(1);
-}
+const pctText = pctNumber;
 
 interface BandLayout {
   group: StripGroup;

@@ -7,7 +7,7 @@ import type { MergeFlag, MergeSettings } from "../engine/types";
 import { useT } from "../i18n";
 import type { StripOutput } from "./ColourStrip";
 import { HelpTip } from "./HelpTip";
-import { NumberField } from "./common";
+import { NumberField, pct } from "./common";
 import { Icon } from "./Shell";
 
 /**
@@ -145,7 +145,7 @@ export function CleanupPanel({
                 <span className="sub">
                   {[
                     <>
-                      {t("clean.area")} <span className="mono">{(focus.weight * 100).toFixed(1)}%</span>
+                      {t("clean.area")} <span className="mono">{pct(focus.weight)}</span>
                     </>,
                     ...(focus.colours.length > 1 ? t("clean.shades", { n: focus.colours.length.toLocaleString() }) : t("clean.shadesOne")).split(" · "),
                     ...(focus.pinned ? [<span title={t("clean.pinnedHint")}>📌 {t("clean.pinned")}</span>] : []),
@@ -249,7 +249,7 @@ export function CleanupPanel({
                         <span className="dot" style={{ background: hexOf(group) }} />
                         <span className="mono">{hexOf(group)}</span>
                         <span className="mono" style={{ color: "var(--muted)" }}>
-                          {(group.weight * 100).toFixed(1)}%
+                          {pct(group.weight)}
                         </span>
                       </button>
                     ))}
@@ -378,7 +378,7 @@ export function CleanupPanel({
               {protectedGroups.map((group) => (
                 <button key={hexOf(group)} type="button" className="chip button" title={`${hexOf(group)} · ${t("clean.pickThis")}`} onClick={() => onToggleSelected(hexOf(group))}>
                   <span className="dot" style={{ background: hexOf(group) }} />
-                  <span className="mono">{(group.weight * 100).toFixed(1)}%</span>
+                  <span className="mono">{pct(group.weight)}</span>
                   <Icon name="lock" size={11} stroke={1.6} />
                 </button>
               ))}
