@@ -4245,6 +4245,8 @@ export default function App() {
         smoothProtected: mergeSettings.smoothProtected,
         trimRounds: mergeSettings.trimRounds,
         lineSpan: mergeSettings.lineSpan,
+        // Borders cut along their line and confirmed are smooth already: the tidy leaves them as they are.
+        settled: settledFaces(model),
         geometry: { triangles: model.triangles, vertices: model.vertices },
       });
       const representatives = representativeColoursByPosition(model.triangleColors, labels, palette);

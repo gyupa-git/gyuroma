@@ -70,6 +70,15 @@ export interface MergeReprojectionOptions {
    * Before the teeth trim.  Needs `geometry`.
    */
   lineSpan?: number;
+  /**
+   * Each face's group (any number standing for it) when the mesh was last cut
+   * along the lines and confirmed (borderCut).  A side that was a border then
+   * is a smooth line already, made of the cut's thin pieces: the line
+   * straightening leaves it where it is, the teeth trim does not count it (a
+   * piece along the line is not a tooth) and the neighbour vote does not hear
+   * the other side of it.  Omitted: every border is worked on afresh.
+   */
+  settled?: ArrayLike<number>;
   geometry?: { triangles: ArrayLike<Tri>; vertices: ArrayLike<Vec3> };
 }
 
@@ -248,6 +257,8 @@ export function mergeWithReprojection(
   for (let f = 0; f < faceCount; f++) if (protectedGroup[g[f]]) prot[f] = 1;
   const next = new Int32Array(faceCount);
   const seen = smoothProtected ? new Int32Array(faceCount) : null;
+  // Across a confirmed cut the line is drawn already: the other side has no vote (see settled).
+  const settledLine = options.settled;
   let stamp = 0;
   for (let round = 0; round < smoothingRounds; round++) {
     for (let f = 0; f < faceCount; f++) {
@@ -257,7 +268,11 @@ export function mergeWithReprojection(
       }
       votes.fill(0);
       const end = adjacency.offsets[f + 1];
-      for (let i = adjacency.offsets[f]; i < end; i++) votes[g[adjacency.neighbours[i]]] += 1;
+      for (let i = adjacency.offsets[f]; i < end; i++) {
+        const n = adjacency.neighbours[i];
+        if (settledLine && settledLine[n] !== settledLine[f] && g[n] !== g[f]) continue;
+        votes[g[n]] += 1;
+      }
       votes[g[f]] += 2;
       next[f] = argmaxRow(votes, 0, groupCount);
     }
@@ -311,6 +326,7 @@ export function mergeWithReprojection(
     stats.lineFaces = smoothBorderLines(adjacency, options.geometry.triangles, options.geometry.vertices, g, {
       span: options.lineSpan ?? 0,
       protectedGroup,
+      settled: options.settled,
     });
 
   // 2b) Teeth: faces bordering other groups along two sides or more (see trimRounds).
@@ -342,10 +358,12 @@ export function mergeWithReprojection(
         sideLengths.push(Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]));
       }
     };
+    // A side along a confirmed cut (a border when the mesh was cut and confirmed) is the line itself: not a tooth's side.
+    const settled = options.settled;
     const foreignSides = (f: number) => {
       sidesOf(f);
       let n = 0;
-      for (const s of sideFaces) if (g[s] !== g[f]) n++;
+      for (const s of sideFaces) if (g[s] !== g[f] && !(settled && settled[s] !== settled[f])) n++;
       return n;
     };
     const ownAround = (f: number) => {

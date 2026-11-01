@@ -275,3 +275,44 @@ describe("mergeWithReprojection — teeth trim", () => {
     for (let i = 2; i < nx - 2; i++) for (let k = 0; k < 2; k++) expect(result.groups[face(i, 3, k)]).toBe(2);
   });
 });
+
+describe("mergeWithReprojection — borders cut and confirmed (settled)", () => {
+  // Group 0 below, group 1 above, the border with teeth in row 3: as the smooth
+  // borders' cut leaves it (thin pieces, a ragged look in faces), confirmed.
+  const nx = 12;
+  const ny = 8;
+  const grid = gridMesh(nx, ny);
+  const adjacency = buildFaceAdjacency(grid.triangles, grid.vertices.length);
+  const labels: number[] = [];
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) labels.push(j < 3 || (j === 3 && i % 2 === 0) ? 0 : 1, j < 3 ? 0 : 1);
+  const tidy = (settled?: Int32Array) =>
+    mergeWithReprojection(adjacency, {
+      faceLabels: Int32Array.from(labels),
+      labelToGroup: Int32Array.from([0, 1]),
+      groupCount: 2,
+      minBlob: 0,
+      smoothingRounds: 6,
+      trimRounds: 3,
+      lineSpan: 10,
+      settled,
+      geometry: { triangles: grid.triangles, vertices: grid.vertices },
+    });
+
+  it("works on a border as it is when nothing was confirmed", () => {
+    const result = tidy();
+    expect([...result.groups].some((g, f) => g !== labels[f])).toBe(true);
+  });
+
+  it("leaves a confirmed border exactly where it is: no line, no trim, no vote across it", () => {
+    const result = tidy(Int32Array.from(labels));
+    expect([...result.groups]).toEqual(labels);
+    expect(result.stats.lineFaces).toBe(0);
+    expect(result.stats.trimmedFaces).toBe(0);
+    expect(result.stats.smoothedFaceChanges).toBe(0);
+  });
+
+  it("works on a border drawn since (the groups then were one)", () => {
+    const result = tidy(new Int32Array(labels.length));
+    expect([...result.groups].some((g, f) => g !== labels[f])).toBe(true);
+  });
+});
