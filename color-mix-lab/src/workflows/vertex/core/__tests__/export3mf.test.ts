@@ -177,7 +177,7 @@ describe("D-1 contiguous virtual extruder ids", () => {
     const modelXml = await zip.file("3D/3dmodel.model")!.async("text");
     const codes = [...modelXml.matchAll(/slic3rpe:mmu_segmentation="([0-9A-F]*)"/g)].map((m) => m[1]);
     expect(codes.length).toBe(exportOptions().model.triangles.length);
-    const states = new Set(codes.map(decodePaintCode));
+    const states = new Set(codes.map((code) => decodePaintCode(code)));
     const virtualStates = [...states].filter((s) => s > 5).sort((a, b) => a - b);
     expect(virtualStates).toEqual(jsonIds);
     expect([...states].filter((s) => s <= 5)).toEqual([2]);
@@ -487,11 +487,12 @@ describe("orientation", () => {
     const result = await buildPrusa3mfBlob(lyingDownOptions("stand-up"));
     const xml = await (await readZip(result.blob)).file("3D/3dmodel.model")!.async("text");
     const transform = /<item objectid="1" transform="([^"]+)"/.exec(xml)![1].split(" ").map(Number);
-    // Rows of the 3x3: the mesh's X ends up as the printed Z.
+    // Read as the 3MF spec does, the first three numbers are where the mesh's X
+    // goes: it becomes the printed height (the figure stands on its +X end).
     // The written matrix is rounded for the file; compare to that precision.
     const scale = Number(result.summary.scale.toFixed(9));
-    expect(transform.slice(0, 3)).toEqual([0, 0, scale]);
-    expect(transform.slice(6, 9)).toEqual([-scale, 0, 0]);
+    expect(transform.slice(0, 3)).toEqual([0, 0, -scale]);
+    expect(transform.slice(6, 9)).toEqual([scale, 0, 0]);
     expect(result.summary.coordinateMode).toBe("x-up");
   });
 

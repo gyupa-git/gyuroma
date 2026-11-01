@@ -6,6 +6,7 @@ import { buildVirtualExtruderPlan } from "@core/virtualExtruders";
 import { applyAssignmentOverridesToPlan, type AssignmentOverride } from "@core/assignmentOverrides";
 import { applyRecipeOverridesToPlan, normaliseRecipeCounts, type RecipeOverride } from "@core/recipeOverrides";
 import { resolveCoordinateMode, transformNoTranslation } from "@core/export3mf";
+import { combineTurns, turnMode, turnRows, type FixedCoordinateMode } from "@core/orientation";
 import { accentPaletteIndices, fidelityScore, scoreSlotSet } from "@core/spoolAdvice";
 import { loadRodin3mf } from "@core/rodin3mf";
 import { parseObjFile } from "@core/objParser";
@@ -120,7 +121,7 @@ import {
 import { pickedOnly, pickedValueLines, type TidyArea } from "./engine/tidyArea";
 import { findPrintPreset } from "@core/printPresets";
 import { limitTidyToPicked } from "./engine/tidyArea";
-import { ExportSection, type ExportCheck } from "./ui/ExportSection";
+import { ExportSection, faceOnBed, type ExportCheck } from "./ui/ExportSection";
 import { NumberField, Swatch, pct } from "./ui/common";
 import { Brand, Glossary, Icon, Intro, Menu, Segmented, StepNav, Welcome, supportLinks } from "./ui/Shell";
 import { ColourSelect } from "./ui/ColourSelect";
@@ -238,6 +239,16 @@ interface StripToast {
 
 function baseName(name: string): string {
   return name.replace(/\.[^.]+$/, "") || "model";
+}
+
+/**
+ * How a freshly loaded file stands: OBJ (Nomad, Blender) is written Y-up and
+ * 3MF is Z-up by its spec.  Following the file beats guessing from its shape —
+ * "the longest side up" laid wide figures (a big head, a key on the back) on
+ * their side.
+ */
+function orientationFor(kind: SourceInfo["kind"]): FixedCoordinateMode {
+  return kind === "rodin" ? "keep" : "blender-y-up";
 }
 
 function yieldToUi(ms = 30): Promise<void> {
@@ -2848,7 +2859,13 @@ export default function App() {
     forgetRecipeUndo();
     forgetTidyUndo();
     setTidyResult(null);
-    setSettings((prev) => ({ ...prev, manualPhysical: {}, export: { ...prev.export, fileName: "" } }));
+    setSettings((prev) => ({
+      ...prev,
+      manualPhysical: {},
+      // The orientation belongs to the model: a face put down for the last one
+      // used to stay and lay the next one over.  Restored work keeps its own.
+      export: { ...prev.export, fileName: "", ...(options?.restored ? {} : { coordinateMode: orientationFor(info.kind) }) },
+    }));
     setFitNonce((n) => n + 1);
     if (options?.persist === false) return;
     if (source && rememberWorkRef.current) void persistWorkFile(source, loadGenerationRef.current);
@@ -4484,18 +4501,10 @@ export default function App() {
   const rightPanel = step >= 2;
   const rightKey = step === 2 ? "2" : "34";
   const rightWidth = rightWidths[rightKey] ?? rightDefault(rightKey);
-  const faceDownLabel: Record<PipelineSettings["export"]["coordinateMode"], string> = {
+  // The two that look at the mesh first; every fixed turn is named by the face it puts down.
+  const faceDownLabel: Partial<Record<PipelineSettings["export"]["coordinateMode"], string>> = {
     "stand-up": t("exp.coordStandUp"),
-    keep: t("exp.coordKeep"),
     auto: t("exp.coordAuto"),
-    "blender-y-up": t("exp.coordYUp"),
-    "x-up": t("exp.coordXUp"),
-    "face-front": t("exp.coordFaceFront"),
-    "face-back": t("exp.coordFaceBack"),
-    "face-left": t("exp.coordFaceLeft"),
-    "face-right": t("exp.coordFaceRight"),
-    "face-top": t("exp.coordFaceTop"),
-    "face-bottom": t("exp.coordFaceBottom"),
   };
   const layerChoices = [...new Set([0.1, 0.15, 0.2, 0.25, ...(layerHeightMm ? [layerHeightMm] : [])])].sort((a, b) => a - b);
 
@@ -4773,6 +4782,7 @@ export default function App() {
               <>
               <ExportSection
                 settings={settings.export}
+                orientationBase={orientationFor(sourceInfo?.kind ?? "rodin")}
                 onChange={(next) => {
                   if (next.printPreset !== settings.export.printPreset) setPreviewLayerHeight(null);
                   patchSettings("export", next);
@@ -4782,7 +4792,9 @@ export default function App() {
                   heightMm: printHeightMm,
                   layerHeight: layerHeightMm,
                   layers: printHeightMm !== null && layerHeightMm ? Math.ceil(printHeightMm / layerHeightMm - 1e-6) : null,
-                  faceDown: faceDownLabel[settings.export.coordinateMode] ?? settings.export.coordinateMode,
+                  faceDown:
+                    faceDownLabel[settings.export.coordinateMode] ??
+                    t(faceOnBed(settings.export.coordinateMode, orientationFor(sourceInfo?.kind ?? "rodin")) ?? "exp.coordTurn"),
                   fit: printFit,
                 }}
                 check={exportCheck}
@@ -4943,10 +4955,12 @@ export default function App() {
                       disabled={view === "iso"}
                       title={t("view.faceDownHint")}
                       onClick={() => {
+                        if (view === "iso") return;
                         patchSettings("export", {
                           ...settings.export,
-                          // The side being looked at is the one that goes down.
-                          coordinateMode: `face-${view}` as PipelineSettings["export"]["coordinateMode"],
+                          // The side being looked at — as the view shows the model
+                          // now, not as the file has it — is the one that goes down.
+                          coordinateMode: turnMode(combineTurns(turnRows(`face-${view}`), turnRows(viewMode))),
                         });
                         close();
                       }}

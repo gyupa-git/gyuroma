@@ -29,25 +29,21 @@ import {
   renderModelThumbnail,
   type ThumbnailRaster,
 } from "./modelThumbnail";
+import {
+  turn3mfEntries,
+  turnPoint,
+  turnRows,
+  type ExportCoordinateMode,
+  type FixedCoordinateMode,
+} from "./orientation";
 
 /**
- * How the mesh is turned before it is placed on the bed.  "stand-up" puts the
- * model's longest axis vertical, which is what a figure sculpted lying down
- * needs; "auto" only catches the Blender/Nomad Y-up convention.
+ * How the mesh is turned before it is placed on the bed (orientation.ts).
+ * "stand-up" puts the model's longest axis vertical, which is what a figure
+ * sculpted lying down needs; "auto" only catches the Blender/Nomad Y-up
+ * convention.
  */
-export type ExportCoordinateMode =
-  | "auto"
-  | "keep"
-  | "blender-y-up"
-  | "x-up"
-  | "stand-up"
-  /** Put a named face of the model on the bed. */
-  | "face-front"
-  | "face-back"
-  | "face-left"
-  | "face-right"
-  | "face-top"
-  | "face-bottom";
+export type { ExportCoordinateMode, FixedCoordinateMode };
 export type ExportBedSource = "template" | "custom";
 
 export interface ExportPlacementOptions {
@@ -206,7 +202,7 @@ function bounds(vertices: Vec3[]): { min: Vec3; max: Vec3; range: Vec3 } {
 export function resolveCoordinateMode(
   mode: ExportCoordinateMode,
   vertices: Vec3[],
-): Exclude<ExportCoordinateMode, "auto" | "stand-up"> {
+): FixedCoordinateMode {
   if (mode !== "auto" && mode !== "stand-up") return mode;
   const b = bounds(vertices);
   const [rx, ry, rz] = b.range;
@@ -221,25 +217,15 @@ export function resolveCoordinateMode(
 
 export function transformNoTranslation(
   v: Vec3,
-  mode: Exclude<ExportCoordinateMode, "auto" | "stand-up">,
+  mode: FixedCoordinateMode,
   scale: number,
 ): Vec3 {
-  const [x, y, z] = v;
-  if (mode === "keep" || mode === "face-bottom") return [scale * x, scale * y, scale * z];
-  // X-up (a figure lying along X): rotate about Y so X becomes height.
-  if (mode === "x-up" || mode === "face-right") return [scale * z, scale * y, -scale * x];
-  // The opposite side down.
-  if (mode === "face-left") return [-scale * z, scale * y, scale * x];
-  if (mode === "face-front") return [scale * x, -scale * z, scale * y];
-  if (mode === "face-top") return [scale * x, -scale * y, -scale * z];
-  // Blender Y-up OBJ to PrusaSlicer/3MF Z-up: X'=X, Y'=Z, Z'=-Y.
-  // The same rotation lays the back face (+Y) on the bed.
-  return [scale * x, scale * z, -scale * y];
+  return turnPoint(v, turnRows(mode), scale);
 }
 
 function transformedBounds(
   vertices: Vec3[],
-  mode: Exclude<ExportCoordinateMode, "auto" | "stand-up">,
+  mode: FixedCoordinateMode,
   scale: number,
 ): { min: Vec3; max: Vec3; range: Vec3 } {
   const min: Vec3 = [
@@ -268,7 +254,7 @@ function transformedBounds(
 
 function resolveScale(
   vertices: Vec3[],
-  mode: Exclude<ExportCoordinateMode, "auto" | "stand-up">,
+  mode: FixedCoordinateMode,
   requestedScale: number,
   targetHeight?: number | null,
 ): number {
@@ -282,29 +268,15 @@ function resolveScale(
 }
 
 function matrixString(
-  mode: Exclude<ExportCoordinateMode, "auto" | "stand-up">,
+  mode: FixedCoordinateMode,
   scale: number,
   tx: number,
   ty: number,
   tz: number,
 ): string {
-  // Rows are the output components: v' = (r0·v, r1·v, r2·v), matching
-  // transformNoTranslation so the 3MF places the mesh the way the preview and
-  // the bounds maths already assume.
-  // Rows are the output components, matching transformNoTranslation.
-  const rows =
-    mode === "keep" || mode === "face-bottom"
-      ? [scale, 0, 0, 0, scale, 0, 0, 0, scale]
-      : mode === "x-up" || mode === "face-right"
-        ? [0, 0, scale, 0, scale, 0, -scale, 0, 0]
-        : mode === "face-left"
-          ? [0, 0, -scale, 0, scale, 0, scale, 0, 0]
-          : mode === "face-back"
-            ? [scale, 0, 0, 0, 0, -scale, 0, scale, 0]
-            : mode === "face-top"
-              ? [scale, 0, 0, 0, -scale, 0, 0, 0, -scale]
-              : [scale, 0, 0, 0, 0, scale, 0, -scale, 0];
-  return [...rows, tx, ty, tz].map(fmt).join(" ");
+  // The 3MF order (row vectors, orientation.ts), so the slicer places the mesh
+  // where transformNoTranslation — the preview and the bounds — already has it.
+  return [...turn3mfEntries(turnRows(mode), scale), tx, ty, tz].map(fmt).join(" ");
 }
 
 export function buildTransform(
@@ -513,7 +485,7 @@ export function validateExportAssignments(input: ExportValidationInput): string[
  */
 async function createExportThumbnailPng(
   options: Export3mfOptions,
-  resolvedMode: Exclude<ExportCoordinateMode, "auto" | "stand-up">,
+  resolvedMode: FixedCoordinateMode,
   paletteIndices: number[],
 ): Promise<Uint8Array> {
   const paletteRgbByIndex = new Map<number, RGB>(
@@ -1448,7 +1420,7 @@ export async function buildPrusa3mfBlob(
   );
   const generatedThumbnailBytes = await createExportThumbnailPng(
     options,
-    transformResult.resolvedMode as Exclude<ExportCoordinateMode, "auto" | "stand-up">,
+    transformResult.resolvedMode as FixedCoordinateMode,
     modelResult.paletteIndices,
   );
 

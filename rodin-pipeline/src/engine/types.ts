@@ -5,6 +5,7 @@ import type {
   MixingRecipeResolution,
   VirtualMixPriorityMode,
 } from "@core/types";
+import type { ExportCoordinateMode } from "@core/orientation";
 
 /** Tool changers keep growing (9-head machines are coming); the paint format allows 255 with the mixes. */
 export const MAX_PHYSICAL = 16;
@@ -61,18 +62,11 @@ export interface ExportSettings {
   /** Colour printers: the file format; null takes the printer's first. */
   colourFormat: "3mf" | "obj" | "wrl" | "ply" | null;
   fileName: string;
-  coordinateMode:
-    | "auto"
-    | "keep"
-    | "blender-y-up"
-    | "x-up"
-    | "stand-up"
-    | "face-front"
-    | "face-back"
-    | "face-left"
-    | "face-right"
-    | "face-top"
-    | "face-bottom";
+  /**
+   * Which way up the model goes (@core/orientation).  It belongs to the model:
+   * loading another file sets it again from that file (App installModel).
+   */
+  coordinateMode: ExportCoordinateMode;
   scale: number;
   targetHeight: number | null;
   /** Write each separate piece as its own 3MF object (PrusaSlicer's own split erases the paint). */
@@ -193,7 +187,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     printerId: "prusa-xl5",
     colourFormat: null,
     fileName: "",
-    coordinateMode: "stand-up",
+    coordinateMode: "keep",
     scale: 1,
     // Nomad/Rodin meshes arrive at unit scale (a 2 mm model), which slices into a
     // handful of layers and looks single-coloured. Default every export to 70 mm.

@@ -1,4 +1,5 @@
 import type { RGB, Tri, Vec3 } from "./types";
+import { turnPoint, turnRows, type FixedCoordinateMode } from "./orientation";
 
 /**
  * Small CPU rasteriser shared by the 3MF thumbnail export and the merge
@@ -7,16 +8,8 @@ import type { RGB, Tri, Vec3 } from "./types";
  */
 
 export type ThumbnailView = "front-top-left" | "front" | "back" | "left" | "right" | "top";
-export type ThumbnailCoordinateMode =
-  | "keep"
-  | "blender-y-up"
-  | "x-up"
-  | "face-front"
-  | "face-back"
-  | "face-left"
-  | "face-right"
-  | "face-top"
-  | "face-bottom";
+/** The turn the export applies (orientation.ts), so the thumbnail stands as the print will. */
+export type ThumbnailCoordinateMode = FixedCoordinateMode;
 
 export interface ThumbnailRenderOptions {
   width?: number;
@@ -87,14 +80,7 @@ function basisFor(view: ThumbnailView): Basis {
 }
 
 function transformVertex(v: Vec3, mode: ThumbnailCoordinateMode): Vec3 {
-  if (mode === "keep" || mode === "face-bottom") return v;
-  const [x, y, z] = v;
-  // Same rotations the export applies, so the thumbnail stands as the print will.
-  if (mode === "x-up" || mode === "face-right") return [z, y, -x];
-  if (mode === "face-left") return [-z, y, x];
-  if (mode === "face-back") return [x, -z, y];
-  if (mode === "face-top") return [x, -y, -z];
-  return [x, -z, y];
+  return turnPoint(v, turnRows(mode));
 }
 
 function project(basis: Basis, v: Vec3): [number, number, number] {

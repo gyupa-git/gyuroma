@@ -1,5 +1,6 @@
 import { MAX_PAINTABLE_EXTRUDER_ID } from "@core/paintCodes";
 import type { Template3mfInfo } from "@core/template3mf";
+import { combineTurns, sameTurn, turnMode, turnRows, type FixedCoordinateMode } from "@core/orientation";
 import { rgbToHex } from "@core/colour";
 import { deltaE2000, rgbToLab } from "@core/prusaFdmMixer";
 import { PRINT_PRESETS } from "@core/printPresets";
@@ -43,8 +44,37 @@ const PRINTER_GROUPS: Array<{ key: TranslateKey; match: (printer: Printer) => bo
 
 const FORMAT_LABEL: Record<"3mf" | "obj" | "wrl" | "ply", string> = { "3mf": "3MF", obj: "OBJ + MTL", wrl: "VRML (.wrl)", ply: "PLY" };
 
+const FACES = [
+  ["front", "exp.coordFaceFront"],
+  ["back", "exp.coordFaceBack"],
+  ["left", "exp.coordFaceLeft"],
+  ["right", "exp.coordFaceRight"],
+  ["top", "exp.coordFaceTop"],
+  ["bottom", "exp.coordFaceBottom"],
+] as const;
+
+/**
+ * "This face on the bed", counted from the model standing the way its file
+ * says (`base`): the mode each face makes.  Counted from the raw file instead,
+ * "front" on a Y-up OBJ only stood it up.  Each is written as its own turn so
+ * no two choices share a value (on an OBJ, "back" is the same turn as "keep").
+ */
+export function faceChoices(base: FixedCoordinateMode): Array<{ mode: FixedCoordinateMode; label: (typeof FACES)[number][1] }> {
+  return FACES.map(([face, label]) => ({
+    mode: turnMode(combineTurns(turnRows(`face-${face}`), turnRows(base)), true),
+    label,
+  }));
+}
+
+/** Which face of the upright model is on the bed, when it is one of the six. */
+export function faceOnBed(mode: ExportSettings["coordinateMode"], base: FixedCoordinateMode): (typeof FACES)[number][1] | null {
+  if (mode === "auto" || mode === "stand-up") return null;
+  return faceChoices(base).find((face) => sameTurn(face.mode, mode))?.label ?? null;
+}
+
 export function ExportSection({
   settings,
+  orientationBase,
   onChange,
   check,
   finalCheck,
@@ -69,6 +99,8 @@ export function ExportSection({
   onOpenGather,
 }: {
   settings: ExportSettings;
+  /** How the loaded file stands by itself (OBJ Y-up, 3MF as is): what the face choices count from. */
+  orientationBase: FixedCoordinateMode;
   onChange: (next: ExportSettings) => void;
   check: ExportCheck | null;
   /** The colour result, summarised where the print is started. */
@@ -120,6 +152,15 @@ export function ExportSection({
 }) {
   const t = useT();
   const set = (patch: Partial<ExportSettings>) => onChange({ ...settings, ...patch });
+  const faces = faceChoices(orientationBase);
+  const choices: string[] = ["blender-y-up", "keep", "stand-up", "auto", "x-up", ...faces.map((face) => face.mode)];
+  const current = settings.coordinateMode;
+  // A saved value none of the choices spells (an older face name, a ⤓ turn)
+  // shows as the choice that turns the model the same way, if there is one.
+  const shown = choices.includes(current)
+    ? current
+    : (faces.find((face) => sameTurn(face.mode, current as FixedCoordinateMode))?.mode ?? current);
+  const listed = choices.includes(shown);
   const ok = check !== null && check.failures.length === 0;
   const fdm = printer.kind === "fdm" ? printer : null;
   const prusa = fdm?.slicer === "prusa";
@@ -329,20 +370,20 @@ export function ExportSection({
         <input type="text" value={settings.fileName} placeholder={defaultFileName} style={{ width: 230 }} onChange={(e) => set({ fileName: e.target.value })} />
       </Row>
       <Row label={t("exp.coordinates")} hint={t("exp.coordinatesHint")}>
-        <select value={settings.coordinateMode} onChange={(e) => set({ coordinateMode: e.target.value as ExportSettings["coordinateMode"] })}>
-          <option value="stand-up">{t("exp.coordStandUp")}</option>
-          <option value="keep">{t("exp.coordKeep")}</option>
-          <option value="auto">{t("exp.coordAuto")}</option>
+        <select value={shown} onChange={(e) => set({ coordinateMode: e.target.value as ExportSettings["coordinateMode"] })}>
           <option value="blender-y-up">{t("exp.coordYUp")}</option>
+          <option value="keep">{t("exp.coordKeep")}</option>
+          <option value="stand-up">{t("exp.coordStandUp")}</option>
+          <option value="auto">{t("exp.coordAuto")}</option>
           <option value="x-up">{t("exp.coordXUp")}</option>
           <optgroup label={t("exp.coordFaceGroup")}>
-            <option value="face-front">{t("exp.coordFaceFront")}</option>
-            <option value="face-back">{t("exp.coordFaceBack")}</option>
-            <option value="face-left">{t("exp.coordFaceLeft")}</option>
-            <option value="face-right">{t("exp.coordFaceRight")}</option>
-            <option value="face-top">{t("exp.coordFaceTop")}</option>
-            <option value="face-bottom">{t("exp.coordFaceBottom")}</option>
+            {faces.map((face) => (
+              <option key={face.label} value={face.mode}>
+                {t(face.label)}
+              </option>
+            ))}
           </optgroup>
+          {!listed && <option value={settings.coordinateMode}>{t("exp.coordTurn")}</option>}
         </select>
       </Row>
       <Row label={t("exp.scaleHeight")} hint={t("exp.scaleHeightHint")}>
