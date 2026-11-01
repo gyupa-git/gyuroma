@@ -1531,6 +1531,14 @@ export default function App() {
   const cutSpan = settings.export.cutSpan;
   /** The last cut, with what it was worked out for. */
   const [cutLayer, setCutLayer] = useState<CutLayer | null>(null);
+  /**
+   * The small notice at the result view's bottom right, like a slicer's: why
+   * it is up ("on" the smooth borders are a preview until confirmed, "load" the
+   * same for a model just opened, "undone" a confirm was taken back but the
+   * preview looks the same, "off" the borders were straightened while the cut
+   * is off) — null when closed.
+   */
+  const [cutNotice, setCutNotice] = useState<"on" | "load" | "undone" | "off" | null>(null);
   /** Each colour state's cut once worked out (by its colours array, as undo and redo bring it back). */
   const cutByColours = useRef(new WeakMap<RGB[], { layer: CutLayer; triangles: MeshModel["triangles"]; span: number; protectedKey: string }>());
   /** The palette's colours in order: a cut's groups are positions in it. */
@@ -3262,6 +3270,7 @@ export default function App() {
     meshUndoRef.current = [];
     meshRedoRef.current = [];
     redoOrderRef.current = [];
+    setCutNotice(cutSpan > 0 ? "load" : null);
     lastSavedCutsRef.current = options?.restored ? (cutLogRef.current.get(next.triangles) ?? []) : null;
     setWorkRestored(options?.restored ?? false);
     setMergeReport(null);
@@ -3505,6 +3514,7 @@ export default function App() {
     meshRedoRef.current = [];
     redoOrderRef.current = [];
     lastSavedCutsRef.current = null;
+    setCutNotice(null);
     setRecipeSteps([]);
     forgetTidyUndo();
     setTidyResult(null);
@@ -4378,6 +4388,7 @@ export default function App() {
     const context = buildTidyContext();
     const picked = pickedMaskRef.current;
     if (!context || !model || !picked || busy !== null) return;
+    if (id === "line") setCutNotice(cutSpan > 0 ? "on" : "off");
     const changes = pickedOnly(presetChanges(id, context, "clean"));
     // Lines are the values that differ from the model's; the bake runs even when
     // none do, since the patch itself may not be tidy yet.
@@ -4419,6 +4430,7 @@ export default function App() {
     }
     const context = buildTidyContext();
     if (!context || busy !== null) return;
+    if (id === "line") setCutNotice(cutSpan > 0 ? "on" : "off");
     const changes = presetChanges(id, context, tidyScope);
     const lines = describeChanges(changes, context);
     const name = t(`tidy.preset.${id}` as Key);
@@ -4691,6 +4703,22 @@ export default function App() {
   const cutFresh = model && cutSpan > 0 && cutLayer && cutLayer.triangles === model.triangles && cutLayer.paletteKey === paletteKey && cutLayer.labels === labels ? cutLayer : null;
   /** The cut shown in the result view, ready to confirm. */
   const cutReady = Boolean(cutFresh && cutFresh.cut.replaced.length > 0);
+  /** The notice stays only while it still says something true: closed once nothing is left to confirm. */
+  const cutNoticeShown =
+    Boolean(model) &&
+    cutNotice !== null &&
+    (cutNotice === "off" ? cutSpan <= 0 : cutNotice === "load" ? cutSpan > 0 && cutReady : cutSpan > 0 && !(cutFresh && !cutReady));
+  /** A model just opened says what turning the cut on says (and only once there is something to confirm). */
+  const cutNoticeText = cutNotice === "load" ? "on" : cutNotice;
+  useEffect(() => {
+    // Once up, it is the "on" notice: it stays while a recolour's cut is worked out again.
+    if (cutNotice === "load" && cutReady) setCutNotice("on");
+  }, [cutNotice, cutReady]);
+
+  function toggleCut(on: boolean): void {
+    patchSettings("export", { ...settings.export, cutSpan: on ? CUT_SPAN : 0 });
+    setCutNotice(on ? "on" : null);
+  }
 
   /**
    * Confirm the cut shown: the model takes the cut faces for good (one undo
@@ -4751,6 +4779,7 @@ export default function App() {
       setFuture([]);
       pushUndo("mesh");
       swapGeometry(after, originalAfter);
+      setCutNotice(null);
       setStatus(
         t("status.cutConfirmed", {
           faces: cut.replaced.length.toLocaleString(),
@@ -4807,6 +4836,8 @@ export default function App() {
     cutsBackWith(step.before.triangleColors);
     swapGeometry(step.before, step.originalBefore);
     setCutLayer(step.shown);
+    // The preview comes back looking just like the confirmed cut did: say so.
+    if (cutSpan > 0) setCutNotice("undone");
     setStatus(t("status.cutUndone", { total: step.before.triangles.length.toLocaleString() }));
   }
 
@@ -4819,6 +4850,7 @@ export default function App() {
     pushUndo("mesh");
     cutsBackWith(step.after.triangleColors);
     swapGeometry(step.after, step.originalAfter);
+    setCutNotice(null);
     setStatus(t("status.cutRedone", { total: step.after.triangles.length.toLocaleString() }));
   }
 
@@ -5806,7 +5838,7 @@ export default function App() {
                 aria-pressed={cutSpan > 0}
                 aria-label={t("view.cut")}
                 title={`${t("view.cut")} — ${t(cutSpan > 0 ? "view.cutOnHint" : "view.cutOffHint")}`}
-                onClick={() => patchSettings("export", { ...settings.export, cutSpan: cutSpan > 0 ? 0 : CUT_SPAN })}
+                onClick={() => toggleCut(cutSpan <= 0)}
               >
                 <Icon name="cutLine" size={14} stroke={1.4} />
               </button>
@@ -6195,6 +6227,36 @@ export default function App() {
               <span className="drag-badge" style={{ left: showSource ? `calc(${100 / paneCount}% + 12px)` : 12 }}>
                 {t("view.dragging")}
               </span>
+            )}
+            {compareStep && cutNoticeShown && cutNotice && (
+              <div className="cut-notice" role="status">
+                <span className="cut-notice-icon">
+                  <Icon name="cutLine" size={13} stroke={1.5} />
+                </span>
+                <span className="cut-notice-body">
+                  <span className="cut-notice-title">{t(`cutNotice.${cutNoticeText}.title` as Key)}</span>
+                  <span className="cut-notice-detail">{t(`cutNotice.${cutNoticeText}.detail` as Key)}</span>
+                  {cutNotice === "off" ? (
+                    <span className="cut-notice-actions">
+                      <button type="button" className="cut-confirm" onClick={() => toggleCut(true)}>
+                        {t("cutNotice.turnOn")}
+                      </button>
+                    </span>
+                  ) : (
+                    <span className="cut-notice-actions">
+                      <button type="button" className="cut-confirm" disabled={isBusy || !cutReady} onClick={() => void confirmCut()}>
+                        {t("view.cutConfirm")}
+                      </button>
+                      <span className="mono muted">
+                        {cutReady && cutFresh ? t("cutNotice.count", { n: cutFresh.cut.replaced.length.toLocaleString() }) : t("view.cutWorking")}
+                      </span>
+                    </span>
+                  )}
+                </span>
+                <button type="button" className="close" aria-label={t("toast.close")} onClick={() => setCutNotice(null)}>
+                  <Icon name="close" size={12} />
+                </button>
+              </div>
             )}
           </div>
           {step === 3 && (

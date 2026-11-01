@@ -1011,6 +1011,20 @@ mark.hl { background: #ffe066; color: #1b1b1d; border-radius: 3px; padding: 0 3p
 .stage-toolbar .cut-confirm { height: 26px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--raised); color: var(--text); font-size: 12px; white-space: nowrap; cursor: pointer; }
 .stage-toolbar .cut-confirm:hover:not(:disabled) { border-color: var(--iris-300); }
 .stage-toolbar .cut-confirm:disabled { opacity: 0.45; cursor: default; }
+/* --- cut notice: the result view's bottom right, like a slicer's notification —
+   above the tool dock and the pane labels that sit on it (bottom 76px) --- */
+.cut-notice { position: absolute; right: 12px; bottom: 108px; z-index: 9; display: flex; align-items: flex-start; gap: 10px; width: min(340px, calc(100% - 24px)); padding: 10px 8px 10px 12px; border-radius: 10px; background: var(--well); border: 1px solid var(--border-strong); box-shadow: 0 14px 34px rgba(0, 0, 0, 0.5); animation: cut-notice-in 0.18s ease-out; }
+.cut-notice-icon { width: 22px; height: 22px; border-radius: 50%; background: rgba(var(--iris-rgb), 0.16); color: var(--iris-200); display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.cut-notice-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 auto; }
+.cut-notice-title { color: var(--text); font-size: 12.5px; font-weight: 600; }
+.cut-notice-detail { color: var(--text-2); font-size: 11.5px; line-height: 1.45; }
+.cut-notice-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; font-size: 11px; }
+.cut-notice .cut-confirm { height: 26px; padding: 0 10px; border-radius: 6px; border: 1px solid rgba(var(--iris-rgb), 0.55); background: rgba(var(--iris-rgb), 0.12); color: var(--iris-200); font-size: 12px; white-space: nowrap; cursor: pointer; }
+.cut-notice .cut-confirm:hover:not(:disabled) { background: rgba(var(--iris-rgb), 0.22); }
+.cut-notice .cut-confirm:disabled { opacity: 0.45; cursor: default; }
+.cut-notice .close { width: 24px; height: 24px; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.cut-notice .close:hover { background: var(--raised); color: var(--text); }
+@keyframes cut-notice-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* Gyupa's face turning: the one sign the app is working (ui/GyupaLoader.tsx); after five seconds its eyes spin too.
    The pointer stays the plain arrow meanwhile — no spinning wheel of its own, no "not allowed" over the buttons waiting. */
