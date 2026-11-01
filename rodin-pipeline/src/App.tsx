@@ -243,9 +243,19 @@ interface CutLayer {
   triangles: MeshModel["triangles"];
   /** The palette's colours in order (the cut's groups are positions in it). */
   paletteKey: string;
+  /** The same colours one by one, to find a group again when the palette is numbered anew. */
+  paletteHex: string[];
   labels: Int32Array;
   cut: BorderCut;
 }
+/** The same group for every face (two label arrays alike, value by value). */
+function sameGroups(a: Int32Array, b: Int32Array): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 /** Confirmed cuts kept for undo (each holds the model before it: ~30 MB of arrays at 2.4 million faces, its parts shared). */
 const MESH_UNDO_LIMIT = 5;
 /**
@@ -1521,18 +1531,31 @@ export default function App() {
   const cutSpan = settings.export.cutSpan;
   /** The last cut, with what it was worked out for. */
   const [cutLayer, setCutLayer] = useState<CutLayer | null>(null);
+  /** Each colour state's cut once worked out (by its colours array, as undo and redo bring it back). */
+  const cutByColours = useRef(new WeakMap<RGB[], { layer: CutLayer; triangles: MeshModel["triangles"]; span: number; protectedKey: string }>());
   /** The palette's colours in order: a cut's groups are positions in it. */
   const paletteKey = useMemo(() => hexByPosition.join(","), [hexByPosition]);
   const protectedKey = useMemo(() => hexByPosition.map((hex) => (protectedHexes.has(hex) ? "1" : "0")).join(""), [hexByPosition, protectedHexes]);
   useEffect(() => {
     if (!model || cutSpan <= 0 || palette.length === 0 || labels.length !== model.triangles.length || previewCuts) return;
+    // Colours shown before (an undo, a redo): their cut is known — shown at once, and
+    // nothing to work out when the groups are the same too.
+    const known = cutByColours.current.get(model.triangleColors);
+    if (known && known.triangles === model.triangles && known.span === cutSpan && known.protectedKey === protectedKey) {
+      const same = known.layer.paletteKey === paletteKey && sameGroups(known.layer.labels, labels);
+      setCutLayer(same ? { ...known.layer, labels } : known.layer);
+      if (same) return;
+    }
     let alive = true;
     const shielded = protectedPositions();
     const settled = settledFaces(model);
+    const colours = model.triangleColors;
     const timer = window.setTimeout(() => {
       cutBorders(model, labels, shielded, cutSpan, settled)
         .then((cut) => {
-          if (alive) setCutLayer({ triangles: model.triangles, paletteKey, labels, cut });
+          const layer: CutLayer = { triangles: model.triangles, paletteKey, paletteHex: hexByPosition, labels, cut };
+          cutByColours.current.set(colours, { layer, triangles: model.triangles, span: cutSpan, protectedKey });
+          if (alive) setCutLayer(layer);
         })
         .catch((err) => {
           if (!(err instanceof CutSuperseded)) console.warn("Border cut failed", err);
@@ -5220,13 +5243,23 @@ export default function App() {
    */
   const viewerCut = useMemo<ViewerCut | null>(() => {
     if (!model || !cutLayer || cutSpan <= 0 || dragColours || resultMode === "source") return null;
-    if (cutLayer.triangles !== model.triangles || cutLayer.paletteKey !== paletteKey) return null;
-    const { cut, labels: then } = cutLayer;
+    if (cutLayer.triangles !== model.triangles) return null;
+    const { cut, labels: then, paletteHex: thenHex } = cutLayer;
+    // A group of the cut, found in the palette as it is now by its colour (-1: gone).
+    const samePalette = cutLayer.paletteKey === paletteKey;
+    const nowOf = samePalette ? null : new Map(hexByPosition.map((hex, position) => [hex, position]));
+    const toNow = (position: number) => (nowOf ? (nowOf.get(thenHex[position]) ?? -1) : position);
     const vertexCount = model.vertices.length;
     const kept: number[] = [];
+    const keptGroup: number[] = [];
     for (let p = 0; p < cut.pieceGroups.length; p++) {
       const f = cut.pieceFaces[p];
-      if (labels[f] === then[f] && palette[cut.pieceGroups[p]]) kept.push(p);
+      // Only where the face's group is as it was when cut (by colour); the rest waits for the new cut.
+      if (toNow(then[f]) !== labels[f]) continue;
+      const group = toNow(cut.pieceGroups[p]);
+      if (group < 0 || !palette[group]) continue;
+      kept.push(p);
+      keptGroup.push(group);
     }
     const linearOf = new Map<number, [number, number, number]>();
     const colourOf = (position: number) => {
@@ -5244,7 +5277,7 @@ export default function App() {
     const parentFace = new Int32Array(kept.length);
     const corners = new Int32Array(kept.length * 3);
     kept.forEach((p, i) => {
-      const lin = colourOf(cut.pieceGroups[p]);
+      const lin = colourOf(keptGroup[i]);
       for (let k = 0; k < 3; k++) {
         const v = cut.pieces[p * 3 + k];
         const o = i * 9 + k * 3;
@@ -5267,7 +5300,7 @@ export default function App() {
       parentFace[i] = cut.pieceFaces[p];
     });
     return { positions: toViewSpace(points), colours, parentFace, corners };
-  }, [model, cutLayer, cutSpan, dragColours, resultMode, palette, paletteKey, labels, effectiveByIndex, toViewSpace]);
+  }, [model, cutLayer, cutSpan, dragColours, resultMode, palette, paletteKey, hexByPosition, labels, effectiveByIndex, toViewSpace]);
   const paneCount = (showSource ? 1 : 0) + (showResult ? 1 : 0) + (showMap ? 1 : 0);
   // A chip about the 3D view keeps off the colour map (the last column).
   const chipStyle: CSSProperties | undefined = showMap && paneCount > 1 ? { right: `calc(${100 / paneCount}% + 12px)` } : undefined;
