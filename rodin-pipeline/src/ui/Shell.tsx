@@ -18,7 +18,8 @@ const ICONS = {
   select: <path d="M3 2.5 12.5 7l-4 1.2L7 12.5z" />,
   brush: <><path d="M13.5 2.5 7.5 8.5" /><path d="M7.3 8.7c-1.6-.4-3.3.6-3.3 2.6 0 1-.6 1.6-1.5 1.9 2.9 1 5.6-.2 5.6-2.7" /></>,
   fill: <><path d="M8.5 2.5 13.5 7.5 9 12a1.5 1.5 0 0 1-2.1 0L4 9.1a1.5 1.5 0 0 1 0-2.1z" /><path d="M4.6 7.6h8.4" /><path d="M2.6 10c-.8 1.1-1.2 1.9-1.2 2.4a1.2 1.2 0 0 0 2.4 0c0-.5-.4-1.3-1.2-2.4z" /></>,
-  eyedropper: <path d="m10 3.5 2.5 2.5M11.6 1.9a1.7 1.7 0 0 1 2.5 2.5L12.5 6l-2.5-2.5zM10.6 4.9 4 11.5l-.8 2.3 2.3-.8 6.6-6.6" />,
+  // Tip, tube, collar and bulb on one centre line, turned 45° — the same drawing as the eyedropper cursor.
+  eyedropper: <g transform="translate(3.333 13.333) rotate(-45)"><path d="M0 0 1.8-1.1H9V1.1H1.8z" /><path d="M9-1.9h.8v3.8H9z" fill="currentColor" /><path d="M9.8-1.5h1.8a1.5 1.5 0 0 1 0 3H9.8z" fill="currentColor" /></g>,
   map: <><path d="M1.5 3.5 5.5 2l5 1.5 4-1.5v10.5l-4 1.5-5-1.5-4 1.5z" /><path d="M5.5 2v10.5M10.5 3.5V14" /></>,
   fit: <path d="M2 5.5V2h3.5M10.5 2H14v3.5M14 10.5V14h-3.5M5.5 14H2v-3.5" />,
   lock: <><rect x="3" y="7" width="10" height="7" rx="1.5" /><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" /></>,

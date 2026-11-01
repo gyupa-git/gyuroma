@@ -5047,164 +5047,168 @@ export default function App() {
               )}
             </div>
           </div>
-          {model && (brushMode || fillMode) && (
-            <div className="stage-bar brush-bar">
-              <b>{fillMode ? t("fill.title") : t("brush.title")}</b>
-              <span>{t("brush.colour")}</span>
-              <ColourSelect
-                value={pickTarget || "__new__"}
-                placeholder="…"
-                onChange={setPickTarget}
-                options={[
-                  ...palette.map((entry, position) => {
-                    const hex = rgbToHex(entry.rgb);
-                    return { value: hex, hex, label: `#${entry.index} ${hex}`, sub: pct(areaByPosition[position] ?? 0) };
-                  }),
-                  { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
-                ]}
-              />
-              {(pickTarget === "__new__" || !pickTarget) && <ColourPicker value={pickCustom} onChange={(hex) => setPickCustom(hex.toUpperCase())} />}
-              <button
-                type="button"
-                className={`btn small eyedropper-toggle${eyedropper ? " active" : ""}`}
-                title={t("brush.eyedropperHint")}
-                onClick={() => {
-                  setEyedropper((v) => !v);
-                  if (!eyedropper) setStatus(t("status.eyedropperOn"));
-                }}
-              >
-                {t("brush.eyedropper")}
-              </button>
-              {brushMode ? (
-                <>
-                  <span>{t("brush.size")}</span>
-                  <NumberField value={brushRadius} min={0.001} max={10000} step={Math.max(0.001, Number((brushRadius / 5).toPrecision(1)))} onChange={(v) => setBrushRadiusClamped(v)} />
-                  <span className="muted">{t("brush.keys")}</span>
-                  <label className="inline" style={{ gap: 6 }}>
-                    <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
-                  </label>
-                  {brushMaskOnly && !pickedMask && <span className="warn">{t("brush.selectFirst")}</span>}
-                  <span className="muted">{t("brush.hint")}</span>
-                </>
-              ) : (
-                <span className="muted">{t(pickedPatches.length > 0 ? "fill.hintSelection" : "fill.hint")}</span>
-              )}
-            </div>
-          )}
-          {model && (pickedPatches.length > 0 || shownHex) && (
-            <div className="stage-bar pick-panel">
-                <>
-                  <span className="pin-mark" title={t("pick.pinHint")} aria-hidden="true" />
-                  <b className="pick-title" title={t("pick.pinHint")}>
-                    {t("pick.title", { n: pickedPatches.length })}
-                  </b>
-                  <span className="cell-colour">
-                    {pickedHexes.slice(0, 8).map((hex) => (
-                      <Swatch key={hex} hex={hex} size={14} title={hex} />
-                    ))}
-                    {pickedHexes.length === 1 && <code>{pickedHexes[0]}</code>}
-                  </span>
-                  {pickedExtruders.length > 0 && (
-                    <span className="pick-extruders" title={t("pick.extruderHint")}>
-                      <span className="muted">→ {t("pick.extruder")}</span>
-                      {pickedExtruders.slice(0, 4).map((info) => (
-                        <span key={info.label} className="pick-extruder">
-                          <Swatch rgb={info.rgb} size={14} />
-                          <b>{info.label}</b>
-                          {info.recipe && <span className="muted">{info.recipe}</span>}
-                        </span>
-                      ))}
-                      {pickedExtruders.length > 4 && <span className="muted">+{pickedExtruders.length - 4}</span>}
-                    </span>
-                  )}
-                  <span className="muted">{t("pick.faces", { n: pickedFaceCount.toLocaleString(), pct: pct(pickedFraction) })}</span>
-                  <span className="pick-edge" title={t("pick.edgeHint")}>
-                    <span className="muted">{t("pick.edge")}</span>
-                    <span className="end">{t("pick.edgeThin")}</span>
-                    <datalist id="edge-middle">
-                      <option value="50" />
-                    </datalist>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={edgeValue}
-                      aria-label={t("pick.edge")}
-                      list="edge-middle"
-                      disabled={isBusy}
-                      onChange={(event) => previewEdge(Number(event.target.value))}
-                      onPointerDown={() => window.addEventListener("pointerup", () => commitEdgeRef.current(), { once: true })}
-                      onKeyUp={() => commitEdgeRef.current()}
-                    />
-                    <span className="end">{t("pick.edgeThick")}</span>
-                    <span className="mono count">{edgeValue === 50 ? t("pick.edgeAsIs") : t("pick.edgeCount", { join: edgeCount.join.toLocaleString(), leave: edgeCount.leave.toLocaleString() })}</span>
-                    {edgeValue !== 50 && (
-                      <button
-                        type="button"
-                        className="btn small"
-                        title={t("pick.edgeResetHint")}
-                        disabled={isBusy}
-                        onClick={() => {
-                          previewEdge(50);
-                          commitEdgeRef.current();
-                        }}
-                      >
-                        ↺ {t("pick.edgeReset")}
-                      </button>
-                    )}
-                  </span>
-                  {shownHex && (
-                    <span className="pick-colour-mode">
-                      <Swatch hex={shownHex} size={12} /> {t("pick.colourMode", { hex: shownHex })}
-                      <button type="button" className="btn small" onClick={() => setShownHex(null)}>
-                        {t("pick.colourModeOff")}
-                      </button>
-                    </span>
-                  )}
-                  <span>{t("pick.changeTo")}</span>
+          <div className={`viewers${showDock ? "" : " dock-off"}${fillMode && !eyedropper ? " filling" : ""}`} style={{ gridTemplateColumns: `repeat(${Math.max(1, paneCount)}, minmax(0, 1fr))` }}>
+            {/* The tool and pick bars float over the views: coming and going they
+                no longer resize them, which moved the model on every pick and fill. */}
+            <div className="stage-bars">
+              {model && (brushMode || fillMode) && (
+                <div className="stage-bar brush-bar">
+                  <b>{fillMode ? t("fill.title") : t("brush.title")}</b>
+                  <span>{t("brush.colour")}</span>
                   <ColourSelect
-                    value={pickTarget}
+                    value={pickTarget || "__new__"}
                     placeholder="…"
                     onChange={setPickTarget}
                     options={[
                       ...palette.map((entry, position) => {
                         const hex = rgbToHex(entry.rgb);
-                        return { value: hex, hex, label: `#${entry.index} ${hex}`, sub: pct(areaByPosition[position] ?? 0), disabled: pickedHexes.length === 1 && hex === pickedHexes[0] };
+                        return { value: hex, hex, label: `#${entry.index} ${hex}`, sub: pct(areaByPosition[position] ?? 0) };
                       }),
                       { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
                     ]}
                   />
-                  {pickTarget === "__new__" && <ColourPicker value={pickCustom} onChange={(hex) => setPickCustom(hex.toUpperCase())} />}
-                  {!brushMode && (
-                    <button
-                      type="button"
-                      className={`btn small eyedropper-toggle${eyedropper ? " active" : ""}`}
-                      title={t("brush.eyedropperHint")}
-                      onClick={() => {
-                        setEyedropper((v) => !v);
-                        if (!eyedropper) setStatus(t("status.eyedropperOn"));
-                      }}
-                    >
-                      {t("brush.eyedropper")}
-                    </button>
-                  )}
+                  {(pickTarget === "__new__" || !pickTarget) && <ColourPicker value={pickCustom} onChange={(hex) => setPickCustom(hex.toUpperCase())} />}
                   <button
                     type="button"
-                    className="btn primary small"
-                    disabled={!canFillPick}
-                    title={t("pick.applyHint")}
-                    onClick={applyPickColour}
+                    className={`btn small eyedropper-toggle${eyedropper ? " active" : ""}`}
+                    title={t("brush.eyedropperHint")}
+                    onClick={() => {
+                      setEyedropper((v) => !v);
+                      if (!eyedropper) setStatus(t("status.eyedropperOn"));
+                    }}
                   >
-                    {t("pick.apply")}
+                    {t("brush.eyedropper")}
                   </button>
-                  <button type="button" className="btn small" onClick={clearPick}>
-                    {t("pick.clear")}
-                  </button>
-                </>
+                  {brushMode ? (
+                    <>
+                      <span>{t("brush.size")}</span>
+                      <NumberField value={brushRadius} min={0.001} max={10000} step={Math.max(0.001, Number((brushRadius / 5).toPrecision(1)))} onChange={(v) => setBrushRadiusClamped(v)} />
+                      <span className="muted">{t("brush.keys")}</span>
+                      <label className="inline" style={{ gap: 6 }}>
+                        <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
+                      </label>
+                      {brushMaskOnly && !pickedMask && <span className="warn">{t("brush.selectFirst")}</span>}
+                      <span className="muted">{t("brush.hint")}</span>
+                    </>
+                  ) : (
+                    <span className="muted">{t(pickedPatches.length > 0 ? "fill.hintSelection" : "fill.hint")}</span>
+                  )}
+                </div>
+              )}
+              {model && (pickedPatches.length > 0 || shownHex) && (
+                <div className="stage-bar pick-panel">
+                    <>
+                      <span className="pin-mark" title={t("pick.pinHint")} aria-hidden="true" />
+                      <b className="pick-title" title={t("pick.pinHint")}>
+                        {t("pick.title", { n: pickedPatches.length })}
+                      </b>
+                      <span className="cell-colour">
+                        {pickedHexes.slice(0, 8).map((hex) => (
+                          <Swatch key={hex} hex={hex} size={14} title={hex} />
+                        ))}
+                        {pickedHexes.length === 1 && <code>{pickedHexes[0]}</code>}
+                      </span>
+                      {pickedExtruders.length > 0 && (
+                        <span className="pick-extruders" title={t("pick.extruderHint")}>
+                          <span className="muted">→ {t("pick.extruder")}</span>
+                          {pickedExtruders.slice(0, 4).map((info) => (
+                            <span key={info.label} className="pick-extruder">
+                              <Swatch rgb={info.rgb} size={14} />
+                              <b>{info.label}</b>
+                              {info.recipe && <span className="muted">{info.recipe}</span>}
+                            </span>
+                          ))}
+                          {pickedExtruders.length > 4 && <span className="muted">+{pickedExtruders.length - 4}</span>}
+                        </span>
+                      )}
+                      <span className="muted">{t("pick.faces", { n: pickedFaceCount.toLocaleString(), pct: pct(pickedFraction) })}</span>
+                      <span className="pick-edge" title={t("pick.edgeHint")}>
+                        <span className="muted">{t("pick.edge")}</span>
+                        <span className="end">{t("pick.edgeThin")}</span>
+                        <datalist id="edge-middle">
+                          <option value="50" />
+                        </datalist>
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={1}
+                          value={edgeValue}
+                          aria-label={t("pick.edge")}
+                          list="edge-middle"
+                          disabled={isBusy}
+                          onChange={(event) => previewEdge(Number(event.target.value))}
+                          onPointerDown={() => window.addEventListener("pointerup", () => commitEdgeRef.current(), { once: true })}
+                          onKeyUp={() => commitEdgeRef.current()}
+                        />
+                        <span className="end">{t("pick.edgeThick")}</span>
+                        <span className="mono count">{edgeValue === 50 ? t("pick.edgeAsIs") : t("pick.edgeCount", { join: edgeCount.join.toLocaleString(), leave: edgeCount.leave.toLocaleString() })}</span>
+                        {edgeValue !== 50 && (
+                          <button
+                            type="button"
+                            className="btn small"
+                            title={t("pick.edgeResetHint")}
+                            disabled={isBusy}
+                            onClick={() => {
+                              previewEdge(50);
+                              commitEdgeRef.current();
+                            }}
+                          >
+                            ↺ {t("pick.edgeReset")}
+                          </button>
+                        )}
+                      </span>
+                      {shownHex && (
+                        <span className="pick-colour-mode">
+                          <Swatch hex={shownHex} size={12} /> {t("pick.colourMode", { hex: shownHex })}
+                          <button type="button" className="btn small" onClick={() => setShownHex(null)}>
+                            {t("pick.colourModeOff")}
+                          </button>
+                        </span>
+                      )}
+                      <span>{t("pick.changeTo")}</span>
+                      <ColourSelect
+                        value={pickTarget}
+                        placeholder="…"
+                        onChange={setPickTarget}
+                        options={[
+                          ...palette.map((entry, position) => {
+                            const hex = rgbToHex(entry.rgb);
+                            return { value: hex, hex, label: `#${entry.index} ${hex}`, sub: pct(areaByPosition[position] ?? 0), disabled: pickedHexes.length === 1 && hex === pickedHexes[0] };
+                          }),
+                          { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
+                        ]}
+                      />
+                      {pickTarget === "__new__" && <ColourPicker value={pickCustom} onChange={(hex) => setPickCustom(hex.toUpperCase())} />}
+                      {!brushMode && (
+                        <button
+                          type="button"
+                          className={`btn small eyedropper-toggle${eyedropper ? " active" : ""}`}
+                          title={t("brush.eyedropperHint")}
+                          onClick={() => {
+                            setEyedropper((v) => !v);
+                            if (!eyedropper) setStatus(t("status.eyedropperOn"));
+                          }}
+                        >
+                          {t("brush.eyedropper")}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn primary small"
+                        disabled={!canFillPick}
+                        title={t("pick.applyHint")}
+                        onClick={applyPickColour}
+                      >
+                        {t("pick.apply")}
+                      </button>
+                      <button type="button" className="btn small" onClick={clearPick}>
+                        {t("pick.clear")}
+                      </button>
+                    </>
+                </div>
+              )}
             </div>
-          )}
-          <div className={`viewers${showDock ? "" : " dock-off"}${fillMode && !eyedropper ? " filling" : ""}`} style={{ gridTemplateColumns: `repeat(${Math.max(1, paneCount)}, minmax(0, 1fr))` }}>
             {model && brushMode && (
               <div className="brush-size-overlay" title={t("brush.keys")}>
                 <span>{t("brush.sizeShort")}</span>

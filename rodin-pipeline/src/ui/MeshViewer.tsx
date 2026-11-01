@@ -1607,7 +1607,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     state.controls.mouseButtons = brush
       ? { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
       : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
-    state.renderer.domElement.style.cursor = eyedropper ? "cell" : brush ? "crosshair" : "";
+    // The eyedropper's cursor comes from the stylesheet (.eyedropping).
+    state.renderer.domElement.style.cursor = brush && !eyedropper ? "crosshair" : "";
     if (!brush && state.cursorLine.visible) {
       state.cursorLine.visible = false;
       requestRender(state);
@@ -1878,7 +1879,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
   }, [view, fitNonce]);
 
   return (
-    <div className={`mesh-viewer${className ? ` ${className}` : ""}${brush ? " brushing" : ""}`}>
+    <div className={`mesh-viewer${className ? ` ${className}` : ""}${brush ? " brushing" : ""}${eyedropper ? " eyedropping" : ""}`}>
       {(label || labelTools) && (
         <div className="mesh-viewer-label">
           {label}
