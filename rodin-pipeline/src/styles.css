@@ -410,11 +410,12 @@ table.grid tr.head td { font-weight: 600; }
 .viewers .mesh-viewer.dragging { box-shadow: inset 0 0 0 2px var(--iris-300); }
 
 .tool-dock { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 8; display: flex; align-items: center; gap: 2px; padding: 4px; border-radius: 10px; background: rgba(20, 20, 21, 0.9); border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35); }
-.tool-dock button { width: 60px; height: 48px; border: 0; border-radius: 7px; background: transparent; color: var(--text-2); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; cursor: pointer; font-size: 11px; padding: 0; }
+.tool-dock button { min-width: 60px; padding: 0 9px; white-space: nowrap; height: 48px; border: 0; border-radius: 7px; background: transparent; color: var(--text-2); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; cursor: pointer; font-size: 11px; }
 .tool-dock button:hover { background: var(--raised); color: var(--text); }
 .tool-dock button[aria-pressed="true"] { background: var(--pressed); color: var(--text); }
 .tool-dock button:disabled { color: var(--faint); cursor: not-allowed; background: transparent; }
-.tool-dock .key { color: var(--muted); font-family: var(--mono); }
+.tool-dock .key { color: var(--iris-300); font-family: var(--mono); font-weight: 600; }
+.tool-dock button:disabled .key { color: var(--faint); }
 .tool-dock .dock-sep { width: 1px; height: 28px; background: var(--border); margin: 0 4px; }
 
 /* The tool and pick bars float over the top of the views, so coming and going they never resize them. */

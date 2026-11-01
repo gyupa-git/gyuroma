@@ -94,6 +94,7 @@ import { RecipeDetail } from "./ui/RecipeDetail";
 import { BandingPanel, outputsFromRows } from "./ui/BandingPanel";
 import { TidyPanel, type TidyResultCard } from "./ui/TidyPanel";
 import { edgeChanges, measurePatchEdge, type PatchEdge } from "./engine/patchEdge";
+import { cleanGaps } from "./engine/gapClean";
 import { NO_TONE, isNoTone, sameTone, toneColours, type Tone, type ToneColour, type ToneWalls } from "./engine/groupTone";
 import { cutsKeepingGroups } from "./engine/stripCuts";
 import { WITH_CLAUDE } from "./features";
@@ -550,6 +551,19 @@ export default function App() {
   const [fillMode, setFillMode] = useState(false);
   const fillModeRef = useRef(false);
   fillModeRef.current = fillMode;
+  /**
+   * Gap clean (C): clicks add patches to the selection; Enter or the bar's
+   * button turns the colours wedged between the picked colours ("part", the
+   * default) or, after a warning, between any two colours ("all").
+   */
+  const [gapMode, setGapMode] = useState(false);
+  const gapModeRef = useRef(false);
+  gapModeRef.current = gapMode;
+  const [gapScope, setGapScope] = useState<"part" | "all">("part");
+  /** Runs the gap clean when it can run now (for Enter). */
+  const gapRunRef = useRef<(() => void) | null>(null);
+  /** After a gap clean between patches: faces to pick again once the colours are in. */
+  const regrabRef = useRef<number[] | null>(null);
   const [coloursVersion, setColoursVersion] = useState(0);
   const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string } | null>(null);
   const viewerRef0 = useRef<MeshViewerHandle>(null);
@@ -665,10 +679,23 @@ export default function App() {
     if (!brushMode) return;
     setBrushMaskOnly(pickedRef.current.length > 0);
     setFillMode(false);
+    setGapMode(false);
   }, [brushMode]);
   useEffect(() => {
-    if (fillMode) setBrushMode(false);
+    if (!fillMode) return;
+    setBrushMode(false);
+    setGapMode(false);
   }, [fillMode]);
+  // The gap clean picks as the select tool does: no brush, fill or eyedropper with it.
+  useEffect(() => {
+    if (!gapMode) return;
+    setBrushMode(false);
+    setFillMode(false);
+    setEyedropper(false);
+  }, [gapMode]);
+  useEffect(() => {
+    if (eyedropper) setGapMode(false);
+  }, [eyedropper]);
   /** Colour mode: every patch of this colour is outlined; clicks add/remove patches. */
   const [shownHex, setShownHex] = useState<string | null>(null);
   const shownHexRef = useRef<string | null>(null);
@@ -2557,7 +2584,8 @@ export default function App() {
         setShownHex(patch.hex);
         setStatus(t("status.colourMode", { index: patch.index, hex: patch.hex, ...selectionSummary(next) }));
         focusPatch(patch, info.source, faceIndex);
-      } else if (info.toggle || shownHexRef.current !== null) {
+      } else if (info.toggle || shownHexRef.current !== null || gapModeRef.current) {
+        // (The gap clean needs two colours, so there a click adds.)
         const next = exists ? current.filter((p) => p.id !== patch.id) : [...current, patch];
         setPickedPatches(next);
         setStatus(t(exists ? "status.pickRemoved" : "status.pickAdded", { index: patch.index, hex: patch.hex, ...selectionSummary(next) }));
@@ -2621,6 +2649,67 @@ export default function App() {
     applyColours(model, next);
     setStatus(t("status.recoloured", { n: count.toLocaleString(), hex: targetHex, patches: pickedPatches.length }));
   }
+
+  /**
+   * Gap clean: between the picked colours, faces of another colour wedged a
+   * face or two deep go to the side they are joined to more strongly; "all"
+   * does it between any two colours, after a warning to protect what must
+   * stay.  One undo step.  See engine/gapClean.ts for the rules.
+   */
+  async function runGap(): Promise<void> {
+    if (!model || busy !== null) return;
+    const scope = gapScope;
+    const keptCount = new Set(pickedPatches.map((patch) => labels[patch.anchor])).size;
+    if (scope === "part" && keptCount < 2) {
+      setStatus(t("gap.needTwo", { n: keptCount }));
+      return;
+    }
+    if (scope === "all") {
+      const shielded = hexByPosition.filter((hex) => protectedHexes.has(hex)).length;
+      if (!window.confirm(t("gap.confirmAll", { n: shielded, none: shielded === 0 ? t("gap.confirmNone") : "" }))) return;
+    }
+    setBusy(t("busy.gap"));
+    await yieldToUi();
+    try {
+      const protectedLabels = new Uint8Array(palette.length);
+      hexByPosition.forEach((hex, position) => {
+        if (protectedHexes.has(hex)) protectedLabels[position] = 1;
+      });
+      const result = cleanGaps(
+        { adjacency: adjacencyFor(model), triangles: model.triangles, vertices: model.vertices, labels, colours: model.triangleColors, protectedLabels },
+        scope === "part" ? { kind: "between", patches: pickedPatches.map((patch) => patch.faces) } : { kind: "all" },
+      );
+      if (result.changed.length === 0) {
+        setStatus(t(scope === "part" ? "gap.nonePart" : "gap.noneAll"));
+        return;
+      }
+      const detail = [...result.into]
+        .sort((a, b) => b[1] - a[1])
+        .map(([position, n]) => `${hexByPosition[position]} ${n.toLocaleString()}`)
+        .join(" · ");
+      // Between patches the same places stay picked: their outlines show the gap gone.
+      if (scope === "part") regrabRef.current = pickedPatches.map((patch) => patch.anchor);
+      applyColours(model, result.colours, { keepSelection: scope === "part" });
+      setStatus(t(scope === "part" ? "gap.donePart" : "gap.doneAll", { n: result.changed.length.toLocaleString(), detail }));
+    } finally {
+      setBusy(null);
+    }
+  }
+  useEffect(() => {
+    const anchors = regrabRef.current;
+    if (!anchors || !model) return;
+    regrabRef.current = null;
+    const seen = new Set<number>();
+    const next: PickedPatch[] = [];
+    for (const face of anchors) {
+      const patch = patchAt(model, face);
+      if (seen.has(patch.id)) continue;
+      seen.add(patch.id);
+      next.push(patch);
+    }
+    setPickedPatches(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [labels]);
 
   /**
    * Fill tool: the patch under the click takes the fill colour — or, clicked
@@ -3452,18 +3541,18 @@ export default function App() {
     return null;
   }
 
-  // V B G I M F pick the tool dock's tools (by physical key, so a Korean input
+  // V B G I C M F pick the tool dock's tools (by physical key, so a Korean input
   // mode works too); ignored while typing or with a modifier held.  M and F
   // work in every step, the painting tools only where the dock is.  Enter
-  // fills the picked patches, unless another button or a matrix row has the
-  // focus (they keep their own Enter).
+  // fills the picked patches (with the gap clean on: cleans the gap), unless
+  // another button or a matrix row has the focus (they keep their own Enter).
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) return;
       if (event.code === "Enter" || event.code === "NumpadEnter") {
-        const fill = fillPickRef.current;
+        const fill = gapModeRef.current ? gapRunRef.current : fillPickRef.current;
         const inPickBar = Boolean(target?.closest(".pick-panel"));
         const ownEnter = Boolean(target?.closest("a, [role='row'], [role='option']")) || (Boolean(target?.closest("button")) && !inPickBar);
         if (!fill || ownEnter || (inPickBar && target?.closest("button") && !target.closest(".colour-select-trigger"))) return;
@@ -3486,9 +3575,11 @@ export default function App() {
         setBrushMode(false);
         setFillMode(false);
         setEyedropper(false);
+        setGapMode(false);
       } else if (event.code === "KeyB") setBrushMode((v) => !v);
       else if (event.code === "KeyG") setFillMode((v) => !v);
       else if (event.code === "KeyI") setEyedropper((v) => !v);
+      else if (event.code === "KeyC") setGapMode((v) => !v);
       else return;
       event.preventDefault();
     };
@@ -4419,6 +4510,9 @@ export default function App() {
   const canFillPick =
     !isBusy && pickedPatches.length > 0 && Boolean(pickTarget) && !(pickTarget !== "__new__" && pickedHexes.length === 1 && pickTarget === pickedHexes[0]);
   fillPickRef.current = canFillPick ? applyPickColour : null;
+  const gapHexes = [...new Set(pickedPatches.map((patch) => patch.hex))];
+  const canRunGap = !isBusy && model !== null && (gapScope === "all" || gapHexes.length >= 2);
+  gapRunRef.current = canRunGap ? () => void runGap() : null;
   const setRecipeOverride = (paletteIndex: number, counts: Record<number, number> | null) => {
     setSettings((prev) => {
       const next = { ...prev.recipeOverrides };
@@ -5129,6 +5223,31 @@ export default function App() {
                   )}
                 </div>
               )}
+              {model && gapMode && (
+                <div className="stage-bar gap-bar">
+                  <b>{t("gap.title")}</b>
+                  <Segmented
+                    value={gapScope}
+                    onChange={setGapScope}
+                    label={t("gap.title")}
+                    options={[
+                      { value: "part", label: t("gap.part"), title: t("gap.hintPart") },
+                      { value: "all", label: t("gap.all"), title: t("gap.hintAll") },
+                    ]}
+                  />
+                  {gapScope === "part" && gapHexes.length > 0 && (
+                    <span className="cell-colour">
+                      {gapHexes.slice(0, 8).map((hex) => (
+                        <Swatch key={hex} hex={hex} size={14} title={hex} />
+                      ))}
+                    </span>
+                  )}
+                  <span className="muted">{t(gapScope === "all" ? "gap.hintAll" : gapHexes.length >= 2 ? "gap.hintPartReady" : "gap.hintPart")}</span>
+                  <button type="button" className="btn primary small" disabled={!canRunGap} onClick={() => void runGap()}>
+                    {t(gapScope === "all" ? "gap.runAll" : "gap.run")}
+                  </button>
+                </div>
+              )}
               {model && (pickedPatches.length > 0 || shownHex) && (
                 <div className="stage-bar pick-panel">
                     <>
@@ -5402,7 +5521,7 @@ export default function App() {
           )}
           {showDock && (
             <div className="tool-dock" role="toolbar" aria-label={t("tool.aria")}>
-              <button type="button" aria-pressed={!brushMode && !fillMode && !eyedropper} title={t("pick.hint")} onClick={() => { setBrushMode(false); setFillMode(false); setEyedropper(false); }}>
+              <button type="button" aria-pressed={!brushMode && !fillMode && !eyedropper && !gapMode} title={t("pick.hint")} onClick={() => { setBrushMode(false); setFillMode(false); setEyedropper(false); setGapMode(false); }}>
                 <Icon name="select" size={17} stroke={1.4} />
                 <span>
                   {t("tool.select")} <span className="key">V</span>
@@ -5432,6 +5551,12 @@ export default function App() {
                 <Icon name="eyedropper" size={17} stroke={1.4} />
                 <span>
                   {t("tool.eyedropper")} <span className="key">I</span>
+                </span>
+              </button>
+              <button type="button" aria-pressed={gapMode} title={t("gap.hintDock")} onClick={() => setGapMode((v) => !v)}>
+                <Icon name="gap" size={17} stroke={1.4} />
+                <span>
+                  {t("tool.gap")} <span className="key">C</span>
                 </span>
               </button>
               <span className="dock-sep" aria-hidden="true" />
