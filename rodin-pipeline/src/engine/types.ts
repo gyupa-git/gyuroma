@@ -40,6 +40,10 @@ export interface MergeSettings {
   smoothingRounds: number;
   /** Protected colours (eyes, mouth lines) are smoothed too, without being cut or erased. */
   smoothProtected: boolean;
+  /** Rounds of trimming triangles that stick out of colour borders (0 = off; see trimRounds in the merge). */
+  trimRounds: number;
+  /** Straightening the border lines: stairs shorter than this many border edges go (0 = off; see lineSpan in the merge). */
+  lineSpan: number;
 }
 
 export interface MixSettings {
@@ -169,6 +173,8 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     propagationRounds: 80,
     smoothingRounds: 3,
     smoothProtected: false,
+    trimRounds: 0,
+    lineSpan: 0,
   },
   mix: {
     assignmentMode: "physical-and-virtual",

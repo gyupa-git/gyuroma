@@ -229,3 +229,49 @@ describe("Feature B heuristics", () => {
     expect(defaultMinBlobForColour([0xc9, 0xa0, 0xdc])).toBe(150); // lilac
   });
 });
+
+describe("mergeWithReprojection — teeth trim", () => {
+  // Two triangles per cell; face (i, j, k) = (j·nx + i)·2 + k.
+  const nx = 8;
+  const ny = 6;
+  const grid = gridMesh(nx, ny);
+  const adjacency = buildFaceAdjacency(grid.triangles, grid.vertices.length);
+  const face = (i: number, j: number, k: number) => (j * nx + i) * 2 + k;
+  const run = (labels: number[], trimRounds: number, protectGroups: number[] = []) =>
+    mergeWithReprojection(adjacency, {
+      faceLabels: Int32Array.from(labels),
+      labelToGroup: Int32Array.from([0, 1, 2]),
+      groupCount: 3,
+      smoothingRounds: 0,
+      minBlob: 0,
+      protectGroups,
+      trimRounds,
+      geometry: { triangles: grid.triangles, vertices: grid.vertices },
+    });
+  const labelsOf = (of: (i: number, j: number, k: number) => number) => {
+    const out: number[] = [];
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) out.push(of(i, j, 0), of(i, j, 1));
+    return out;
+  };
+
+  it("takes a tooth off a straight border and leaves the border", () => {
+    // Group 0 below row 3, group 1 above, one triangle of group 0 sticking up into row 3.
+    const labels = labelsOf((i, j, k) => (j < 3 || (i === 4 && j === 3 && k === 0) ? 0 : 1));
+    const result = run(labels, 2);
+    expect(result.groups[face(4, 3, 0)]).toBe(1);
+    expect(result.stats.trimmedFaces).toBe(1);
+    for (let f = 0; f < labels.length; f++) if (f !== face(4, 3, 0)) expect(result.groups[f]).toBe(labels[f]);
+  });
+
+  it("is off at 0 rounds and leaves protected groups alone", () => {
+    const labels = labelsOf((i, j, k) => (j < 3 || (i === 4 && j === 3 && k === 0) ? 0 : 1));
+    expect(run(labels, 0).groups[face(4, 3, 0)]).toBe(0);
+    expect(run(labels, 2, [0]).groups[face(4, 3, 0)]).toBe(0);
+  });
+
+  it("keeps the middle of a line one face wide", () => {
+    const labels = labelsOf((_i, j) => (j === 3 ? 2 : 1));
+    const result = run(labels, 2);
+    for (let i = 2; i < nx - 2; i++) for (let k = 0; k < 2; k++) expect(result.groups[face(i, 3, k)]).toBe(2);
+  });
+});

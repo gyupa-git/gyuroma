@@ -152,12 +152,15 @@ export function cleanGaps(input: GapCleanInput, scope: GapCleanScope): GapCleanR
     return -1;
   };
 
-  /** How many sides of f its own colour is on. */
+  /**
+   * How many sides of f its own colour is on, counting an open mesh edge as
+   * its own: a face at the edge of a part is not a tooth for that alone.
+   */
   const ownSides = (f: number): number => {
     edgesOf(input, f, edges);
-    let n = 0;
-    for (const g of edges.faces) if (label[g] === label[f]) n++;
-    return n;
+    let foreign = 0;
+    for (const g of edges.faces) if (label[g] !== label[f]) foreign++;
+    return 3 - foreign;
   };
 
   const pendingFace: number[] = [];

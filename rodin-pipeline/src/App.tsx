@@ -291,6 +291,8 @@ function cleanSettingsAfter(
   }
   if (changes.smoothing !== undefined) next.smoothingRounds = changes.smoothing;
   if (changes.smoothProtected !== undefined) next.smoothProtected = changes.smoothProtected;
+  if (changes.trimTeeth !== undefined) next.trimRounds = changes.trimTeeth;
+  if (changes.lineSmooth !== undefined) next.lineSpan = changes.lineSmooth;
   const flagOf = (hex: string) => flags[hex] ?? { target: null, ambiguous: false, protect: false, minBlob: next.minBlobDefault };
   for (const hex of changes.protect ?? []) flags[hex] = { ...flagOf(hex), protect: true };
   for (const hex of changes.unprotect ?? []) flags[hex] = { ...flagOf(hex), protect: false };
@@ -3858,6 +3860,9 @@ export default function App() {
         maxPropagationRounds: mergeSettings.propagationRounds,
         smoothingRounds: mergeSettings.smoothingRounds,
         smoothProtected: mergeSettings.smoothProtected,
+        trimRounds: mergeSettings.trimRounds,
+        lineSpan: mergeSettings.lineSpan,
+        geometry: { triangles: model.triangles, vertices: model.vertices },
       });
       const representatives = representativeColoursByPosition(model.triangleColors, labels, palette);
       const groupColour = heads.map((head) => representatives[head]);
@@ -3892,6 +3897,8 @@ export default function App() {
           to: groupCount,
           ambiguous: result.stats.ambiguousFaceCount.toLocaleString(),
           smoothed: result.stats.smoothedFaceChanges.toLocaleString(),
+          trimmed: result.stats.trimmedFaces.toLocaleString(),
+          lined: result.stats.lineFaces.toLocaleString(),
           islands: result.stats.absorbedIslands,
         }),
       );
@@ -3944,6 +3951,8 @@ export default function App() {
       minBlob: settings.merge.minBlobDefault,
       smoothing: settings.merge.smoothingRounds,
       smoothProtected: settings.merge.smoothProtected,
+      trimTeeth: settings.merge.trimRounds,
+      lineSmooth: settings.merge.lineSpan,
       palette: palette.map((entry, position) => {
         const hex = rgbToHex(entry.rgb);
         const group = groupByHex.get(hex);

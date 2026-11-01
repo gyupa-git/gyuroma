@@ -265,6 +265,12 @@ export function MergeSection({
             <NumberField value={settings.propagationRounds} min={1} max={500} width={64} onChange={(v) => set({ propagationRounds: Math.round(v) })} />
             <NumberField value={settings.smoothingRounds} min={0} max={20} width={64} onChange={(v) => set({ smoothingRounds: Math.round(v) })} />
           </Row>
+          <Row label={t("clean.line")}>
+            <NumberField value={settings.lineSpan} min={0} max={40} width={64} onChange={(v) => set({ lineSpan: Math.max(0, Math.min(40, Math.round(v))) })} />
+          </Row>
+          <Row label={t("clean.trim")}>
+            <NumberField value={settings.trimRounds} min={0} max={10} width={64} onChange={(v) => set({ trimRounds: Math.max(0, Math.min(10, Math.round(v))) })} />
+          </Row>
           <Row label={t("clean.smoothProtected")}>
             <input type="checkbox" checked={settings.smoothProtected} title={t("clean.smoothProtectedHint")} onChange={(e) => set({ smoothProtected: e.target.checked })} />
           </Row>

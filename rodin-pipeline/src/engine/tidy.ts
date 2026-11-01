@@ -20,6 +20,10 @@ export interface TidyChanges {
   smoothing?: number;
   /** Protected colours (eyes, mouth lines) are smoothed too, without being cut or erased. */
   smoothProtected?: boolean;
+  /** Rounds of trimming triangles that stick out of borders (teeth), 0 = off. */
+  trimTeeth?: number;
+  /** Straightening border lines: stairs shorter than this many border edges go (a gentle line through them), 0 = off. */
+  lineSmooth?: number;
   /** Palette colours (hex) to protect from being absorbed / to stop protecting. */
   protect?: string[];
   unprotect?: string[];
@@ -62,6 +66,8 @@ export interface TidyContext {
   minBlob: number;
   smoothing: number;
   smoothProtected: boolean;
+  trimTeeth: number;
+  lineSmooth: number;
   palette: TidyColour[];
   slots: Array<{ label: string; hex: string; name: string }>;
   mix: MixSettings;
@@ -70,7 +76,7 @@ export interface TidyContext {
 }
 
 export interface TidyPreset {
-  id: "crisp" | "gradient" | "solid" | "detail";
+  id: "crisp" | "gradient" | "solid" | "detail" | "trim" | "line";
   icon: string;
 }
 
@@ -89,6 +95,8 @@ export const TIDY_PRESETS: TidyPreset[] = [
   { id: "gradient", icon: "◐" },
   { id: "solid", icon: "■" },
   { id: "detail", icon: "✦" },
+  { id: "trim", icon: "◇" },
+  { id: "line", icon: "〰" },
 ];
 
 const RESOLUTIONS: MixSettings["recipeResolution"][] = ["thirds", "half-thirds", "grid25", "grid20", "grid10", "grid5"];
@@ -111,6 +119,12 @@ const clampInt = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi
  *   within ΔE 10 of a loaded filament prints as that filament, not as a mix.
  * - detail: islands down to 20 faces are kept and only 2 smoothing rounds, small vivid colours
  *   are protected.  Mixing: accents kept (balanced) and mapped by accent.
+ * - trim: 3 rounds of trimming the triangles that stick out of borders, so a border runs as
+ *   evenly as its triangles allow — three rounds take teeth up to three faces deep, more
+ *   would start rounding off real points.  Colours only; the mixing stays.
+ * - line: the border lines redrawn as gentle lines through their stairs — stairs and bends
+ *   shorter than 16 border edges straighten, longer curves (the shape of a part) stay — then
+ *   the teeth trim (3) for what still sticks out.  Colours only; the mixing stays.
  */
 export function presetChanges(id: TidyPreset["id"], context: TidyContext, scope: TidyScope): TidyChanges {
   const clean = scope !== "mix";
@@ -131,6 +145,10 @@ export function presetChanges(id: TidyPreset["id"], context: TidyContext, scope:
   } else if (id === "detail") {
     if (clean) Object.assign(out, { smoothing: 2, minBlob: 20, protectAccents: true });
     if (mix) out.mix = { accentProtection: "balanced", mappingStrategy: "preserve-accent" };
+  } else if (id === "trim") {
+    if (clean) out.trimTeeth = 3;
+  } else if (id === "line") {
+    if (clean) Object.assign(out, { lineSmooth: 16, trimTeeth: 3 });
   }
   return out;
 }
@@ -148,7 +166,7 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
   const clean = scope !== "mix";
   const mix = scope !== "clean";
 
-  const cleanKeys = ["target", "minBlob", "smoothing", "smoothProtected", "protect", "unprotect", "merge"];
+  const cleanKeys = ["target", "minBlob", "smoothing", "smoothProtected", "trimTeeth", "lineSmooth", "protect", "unprotect", "merge"];
   if (!clean && cleanKeys.some((k) => r[k] !== undefined)) dropped.push("색정리 칸 (지금 범위는 혼합만)");
   if (clean) {
     const target = num(r.target);
@@ -158,6 +176,10 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
     const smoothing = num(r.smoothing);
     if (smoothing !== null) changes.smoothing = clampInt(smoothing, 0, 20);
     if (typeof r.smoothProtected === "boolean") changes.smoothProtected = r.smoothProtected;
+    const trimTeeth = num(r.trimTeeth);
+    if (trimTeeth !== null) changes.trimTeeth = clampInt(trimTeeth, 0, 10);
+    const lineSmooth = num(r.lineSmooth);
+    if (lineSmooth !== null) changes.lineSmooth = clampInt(lineSmooth, 0, 40);
     // Colours are named by the palette as it is now; a new target lays the palette out
     // again, so the names would point at colours that no longer exist.
     const relayout = changes.target !== undefined && changes.target !== context.target;
@@ -240,6 +262,10 @@ export function describeChanges(changes: TidyChanges, context: TidyContext): Cha
     lines.push({ key: "smoothing", label: "경계 톱니 다듬기", from: `${context.smoothing}회`, to: `${changes.smoothing}회` });
   if (changes.smoothProtected !== undefined && changes.smoothProtected !== context.smoothProtected)
     lines.push({ key: "smoothProtected", label: "보호한 색도 경계 다듬기", from: context.smoothProtected ? "켬" : "끔", to: changes.smoothProtected ? "켬" : "끔" });
+  if (changes.trimTeeth !== undefined && changes.trimTeeth !== context.trimTeeth)
+    lines.push({ key: "trimTeeth", label: "톱니 깎기", from: `${context.trimTeeth}회`, to: `${changes.trimTeeth}회` });
+  if (changes.lineSmooth !== undefined && changes.lineSmooth !== context.lineSmooth)
+    lines.push({ key: "lineSmooth", label: "경계 선 펴기", from: `${context.lineSmooth}칸`, to: `${changes.lineSmooth}칸` });
   const isProtected = new Map(context.palette.map((c) => [c.hex, c.protected]));
   for (const hex of changes.protect ?? []) if (!isProtected.get(hex)) lines.push({ key: "protect", label: `보호 ${hex}`, from: "안 함", to: "보호" });
   for (const hex of changes.unprotect ?? []) if (isProtected.get(hex)) lines.push({ key: "protect", label: `보호 ${hex}`, from: "보호", to: "안 함" });
@@ -259,6 +285,8 @@ export function hasCleanChanges(changes: TidyChanges): boolean {
     changes.minBlob !== undefined ||
     changes.smoothing !== undefined ||
     changes.smoothProtected !== undefined ||
+    changes.trimTeeth !== undefined ||
+    changes.lineSmooth !== undefined ||
     Boolean(changes.protect?.length || changes.unprotect?.length || changes.merge?.length || changes.protectAccents)
   );
 }
@@ -295,6 +323,8 @@ export const TIDY_SCHEMA = {
         minBlob: { type: "integer", minimum: 0, maximum: 5000, description: "이 면 수보다 작은 조각은 주변 색으로 흡수" },
         smoothing: { type: "integer", minimum: 0, maximum: 20, description: "경계 톱니 다듬기 횟수" },
         smoothProtected: { type: "boolean", description: "보호한 색(눈·입·꽃술 같은 작은 선)도 경계 톱니를 편다" },
+        trimTeeth: { type: "integer", minimum: 0, maximum: 10, description: "경계에서 삐죽 튀어나온 삼각형(톱니) 깎기 횟수, 0 = 끔" },
+        lineSmooth: { type: "integer", minimum: 0, maximum: 40, description: "경계 선 펴기 길이(삼각형 변 몇 칸): 이보다 짧은 계단·지그재그를 지나는 완만한 선으로 경계를 다시 긋기, 0 = 끔" },
         protect: { type: "array", items: { type: "string" }, description: "흡수·합치기에서 지킬 지금 팔레트 색(hex)" },
         unprotect: { type: "array", items: { type: "string" } },
         merge: { type: "array", items: { type: "object", properties: { from: { type: "string" }, into: { type: "string" } } }, description: "지금 팔레트 색 from 을 into 로 합치기" },
@@ -328,6 +358,8 @@ export function tidyStablePrompt(context: Pick<TidyContext, "modelName" | "faces
 - smoothing(경계 톱니 다듬기 횟수 0~20): 색 경계의 삼각형 톱니를 펴 준다. 경계가 지저분하면 5~8, 그라데이션을 살릴 땐 0~2.
 - protect / unprotect: 지금 팔레트 색(hex)을 흡수·합치기에서 지킨다(작은 포인트 색 — 눈·입·꽃술 등). 보호한 색은 경계 다듬기에서도 그대로 얼려 둔다 — 그래서 눈·입 같은 보호 색의 경계만 톱니로 남는다.
 - smoothProtected(true/false): 보호한 색도 경계 톱니를 편다. 삐죽 나온 삼각형만 주변 색으로 돌리고, 선을 끊는 면·홀로 선 점은 건드리지 않는다(한 면 굵기 선도 남는다, 선 끝은 한두 면 닳을 수 있음). 흡수로 사라지지도 않는다. 눈·코·입 경계가 터덜터덜하면 이것을 켜고 smoothing 4~8. 눈·입 색을 unprotect 해서 다듬으면 가는 선이 끊기거나 지워지니 그러지 않는다.
+- trimTeeth(톱니 깎기 0~10회): 두 변 이상이 다른 색에 닿은 삼각형(경계에서 가늘게 삐죽 나온 톱니)을 더 길게 맞닿은 색으로 깎는다. smoothing 이 표가 갈려 못 펴는 가는 가시를 잡는다. 한 번에 한 면 깊이, 보통 2~3. 많이 하면 일부러 뾰족한 끝(머리카락 끝·별 끝)도 둥글어진다. 보호한 색은 그대로.
+- lineSmooth(경계 선 펴기 0~40칸): 경계의 계단·지그재그 한가운데로 완만한 선을 다시 긋고(이 길이보다 짧은 계단·굴곡이 펴진다), 경계 근처 삼각형은 중심이 그 선의 어느 쪽에 있는지로 색을 정한다. 톱니 깎기보다 경계 전체가 고르게 정리된다. 보통 16, 계단이 크면 24~32. 크게 하면 일부러 꺾인 모서리도 둥글어진다. 보호한 색 경계·세 색이 만나는 점은 그대로, 가는 선은 양쪽 경계가 따로 펴져 남는다.
 - 한계: 색은 삼각형 단위로 칠해지고 경계는 삼각형 모서리를 따라간다. 선 굵기가 삼각형 서너 개뿐이면(얼굴의 작은 입선·눈선이 흔히 그렇다) 다듬어도 지그재그가 남는다 — 그럴 땐 그렇다고 말하고, 할 수 있는 것(경계에 낀 다른 색 조각 merge, 작은 점 minBlob 등)만 한다. 다 매끄러워진다고 약속하지 않는다.
 - merge [{from, into}]: 지금 팔레트의 from 색을 into 색으로 합친다(같은 부위인데 두 색으로 갈라져 얼룩진 곳).
 - 목표 색 수를 바꾸면 팔레트가 새로 나뉘므로 같은 답에서 protect·merge 는 쓰지 않는다(다음 말에서).
@@ -342,7 +374,7 @@ export function tidyStablePrompt(context: Pick<TidyContext, "modelName" | "faces
 - 점수표(있으면): fidelity 높을수록 원래 색에 가깝고, cycleLayers 가 길수록 층 줄무늬가 눈에 띈다.
 
 ■ 프리셋(규파가 버튼으로 이미 쓸 수 있는 것 — 참고)
-경계 또렷하게: smoothing 6·minBlob 300 / 혼합 2개·1/3 · 그라데이션 살리기: 색 32+·smoothing 1·minBlob 40 / 혼합 3개·25% · 단색 깔끔: 계열당 1.5그룹(6~16)·smoothing 8·minBlob 600 / 혼합 1/3·ΔE 10 안 실물 · 디테일 지키기: minBlob 20·smoothing 2·작은 선명한 색 보호.
+경계 또렷하게: smoothing 6·minBlob 300 / 혼합 2개·1/3 · 그라데이션 살리기: 색 32+·smoothing 1·minBlob 40 / 혼합 3개·25% · 단색 깔끔: 계열당 1.5그룹(6~16)·smoothing 8·minBlob 600 / 혼합 1/3·ΔE 10 안 실물 · 디테일 지키기: minBlob 20·smoothing 2·작은 선명한 색 보호 · 톱니 깎기: trimTeeth 3 · 경계 매끈하게: lineSmooth 16·trimTeeth 3.
 
 ■ 규칙
 - 사진은 회색 배경에 조명을 받은 모습이다. '원본' 사진은 정리 전 색, '결과' 사진은 지금 상태다. '지금 화면' 사진은 규파가 화면에서 확대해 보고 있는 곳이다 — 말이 가리키는 곳일 가능성이 크다. 부위(얼굴·머리카락·옷·소품)를 짚어 말한다.
@@ -381,7 +413,7 @@ export function tidyTurnPrompt(context: TidyContext, scope: TidyScope, history: 
     })
     .join("\n");
   return `■ 지금 상태 (범위: ${SCOPE_LABEL[scope]})
-원본 색 ${context.sourceColours.toLocaleString()}가지 · 목표 색 수 ${context.target} · 작은 조각 흡수 ${context.minBlob}면 · 경계 다듬기 ${context.smoothing}회 · 보호한 색도 다듬기 ${context.smoothProtected ? "켬" : "끔"}
+원본 색 ${context.sourceColours.toLocaleString()}가지 · 목표 색 수 ${context.target} · 작은 조각 흡수 ${context.minBlob}면 · 경계 다듬기 ${context.smoothing}회 · 보호한 색도 다듬기 ${context.smoothProtected ? "켬" : "끔"} · 톱니 깎기 ${context.trimTeeth}회 · 경계 선 펴기 ${context.lineSmooth}칸
 팔레트(면적순, hex 면적 계열 [보호] [→출력]):
 ${palette}
 

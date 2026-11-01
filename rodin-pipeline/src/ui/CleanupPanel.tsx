@@ -347,6 +347,16 @@ export function CleanupPanel({
             <NumberField value={mergeSettings.smoothingRounds} min={0} max={20} width={58} disabled={busy} onChange={(v) => onMergeSettings({ ...mergeSettings, smoothingRounds: Math.max(0, Math.min(20, Math.round(v))) })} />
             {t("clean.rounds")}
           </span>
+          <span title={t("clean.lineHint")}>{t("clean.line")}</span>
+          <span className={`unit${hl("lineSmooth") ? " hl-field" : ""}`}>
+            <NumberField value={mergeSettings.lineSpan} min={0} max={40} width={58} disabled={busy} onChange={(v) => onMergeSettings({ ...mergeSettings, lineSpan: Math.max(0, Math.min(40, Math.round(v))) })} />
+            {t("clean.lineUnit")}
+          </span>
+          <span title={t("clean.trimHint")}>{t("clean.trim")}</span>
+          <span className={`unit${hl("trimTeeth") ? " hl-field" : ""}`}>
+            <NumberField value={mergeSettings.trimRounds} min={0} max={10} width={58} disabled={busy} onChange={(v) => onMergeSettings({ ...mergeSettings, trimRounds: Math.max(0, Math.min(10, Math.round(v))) })} />
+            {t("clean.rounds")}
+          </span>
           <label htmlFor="clean-smooth-protected" title={t("clean.smoothProtectedHint")}>
             {t("clean.smoothProtected")}
           </label>

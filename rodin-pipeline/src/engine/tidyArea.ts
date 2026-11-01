@@ -19,6 +19,8 @@ export function pickedValueLines(changes: TidyChanges): ChangeLine[] {
   const lines: ChangeLine[] = [];
   if (changes.minBlob !== undefined) lines.push({ key: "minBlob", label: "작은 조각 흡수", from: "", to: `${changes.minBlob}면` });
   if (changes.smoothing !== undefined) lines.push({ key: "smoothing", label: "경계 톱니 다듬기", from: "", to: `${changes.smoothing}회` });
+  if (changes.lineSmooth !== undefined) lines.push({ key: "lineSmooth", label: "경계 선 펴기", from: "", to: `${changes.lineSmooth}칸` });
+  if (changes.trimTeeth !== undefined) lines.push({ key: "trimTeeth", label: "톱니 깎기", from: "", to: `${changes.trimTeeth}회` });
   if (changes.smoothProtected !== undefined) lines.push({ key: "smoothProtected", label: "보호한 색도 경계 다듬기", from: "", to: changes.smoothProtected ? "켬" : "끔" });
   if (changes.protectAccents) lines.push({ key: "protect", label: "작은 선명한 색", from: "", to: "보호" });
   return lines;

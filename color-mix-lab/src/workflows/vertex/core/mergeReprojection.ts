@@ -1,9 +1,10 @@
-import type { RGB, Tri } from "./types";
+import type { RGB, Tri, Vec3 } from "./types";
 import {
   buildFaceAdjacency,
   connectedComponentsOfSubset,
   type FaceAdjacency,
 } from "./meshAdjacency";
+import { smoothBorderLines } from "./borderLines";
 
 /**
  * Feature B of the Rodin work order: "merge with shade re-judgement and
@@ -49,6 +50,27 @@ export interface MergeReprojectionOptions {
    * Off, protected groups are frozen as they are, teeth included.
    */
   smoothProtected?: boolean;
+  /**
+   * Rounds of trimming teeth along colour borders (0 = off).  The smoothing
+   * above is a neighbour vote with a bonus for the face's own group, so a long
+   * thin triangle sticking out of a border keeps its colour when the vote
+   * splits.  Here a face bordering other groups along two sides or more (a
+   * tip; an open mesh edge counts for neither) goes to the group it shares the
+   * longest border with — the most cut-off faces first, each checked again
+   * when its turn comes.  A round takes one triangle off each tip, so a tooth
+   * of quads cut in two goes in two rounds per quad.  The middle of a line one
+   * face wide meets its own group along two sides and stays; its ends wear a
+   * face a round.  Protected groups stay as they are.  Needs `geometry`.
+   */
+  trimRounds?: number;
+  /**
+   * Straightening the border lines, the window in border edges (0 = off): the
+   * stairs and teeth along a border redrawn as a gentle line, the faces near
+   * it coloured by the side of it their centre is on (see borderLines.ts).
+   * Before the teeth trim.  Needs `geometry`.
+   */
+  lineSpan?: number;
+  geometry?: { triangles: ArrayLike<Tri>; vertices: ArrayLike<Vec3> };
 }
 
 /** How strongly a protected face keeps its group in the smoothing (see smoothProtected). */
@@ -93,6 +115,10 @@ export interface MergeReprojectionStats {
   filledByPropagation: number;
   isolatedFallback: number;
   smoothedFaceChanges: number;
+  /** Faces taken off borders by the teeth trim. */
+  trimmedFaces: number;
+  /** Faces that changed side when the border lines were straightened. */
+  lineFaces: number;
   absorbedIslands: number;
   absorbedFaces: number;
 }
@@ -169,6 +195,8 @@ export function mergeWithReprojection(
     filledByPropagation: 0,
     isolatedFallback: 0,
     smoothedFaceChanges: 0,
+    trimmedFaces: 0,
+    lineFaces: 0,
     absorbedIslands: 0,
     absorbedFaces: 0,
   };
@@ -275,6 +303,96 @@ export function mergeWithReprojection(
     for (let f = 0; f < faceCount; f++) {
       if (next[f] !== g[f]) stats.smoothedFaceChanges++;
       g[f] = next[f];
+    }
+  }
+
+  // 2a) Border lines straightened; the faces near them take the side they are on.
+  if ((options.lineSpan ?? 0) > 0 && options.geometry)
+    stats.lineFaces = smoothBorderLines(adjacency, options.geometry.triangles, options.geometry.vertices, g, {
+      span: options.lineSpan ?? 0,
+      protectedGroup,
+    });
+
+  // 2b) Teeth: faces bordering other groups along two sides or more (see trimRounds).
+  const trimRounds = Math.max(0, Math.round(options.trimRounds ?? 0));
+  if (trimRounds > 0 && options.geometry) {
+    const { triangles, vertices } = options.geometry;
+    const sideFaces: number[] = [];
+    const sideLengths: number[] = [];
+    // The faces sharing a side (two vertices) with f, and how long that side is.
+    const sidesOf = (f: number) => {
+      sideFaces.length = 0;
+      sideLengths.length = 0;
+      const [a, b, c] = triangles[f];
+      for (let i = adjacency.offsets[f]; i < adjacency.offsets[f + 1]; i++) {
+        const n = adjacency.neighbours[i];
+        const t = triangles[n];
+        let first = -1;
+        let second = -1;
+        for (let k = 0; k < 3; k++) {
+          const v = t[k];
+          if (v !== a && v !== b && v !== c) continue;
+          if (first < 0) first = v;
+          else second = v;
+        }
+        if (second < 0) continue;
+        const p = vertices[first];
+        const q = vertices[second];
+        sideFaces.push(n);
+        sideLengths.push(Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]));
+      }
+    };
+    const foreignSides = (f: number) => {
+      sidesOf(f);
+      let n = 0;
+      for (const s of sideFaces) if (g[s] !== g[f]) n++;
+      return n;
+    };
+    const ownAround = (f: number) => {
+      let n = 0;
+      for (let i = adjacency.offsets[f]; i < adjacency.offsets[f + 1]; i++) if (g[adjacency.neighbours[i]] === g[f]) n++;
+      return n;
+    };
+    const toothy = (f: number): boolean => {
+      if (protectedGroup[g[f]]) return false;
+      let foreign = false;
+      for (let i = adjacency.offsets[f]; i < adjacency.offsets[f + 1] && !foreign; i++) foreign = g[adjacency.neighbours[i]] !== g[f];
+      return foreign && foreignSides(f) >= 2;
+    };
+    const border = new Float64Array(groupCount);
+    for (let round = 0; round < trimRounds; round++) {
+      const candidates: number[] = [];
+      const order: number[] = [];
+      for (let f = 0; f < faceCount; f++) {
+        if (!toothy(f)) continue;
+        candidates.push(f);
+        order.push((4 - foreignSides(f)) * 1024 + ownAround(f));
+      }
+      const byOrder = candidates.map((_, i) => i).sort((x, y) => order[x] - order[y]);
+      let trimmed = 0;
+      for (const i of byOrder) {
+        const f = candidates[i];
+        if (!toothy(f)) continue;
+        // The group f shares the longest border with; on a tie, the one with more faces around.
+        sidesOf(f);
+        border.fill(0);
+        for (let k = 0; k < sideFaces.length; k++) if (g[sideFaces[k]] !== g[f]) border[g[sideFaces[k]]] += sideLengths[k];
+        votes.fill(0);
+        for (let k = adjacency.offsets[f]; k < adjacency.offsets[f + 1]; k++) {
+          const n = g[adjacency.neighbours[k]];
+          if (n !== g[f]) votes[n] += 1;
+        }
+        let best = -1;
+        for (let k = 0; k < groupCount; k++) {
+          if (k === g[f] || votes[k] === 0) continue;
+          if (best < 0 || border[k] > border[best] || (border[k] === border[best] && votes[k] > votes[best])) best = k;
+        }
+        if (best < 0) continue;
+        g[f] = best;
+        trimmed++;
+      }
+      stats.trimmedFaces += trimmed;
+      if (trimmed === 0) break;
     }
   }
 
