@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildFaceAdjacency } from "@core/meshAdjacency";
 import type { RGB, Tri, Vec3 } from "@core/types";
-import { cleanGaps, type GapCleanInput } from "./gapClean";
+import { cleanGaps, discDiameter, piecesOf, type GapCleanInput } from "./gapClean";
 
 const WHITE = 0;
 const MINT = 1;
@@ -138,5 +138,16 @@ describe("cleanGaps — the picked bits melt into what is around them", () => {
     const all = cleanGaps(alone, { kind: "picked", faces: facesOf(alone, MINT) });
     expect(all.changed.length).toBe(0);
     expect(all.left).toBe(32);
+  });
+});
+
+describe("piecesOf", () => {
+  it("splits a set into its places", () => {
+    // Two mint squares far apart in a white field.
+    const W = 10;
+    const input = grid(W, 6, (i, j) => ((i === 1 && j === 1) || (i === 7 && j === 4) ? MINT : WHITE));
+    const pieces = piecesOf(input.adjacency, facesOf(input, MINT));
+    expect(pieces.map((p) => p.length).sort()).toEqual([2, 2]);
+    expect(discDiameter(Math.PI)).toBeCloseTo(2);
   });
 });

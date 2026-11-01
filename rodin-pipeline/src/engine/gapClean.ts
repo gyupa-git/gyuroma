@@ -354,3 +354,36 @@ export function cleanGaps(input: GapCleanInput, scope: GapCleanScope): GapCleanR
   }
   return { colours, changed: Int32Array.from(changed), into, rounds, left: 0 };
 }
+
+/** The places of a set of faces: its pieces, joined through shared vertices as the patches are. */
+export function piecesOf(adjacency: FaceAdjacency, faces: Int32Array): Int32Array[] {
+  const inSet = new Uint8Array(adjacency.faceCount);
+  for (let i = 0; i < faces.length; i++) inSet[faces[i]] = 1;
+  const pieces: Int32Array[] = [];
+  const stack: number[] = [];
+  for (let i = 0; i < faces.length; i++) {
+    const start = faces[i];
+    if (inSet[start] !== 1) continue;
+    inSet[start] = 2;
+    stack.push(start);
+    const piece: number[] = [];
+    while (stack.length > 0) {
+      const f = stack.pop() as number;
+      piece.push(f);
+      const end = adjacency.offsets[f + 1];
+      for (let k = adjacency.offsets[f]; k < end; k++) {
+        const g = adjacency.neighbours[k];
+        if (inSet[g] !== 1) continue;
+        inSet[g] = 2;
+        stack.push(g);
+      }
+    }
+    pieces.push(Int32Array.from(piece));
+  }
+  return pieces;
+}
+
+/** The diameter of a disc of this area (mm² -> mm): how big a place looks. */
+export function discDiameter(area: number): number {
+  return 2 * Math.sqrt(Math.max(0, area) / Math.PI);
+}
