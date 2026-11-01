@@ -126,6 +126,7 @@ import { Brand, Glossary, Icon, Intro, Menu, Segmented, StepNav, Welcome, suppor
 import { ColourSelect } from "./ui/ColourSelect";
 import { ColourPicker } from "./ui/ColourPicker";
 import { GatherDialog } from "./ui/GatherDialog";
+import { countAction } from "./engine/counter";
 import { LangContext, loadStoredLang, storeLang, translate, type Lang, type Params, type Key } from "./i18n";
 
 const APP_VERSION = "0.7.0";
@@ -2862,6 +2863,7 @@ export default function App() {
       const loaded = await parseModelFile(file, kind);
       installModel(loaded.model, loaded.info, { file, kind });
       setStatus(loaded.status);
+      countAction(`load/${kind}`);
     } catch (err) {
       setStatus(t("status.error", { message: err instanceof Error ? err.message : String(err) }));
     } finally {
@@ -4114,6 +4116,7 @@ export default function App() {
       });
       setLastExport({ fileName: result.fileName, blob: result.blob, at: Date.now() });
       downloadBlob(result.fileName, result.blob);
+      countAction(`export/${printer.id}`);
       const size = `${(result.blob.size / (1024 * 1024)).toFixed(1)} MB`;
       setExportOutcome({ kind: "ok", message: t("exp.outcomeOk", { file: result.fileName, size }), at: Date.now() });
       setStatus(t("status.colourExported", { file: result.fileName, colours: result.colourCount, faces: result.triangleCount.toLocaleString() }));
@@ -4168,6 +4171,7 @@ export default function App() {
       });
       setLastExport({ fileName: result.fileName, blob: result.blob, at: Date.now() });
       downloadBlob(result.fileName, result.blob);
+      countAction(`export/${printer.id}`);
       setExportOutcome({
         kind: "ok",
         message: t("exp.outcomeOk", { file: result.fileName, size: `${(result.blob.size / (1024 * 1024)).toFixed(1)} MB` }),
@@ -4209,6 +4213,7 @@ export default function App() {
     try {
       const result = buildNomadObj(model, model.triangleColors, palette.map((entry) => entry.rgb), model.name);
       downloadText(result.fileName, result.obj);
+      countAction("export/nomad");
       setNomadReport({
         message: t("nomad.exported", { file: result.fileName, colours: result.colourCount, vertices: result.vertexCount.toLocaleString(), faces: result.faceCount.toLocaleString() }),
         warnings: [],

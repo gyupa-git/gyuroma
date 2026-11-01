@@ -8,10 +8,12 @@ PrusaSlicer(Full Spectrum) 또는 Bambu Studio(혼합 필라멘트)에서 바로
 
 **바로 쓰기 (설치 없이): https://gyupa-git.github.io/gyuroma/**
 모든 계산은 브라우저 안에서 끝나고, 넣은 파일은 어디로도 올라가지 않아요.
+이 웹 주소의 규로마는 방문 수와 불러오기·내보내기 횟수만 익명으로 세요([GoatCounter](https://www.goatcounter.com) · 쿠키 없음 · 모델이나 색 정보는 보내지 않아요).
 
 *A free web app that turns a coloured 3D model into a multi-colour print file that mixes a few filaments:
 load a Rodin "Face Color" 3MF or a vertex-colour OBJ, tidy the colours, pick how your spools mix, and export a 3MF
-that opens in PrusaSlicer (Full Spectrum) or Bambu Studio (mixed filaments). Everything runs in your browser.*
+that opens in PrusaSlicer (Full Spectrum) or Bambu Studio (mixed filaments). Everything runs in your browser; the hosted
+copy only counts visits, loads and exports anonymously (GoatCounter, no cookies, nothing about your model).*
 
 ## 할 수 있는 것 / What it does
 

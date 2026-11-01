@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { planGather, mixesUsed, slotsUsed, type GatherPlan, type GatherSource, type GatherWarning } from "../engine/gather";
 import { GatherJobError, readInWorker, writeInWorker } from "../engine/gatherClient";
+import { countAction } from "../engine/counter";
 import { useT, type Key } from "../i18n";
 import { Swatch } from "./common";
 import { Icon } from "./Shell";
@@ -288,6 +289,7 @@ export function GatherDialog({ open, onClose }: { open: boolean; onClose: () => 
         (progress) => setWriting(progress),
       );
       downloadBlob(name, blob);
+      countAction(`gather/${plan.slicer}`);
       setResult({ kind: "ok", fileName: name, blob });
     } catch (error) {
       const job = error instanceof GatherJobError ? error : new GatherJobError("unknown", { message: String(error) });
