@@ -542,6 +542,10 @@ export default function App() {
   const [eyedropper, setEyedropper] = useState(false);
   const eyedropperRef = useRef(false);
   eyedropperRef.current = eyedropper;
+  /** Space held over the views: a hand — the left button moves the view sideways, whatever tool is on. */
+  const [hand, setHand] = useState(false);
+  const handRef = useRef(false);
+  handRef.current = hand;
   /** Fill tool: a click fills the patch under it, or the whole selection when clicked inside it. */
   const [fillMode, setFillMode] = useState(false);
   const fillModeRef = useRef(false);
@@ -2397,6 +2401,35 @@ export default function App() {
     setPickedPatches([]);
     setShownHex(null);
   }
+
+  // Space over the views turns the pointer into a hand, as in drawing apps: the
+  // left button pans the 3D views and the colour map (the right button alone did,
+  // which a trackpad hardly can, and the brush had no pan at all).  Elsewhere,
+  // and in a text field, the key keeps its own job.
+  useEffect(() => {
+    const overViews = () => Boolean(stageRef.current?.querySelector(".viewers")?.matches(":hover"));
+    const onDown = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (typingIn(event.target as HTMLElement | null)) return;
+      if (!handRef.current && !overViews()) return;
+      event.preventDefault();
+      if (!handRef.current) setHand(true);
+    };
+    const onUp = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || !handRef.current) return;
+      event.preventDefault();
+      setHand(false);
+    };
+    const release = () => setHand(false);
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    window.addEventListener("blur", release);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+      window.removeEventListener("blur", release);
+    };
+  }, []);
 
   // Escape clears the patch selection and the colours chosen on the spectrum or in the table — unless a
   // popover, a menu, the intro or a drag on the spectrum is using the key, or it is typed in a field.
@@ -4422,6 +4455,7 @@ export default function App() {
     cornerVertex,
     brush: brushMode,
     eyedropper,
+    hand,
     background,
     // The welcome card (already played by the intro) in the first pane, once the intro has gone (two cards at
     // once read as a double); a second pane (side by side) just says what comes there.
@@ -5256,6 +5290,7 @@ export default function App() {
                 masks={atlasMasks}
                 brush={{ active: brushMode, radiusPx: atlas ? brushRadius * atlas.scale : 4, hex: brushHex }}
                 eyedropper={eyedropper}
+                hand={hand}
                 background={background}
                 onPick={(face, info) => void handlePick(face, info)}
                 onHover={mapHover}

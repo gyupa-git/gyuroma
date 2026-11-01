@@ -24,6 +24,8 @@ export interface ColourMapProps {
   brush: { active: boolean; radiusPx: number; hex: string };
   /** Next click samples a colour instead of picking/painting. */
   eyedropper?: boolean;
+  /** Space held: a hand — the left button pans, and nothing is picked or painted. */
+  hand?: boolean;
   background?: ViewBackground;
   onPick?: (face: number | null, info: PickInfo) => void;
   onHover?: (face: number | null) => void;
@@ -62,7 +64,7 @@ function outlineWidthFor(scale: number): number {
 }
 
 export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function ColourMap(
-  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaint, onBrushEnd, label, hint, emptyLabel, buildingLabel },
+  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaint, onBrushEnd, label, hint, emptyLabel, buildingLabel },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -88,6 +90,8 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
   brushRef.current = brush;
   const eyedropperRef = useRef(eyedropper);
   eyedropperRef.current = eyedropper;
+  const handRef = useRef(hand);
+  handRef.current = hand;
   const backgroundRef = useRef(background);
   backgroundRef.current = background;
   const atlasRef = useRef(atlas);
@@ -156,7 +160,7 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         ctx.fillStyle = "#9aa0ff";
         ctx.fill();
       };
-      if (brushRef.current.active && cursorRef.current) drawCursor(cursorRef.current, false);
+      if (brushRef.current.active && !handRef.current && cursorRef.current) drawCursor(cursorRef.current, false);
       if (remoteCursorRef.current) drawCursor(remoteCursorRef.current, true);
     }
   }, []);
@@ -165,6 +169,13 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     if (rafRef.current !== null) return;
     rafRef.current = window.requestAnimationFrame(draw);
   }, [draw]);
+
+  // The hand's cursor stands over the tool's own (brush, eyedropper, fill); the brush circle goes while it is held.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (canvas) canvas.style.cursor = hand ? "grab" : "";
+    requestDraw();
+  }, [hand, requestDraw]);
 
   // Redraws only while the highlight is flashing; once the flashes are over the
   // outline holds and the map is drawn again only when something changes.
@@ -322,7 +333,7 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
       const view = viewRef.current;
       return [(event.clientX - rect.left - view.tx) / view.scale, (event.clientY - rect.top - view.ty) / view.scale];
     };
-    let down: { x: number; y: number; button: number; moved: boolean; painting: boolean } | null = null;
+    let down: { x: number; y: number; button: number; moved: boolean; painting: boolean; hand: boolean } | null = null;
     let lastClick: { face: number; time: number } | null = null;
     const paintAt = (position: [number, number]) => {
       const current = atlasRef.current;
@@ -332,8 +343,10 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     };
     const onPointerDown = (event: PointerEvent) => {
       canvas.setPointerCapture(event.pointerId);
-      const painting = brushRef.current.active && event.button === 0 && !event.altKey && !eyedropperRef.current;
-      down = { x: event.clientX, y: event.clientY, button: event.button, moved: false, painting };
+      const hand = handRef.current;
+      const painting = !hand && brushRef.current.active && event.button === 0 && !event.altKey && !eyedropperRef.current;
+      down = { x: event.clientX, y: event.clientY, button: event.button, moved: false, painting, hand };
+      if (hand) canvas.style.cursor = "grabbing";
       if (painting) {
         callbacksRef.current.onBrushStart?.();
         paintAt(toAtlas(event));
@@ -358,7 +371,7 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         }
       } else {
         const current = atlasRef.current;
-        callbacksRef.current.onHover?.(current ? faceAtAtlasPixel(current, position[0], position[1]) : null);
+        callbacksRef.current.onHover?.(current && !handRef.current ? faceAtAtlasPixel(current, position[0], position[1]) : null);
       }
       requestDraw();
     };
@@ -370,7 +383,8 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         callbacksRef.current.onBrushEnd?.();
         return;
       }
-      if (state.moved || state.button !== 0) return;
+      if (state.hand) canvas.style.cursor = handRef.current ? "grab" : "";
+      if (state.moved || state.button !== 0 || state.hand) return;
       const current = atlasRef.current;
       if (!current) return;
       const position = toAtlas(event);

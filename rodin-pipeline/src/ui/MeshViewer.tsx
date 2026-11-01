@@ -106,6 +106,8 @@ export interface MeshViewerProps {
   brush?: boolean;
   /** Next click samples a colour instead of picking/painting. */
   eyedropper?: boolean;
+  /** Space held: a hand — the left button pans, and nothing is picked or painted. */
+  hand?: boolean;
   background?: ViewBackground;
   /**
    * The face under the pointer while it is not painting (null when it leaves
@@ -1254,7 +1256,7 @@ function makeCursorLine(): THREE.LineLoop {
 }
 
 export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function MeshViewer(
-  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, background = DEFAULT_BACKGROUND, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null },
+  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null },
   ref,
 ) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1274,6 +1276,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
   brushRef.current = brush;
   const eyedropperRef = useRef(eyedropper);
   eyedropperRef.current = eyedropper;
+  const handRef = useRef(hand);
+  handRef.current = hand;
 
   /**
    * Recolour faces in place, `colourOf(i)` giving face `faces[i]` its linear
@@ -1486,6 +1490,11 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       const move = pendingMove;
       pendingMove = null;
       if (!move) return;
+      // The hand only moves the view: no patch to show, no brush circle.
+      if (handRef.current) {
+        reportHover(null);
+        return;
+      }
       const hit = gpuPick(state, move.x, move.y);
       if (!brushRef.current) {
         reportHover(hit ? hit.faceIndex : null);
@@ -1498,6 +1507,11 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       else callbacksRef.current.onBrushHover?.(hit);
     };
     const onPointerDown = (event: PointerEvent) => {
+      if (handRef.current) {
+        down = null;
+        renderer.domElement.style.cursor = "grabbing";
+        return;
+      }
       if (brushRef.current && event.button === 0 && !event.altKey && !eyedropperRef.current) {
         brushDown = true;
         renderer.domElement.setPointerCapture(event.pointerId);
@@ -1525,6 +1539,11 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         callbacksRef.current.onBrushEnd?.();
         return;
       }
+      if (handRef.current) {
+        renderer.domElement.style.cursor = "grab";
+        down = null;
+        return;
+      }
       if (!down) return;
       const moved = Math.hypot(event.clientX - down.x, event.clientY - down.y);
       const elapsed = performance.now() - down.time;
@@ -1544,7 +1563,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       reportHover(null);
       if (brushRef.current) {
         callbacksRef.current.onBrushHover?.(null);
-        if (!eyedropperRef.current) renderer.domElement.style.cursor = "crosshair";
+        if (!eyedropperRef.current && !handRef.current) renderer.domElement.style.cursor = "crosshair";
       }
     };
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
@@ -1601,19 +1620,23 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
   }, []);
 
   // Brush mode: the left button paints, so rotate with the right button instead.
+  // The hand (space held): the left button pans, whatever tool is on.
   useEffect(() => {
     const state = stateRef.current;
     if (!state) return;
-    state.controls.mouseButtons = brush
-      ? { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
-      : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
-    // The eyedropper's cursor comes from the stylesheet (.eyedropping).
-    state.renderer.domElement.style.cursor = brush && !eyedropper ? "crosshair" : "";
-    if (!brush && state.cursorLine.visible) {
+    state.controls.mouseButtons = hand
+      ? { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
+      : brush
+        ? { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE }
+        : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+    // The eyedropper's cursor comes from the stylesheet (.eyedropping); the hand's stands over it.
+    state.renderer.domElement.style.cursor = hand ? "grab" : brush && !eyedropper ? "crosshair" : "";
+    if ((hand || !brush) && state.cursorLine.visible) {
       state.cursorLine.visible = false;
       requestRender(state);
     }
-  }, [brush, eyedropper]);
+    if (hand && brush) callbacksRef.current.onBrushHover?.(null);
+  }, [brush, eyedropper, hand]);
 
   // Geometry from positions.
   useEffect(() => {
