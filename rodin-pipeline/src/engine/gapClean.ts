@@ -19,6 +19,11 @@ import type { RGB, Tri, Vec3 } from "@core/types";
  *   side at most) between two kept colours.  Only that: where the gap opens
  *   into a wide region, the region's faces meet their own colour along two
  *   sides or more, so the clean does not eat its way in row by row.
+ * - picked: the other way round — the picked faces are the wedged bits.
+ *   Each melts into the colour around it, from the outside in a layer at a
+ *   time, every face to the colour it borders most; a bit between green and
+ *   blue ends up split between them.  A piece with no other colour around
+ *   (a part of its own) stays.
  * - all: anywhere on the model, a face that meets its own colour along one
  *   side at most and touches two other colours goes, two rounds (a tooth two
  *   faces deep).  A line one face wide keeps its middle, which meets its own
@@ -32,6 +37,8 @@ import type { RGB, Tri, Vec3 } from "@core/types";
 export type GapCleanScope =
   /** The picked patches (faces), whose colours are kept. */
   | { kind: "between"; patches: Int32Array[] }
+  /** The wedged bits themselves: these faces go to the colours around them. */
+  | { kind: "picked"; faces: Int32Array }
   | { kind: "all" };
 
 export interface GapCleanInput {
@@ -53,6 +60,8 @@ export interface GapCleanResult {
   /** Palette position a changed face went to -> how many went there. */
   into: Map<number, number>;
   rounds: number;
+  /** "picked": faces left as they were — protected, or with no other colour around. */
+  left: number;
 }
 
 /** "between": the gap itself, then two rounds of what sticks out of it. */
@@ -178,7 +187,7 @@ export function cleanGaps(input: GapCleanInput, scope: GapCleanScope): GapCleanR
         kept.add(label[faces[i]]);
       }
     }
-    if (kept.size < 2) return { colours: input.colours, changed: new Int32Array(0), into, rounds: 0 };
+    if (kept.size < 2) return { colours: input.colours, changed: new Int32Array(0), into, rounds: 0, left: 0 };
     const onSide = (g: number) => side[g] !== 0;
     // The faces to look at: around the sides, then around what changed.
     let look: number[] = [];
@@ -227,6 +236,69 @@ export function cleanGaps(input: GapCleanInput, scope: GapCleanScope): GapCleanR
       for (const f of pendingFace) side[f] = 2;
       look = gather(pendingFace, round + 2);
     }
+  } else if (scope.kind === "picked") {
+    // Melt from the outside in: each round the picked faces touching
+    // something else take the colour they border most there (decided from
+    // the state before the round, so a face melts into the surroundings,
+    // never into another picked face).
+    // 1 = still to melt; 2 = picked but protected (kept as it is, a colour around the others).
+    const melting = new Uint8Array(faceCount);
+    let remaining = 0;
+    let shielded = 0;
+    for (let i = 0; i < scope.faces.length; i++) {
+      const f = scope.faces[i];
+      if (melting[f]) continue;
+      if (isProtected(f)) {
+        melting[f] = 2;
+        shielded++;
+        continue;
+      }
+      melting[f] = 1;
+      remaining++;
+    }
+    const outside = (g: number) => melting[g] !== 1;
+    const touchesOutside = (f: number) => {
+      const end = adjacency.offsets[f + 1];
+      for (let i = adjacency.offsets[f]; i < end; i++) if (melting[adjacency.neighbours[i]] !== 1) return true;
+      return false;
+    };
+    const queued = new Int32Array(faceCount);
+    let rim: number[] = [];
+    for (let i = 0; i < scope.faces.length; i++) {
+      const f = scope.faces[i];
+      if (melting[f] !== 1 || queued[f] === -1 || !touchesOutside(f)) continue;
+      queued[f] = -1;
+      rim.push(f);
+    }
+    for (let round = 0; rim.length > 0; round++) {
+      pendingFace.length = 0;
+      pendingDonor.length = 0;
+      for (const f of rim) {
+        if (melting[f] !== 1) continue;
+        const donor = strongest(f, outside);
+        if (donor < 0) continue;
+        pendingFace.push(f);
+        pendingDonor.push(donor);
+      }
+      if (pendingFace.length === 0) break;
+      rounds = round + 1;
+      apply();
+      for (const f of pendingFace) melting[f] = 0;
+      remaining -= pendingFace.length;
+      // The next rim: picked faces next to what just melted.
+      const next: number[] = [];
+      for (const f of pendingFace) {
+        const end = adjacency.offsets[f + 1];
+        for (let i = adjacency.offsets[f]; i < end; i++) {
+          const g = adjacency.neighbours[i];
+          if (melting[g] !== 1 || queued[g] === round + 1) continue;
+          queued[g] = round + 1;
+          next.push(g);
+        }
+      }
+      rim = next;
+    }
+    return { colours, changed: Int32Array.from(changed), into, rounds, left: remaining + shielded };
   } else {
     // Faces are changed one at a time, the most cut off first (fewest sides
     // on their own colour, then fewest faces of it around), each checked
@@ -280,5 +352,5 @@ export function cleanGaps(input: GapCleanInput, scope: GapCleanScope): GapCleanR
       rounds = round + 1;
     }
   }
-  return { colours, changed: Int32Array.from(changed), into, rounds };
+  return { colours, changed: Int32Array.from(changed), into, rounds, left: 0 };
 }

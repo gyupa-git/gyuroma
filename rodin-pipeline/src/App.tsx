@@ -205,6 +205,8 @@ function typingIn(target: HTMLElement | null): boolean {
   return !["range", "checkbox", "radio", "button", "submit", "reset", "color", "file"].includes(type);
 }
 const NO_FOCUS = { mask: null, mode: "normal" as const };
+/** Gap clean, picked bits: melting more than this share of the surface asks first. */
+const GAP_PICK_ASK_SHARE = 0.02;
 /** Outline shapes kept per model (bytes): every colour of a million-face model fits. */
 const OVERLAY_SHAPE_BUDGET = 160 * 1024 * 1024;
 type UndoKind = "strip" | "colours";
@@ -554,12 +556,14 @@ export default function App() {
   /**
    * Gap clean (C): clicks add patches to the selection; Enter or the bar's
    * button turns the colours wedged between the picked colours ("part", the
-   * default) or, after a warning, between any two colours ("all").
+   * default), melts the picked bits themselves into what is around them
+   * ("picked": a double click takes every place of that colour) or, after a
+   * warning, cleans between any two colours ("all").
    */
   const [gapMode, setGapMode] = useState(false);
   const gapModeRef = useRef(false);
   gapModeRef.current = gapMode;
-  const [gapScope, setGapScope] = useState<"part" | "all">("part");
+  const [gapScope, setGapScope] = useState<"part" | "picked" | "all">("part");
   /** Runs the gap clean when it can run now (for Enter). */
   const gapRunRef = useRef<(() => void) | null>(null);
   /** After a gap clean between patches: faces to pick again once the colours are in. */
@@ -2664,6 +2668,31 @@ export default function App() {
       setStatus(t("gap.needTwo", { n: keptCount }));
       return;
     }
+    // "picked": the picked patches, and with a colour shown (double click) every place of it.
+    const pickedFaces = (): Int32Array => {
+      const take = new Uint8Array(labels.length);
+      for (const patch of pickedPatches) for (let i = 0; i < patch.faces.length; i++) take[patch.faces[i]] = 1;
+      const shownPosition = shownHex ? positionByHex.get(shownHex) : undefined;
+      if (shownPosition !== undefined) for (let f = 0; f < labels.length; f++) if (labels[f] === shownPosition) take[f] = 1;
+      const out: number[] = [];
+      for (let f = 0; f < take.length; f++) if (take[f]) out.push(f);
+      return Int32Array.from(out);
+    };
+    if (scope === "picked" && pickedPatches.length === 0 && !shownHex) {
+      setStatus(t("gap.needPick"));
+      return;
+    }
+    const melt = scope === "picked" ? pickedFaces() : null;
+    // A double click can take a whole big colour: more than a sliver of the surface asks first
+    // (by area, as the selection shows it).
+    if (melt) {
+      let area = 0;
+      let total = 0;
+      for (let i = 0; i < areaWeights.length; i++) total += areaWeights[i];
+      for (let i = 0; i < melt.length; i++) area += areaWeights[melt[i]];
+      const share = total > 0 ? area / total : 0;
+      if (share > GAP_PICK_ASK_SHARE && !window.confirm(t("gap.confirmBigPick", { pct: (share * 100).toFixed(1), n: melt.length.toLocaleString() }))) return;
+    }
     if (scope === "all") {
       const shielded = hexByPosition.filter((hex) => protectedHexes.has(hex)).length;
       if (!window.confirm(t("gap.confirmAll", { n: shielded, none: shielded === 0 ? t("gap.confirmNone") : "" }))) return;
@@ -2677,10 +2706,14 @@ export default function App() {
       });
       const result = cleanGaps(
         { adjacency: adjacencyFor(model), triangles: model.triangles, vertices: model.vertices, labels, colours: model.triangleColors, protectedLabels },
-        scope === "part" ? { kind: "between", patches: pickedPatches.map((patch) => patch.faces) } : { kind: "all" },
+        scope === "part"
+          ? { kind: "between", patches: pickedPatches.map((patch) => patch.faces) }
+          : scope === "picked"
+            ? { kind: "picked", faces: melt ?? new Int32Array(0) }
+            : { kind: "all" },
       );
       if (result.changed.length === 0) {
-        setStatus(t(scope === "part" ? "gap.nonePart" : "gap.noneAll"));
+        setStatus(t(scope === "part" ? "gap.nonePart" : scope === "picked" ? "gap.nonePicked" : "gap.noneAll"));
         return;
       }
       const detail = [...result.into]
@@ -2690,7 +2723,8 @@ export default function App() {
       // Between patches the same places stay picked: their outlines show the gap gone.
       if (scope === "part") regrabRef.current = pickedPatches.map((patch) => patch.anchor);
       applyColours(model, result.colours, { keepSelection: scope === "part" });
-      setStatus(t(scope === "part" ? "gap.donePart" : "gap.doneAll", { n: result.changed.length.toLocaleString(), detail }));
+      const done = t(scope === "part" ? "gap.donePart" : scope === "picked" ? "gap.donePicked" : "gap.doneAll", { n: result.changed.length.toLocaleString(), detail });
+      setStatus(result.left > 0 ? `${done} ${t("gap.leftPicked", { n: result.left.toLocaleString() })}` : done);
     } finally {
       setBusy(null);
     }
@@ -4511,7 +4545,8 @@ export default function App() {
     !isBusy && pickedPatches.length > 0 && Boolean(pickTarget) && !(pickTarget !== "__new__" && pickedHexes.length === 1 && pickTarget === pickedHexes[0]);
   fillPickRef.current = canFillPick ? applyPickColour : null;
   const gapHexes = [...new Set(pickedPatches.map((patch) => patch.hex))];
-  const canRunGap = !isBusy && model !== null && (gapScope === "all" || gapHexes.length >= 2);
+  const canRunGap =
+    !isBusy && model !== null && (gapScope === "all" || (gapScope === "picked" ? pickedPatches.length > 0 || shownHex !== null : gapHexes.length >= 2));
   gapRunRef.current = canRunGap ? () => void runGap() : null;
   const setRecipeOverride = (paletteIndex: number, counts: Record<number, number> | null) => {
     setSettings((prev) => {
@@ -5232,17 +5267,26 @@ export default function App() {
                     label={t("gap.title")}
                     options={[
                       { value: "part", label: t("gap.part"), title: t("gap.hintPart") },
+                      { value: "picked", label: t("gap.picked"), title: t("gap.hintPicked") },
                       { value: "all", label: t("gap.all"), title: t("gap.hintAll") },
                     ]}
                   />
-                  {gapScope === "part" && gapHexes.length > 0 && (
+                  {gapScope !== "all" && gapHexes.length > 0 && (
                     <span className="cell-colour">
                       {gapHexes.slice(0, 8).map((hex) => (
                         <Swatch key={hex} hex={hex} size={14} title={hex} />
                       ))}
                     </span>
                   )}
-                  <span className="muted">{t(gapScope === "all" ? "gap.hintAll" : gapHexes.length >= 2 ? "gap.hintPartReady" : "gap.hintPart")}</span>
+                  <span className="muted">
+                    {gapScope === "all"
+                      ? t("gap.hintAll")
+                      : gapScope === "picked"
+                        ? shownHex
+                          ? t("gap.hintPickedColour", { hex: shownHex })
+                          : t(pickedPatches.length > 0 ? "gap.hintPickedReady" : "gap.hintPicked")
+                        : t(gapHexes.length >= 2 ? "gap.hintPartReady" : "gap.hintPart")}
+                  </span>
                   <button type="button" className="btn primary small" disabled={!canRunGap} onClick={() => void runGap()}>
                     {t(gapScope === "all" ? "gap.runAll" : "gap.run")}
                   </button>

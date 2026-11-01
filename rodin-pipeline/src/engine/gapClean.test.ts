@@ -105,3 +105,38 @@ describe("cleanGaps — the whole model", () => {
     expect(cleanGaps(input, { kind: "all" }).changed.length).toBe(0);
   });
 });
+
+describe("cleanGaps — the picked bits melt into what is around them", () => {
+  // Green on the left, white on the right; a mint bit two squares wide sits
+  // on the border between them, rows 3..5.
+  const W = 10;
+  const build = (prot: number[] = []) =>
+    grid(W, 10, (i, j) => (j >= 3 && j <= 5 && (i === 4 || i === 5) ? MINT : i < 5 ? GREEN : WHITE), prot);
+
+  it("splits a bit between its two neighbours and leaves nothing of it", () => {
+    const input = build();
+    const result = cleanGaps(input, { kind: "picked", faces: facesOf(input, MINT) });
+    expect(result.left).toBe(0);
+    expect(result.changed.length).toBe(facesOf(input, MINT).length);
+    const went = new Set([...result.changed].map((f) => labelOf(result.colours[f])));
+    expect(went).toEqual(new Set([GREEN, WHITE]));
+    // Each side takes its own half.
+    for (let j = 3; j <= 5; j++) {
+      expect(labelOf(result.colours[face(W, 4, j, 1)])).toBe(GREEN);
+      expect(labelOf(result.colours[face(W, 5, j, 0)])).toBe(WHITE);
+    }
+    // Nothing else changed.
+    for (const f of result.changed) expect(input.labels[f]).toBe(MINT);
+  });
+
+  it("keeps a protected pick and a piece with nothing else around", () => {
+    const shielded = build([MINT]);
+    const kept = cleanGaps(shielded, { kind: "picked", faces: facesOf(shielded, MINT) });
+    expect(kept.changed.length).toBe(0);
+    expect(kept.left).toBe(facesOf(shielded, MINT).length);
+    const alone = grid(4, 4, () => MINT);
+    const all = cleanGaps(alone, { kind: "picked", faces: facesOf(alone, MINT) });
+    expect(all.changed.length).toBe(0);
+    expect(all.left).toBe(32);
+  });
+});
