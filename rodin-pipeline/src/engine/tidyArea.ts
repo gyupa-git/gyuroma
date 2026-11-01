@@ -1,5 +1,6 @@
 import type { FaceAdjacency } from "@core/meshAdjacency";
-import type { ChangeLine, TidyChanges } from "./tidy";
+import type { Translate } from "../i18n";
+import { tidyCount, type ChangeLine, type TidyChanges } from "./tidy";
 
 /** Where a tidy preset applies. */
 export type TidyArea = "model" | "picked";
@@ -15,14 +16,14 @@ export function pickedOnly(changes: TidyChanges): TidyChanges {
 }
 
 /** The values a picked-patch tidy bakes with (an empty `from`: nothing is switched over). */
-export function pickedValueLines(changes: TidyChanges): ChangeLine[] {
+export function pickedValueLines(changes: TidyChanges, t: Translate): ChangeLine[] {
   const lines: ChangeLine[] = [];
-  if (changes.minBlob !== undefined) lines.push({ key: "minBlob", label: "작은 조각 흡수", from: "", to: `${changes.minBlob}면` });
-  if (changes.smoothing !== undefined) lines.push({ key: "smoothing", label: "경계 톱니 다듬기", from: "", to: `${changes.smoothing}회` });
-  if (changes.lineSmooth !== undefined) lines.push({ key: "lineSmooth", label: "경계 선 펴기", from: "", to: `${changes.lineSmooth}칸` });
-  if (changes.trimTeeth !== undefined) lines.push({ key: "trimTeeth", label: "톱니 깎기", from: "", to: `${changes.trimTeeth}회` });
-  if (changes.smoothProtected !== undefined) lines.push({ key: "smoothProtected", label: "보호한 색도 경계 다듬기", from: "", to: changes.smoothProtected ? "켬" : "끔" });
-  if (changes.protectAccents) lines.push({ key: "protect", label: "작은 선명한 색", from: "", to: "보호" });
+  if (changes.minBlob !== undefined) lines.push({ key: "minBlob", label: t("clean.islands"), from: "", to: tidyCount(changes.minBlob, "faces", t) });
+  if (changes.smoothing !== undefined) lines.push({ key: "smoothing", label: t("clean.smooth"), from: "", to: tidyCount(changes.smoothing, "passes", t) });
+  if (changes.lineSmooth !== undefined) lines.push({ key: "lineSmooth", label: t("clean.line"), from: "", to: tidyCount(changes.lineSmooth, "edges", t) });
+  if (changes.trimTeeth !== undefined) lines.push({ key: "trimTeeth", label: t("clean.trim"), from: "", to: tidyCount(changes.trimTeeth, "passes", t) });
+  if (changes.smoothProtected !== undefined) lines.push({ key: "smoothProtected", label: t("clean.smoothProtected"), from: "", to: t(changes.smoothProtected ? "tidy.val.on" : "tidy.val.off") });
+  if (changes.protectAccents) lines.push({ key: "protect", label: t("tidy.line.accents"), from: "", to: t("tidy.val.protected") });
   return lines;
 }
 

@@ -1,3 +1,4 @@
+import type { Key, Translate } from "../i18n";
 import type { MixSettings } from "./types";
 
 /**
@@ -154,7 +155,7 @@ export function presetChanges(id: TidyPreset["id"], context: TidyContext, scope:
 }
 
 /** Keeps only what the scope allows and what is valid; says what was left out. */
-export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyScope): { changes: TidyChanges; dropped: string[] } {
+export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyScope, t: Translate): { changes: TidyChanges; dropped: string[] } {
   const dropped: string[] = [];
   const changes: TidyChanges = {};
   if (!raw || typeof raw !== "object") return { changes, dropped };
@@ -167,7 +168,7 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
   const mix = scope !== "clean";
 
   const cleanKeys = ["target", "minBlob", "smoothing", "smoothProtected", "trimTeeth", "lineSmooth", "protect", "unprotect", "merge"];
-  if (!clean && cleanKeys.some((k) => r[k] !== undefined)) dropped.push("색정리 칸 (지금 범위는 혼합만)");
+  if (!clean && cleanKeys.some((k) => r[k] !== undefined)) dropped.push(t("tidy.drop.cleanInMix"));
   if (clean) {
     const target = num(r.target);
     if (target !== null) changes.target = clampInt(target, 2, 64);
@@ -192,11 +193,11 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
           .filter((m) => m.from !== m.into)
       : [];
     if (relayout && (protect.length || unprotect.length || merge.length)) {
-      dropped.push("색 지정(보호·합치기) — 목표 색 수가 바뀌면 색이 새로 나뉘어서, 다음 말에서 다시 정합니다");
+      dropped.push(t("tidy.drop.relayout"));
     } else {
       const known = (hex: string) => hexes.has(hex);
       const unknown = [...protect, ...unprotect, ...merge.flatMap((m) => [m.from, m.into])].filter((hex) => !known(hex));
-      if (unknown.length) dropped.push(`지금 팔레트에 없는 색 ${[...new Set(unknown)].join(", ")}`);
+      if (unknown.length) dropped.push(t("tidy.drop.unknownHex", { list: [...new Set(unknown)].join(", ") }));
       if (protect.some(known)) changes.protect = protect.filter(known);
       if (unprotect.some(known)) changes.unprotect = unprotect.filter(known);
       const merges = merge.filter((m) => known(m.from) && known(m.into));
@@ -204,7 +205,7 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
     }
   }
   const rawMix = r.mix && typeof r.mix === "object" ? (r.mix as Record<string, unknown>) : null;
-  if (rawMix && !mix) dropped.push("혼합 칸 (지금 범위는 색정리만)");
+  if (rawMix && !mix) dropped.push(t("tidy.drop.mixInClean"));
   if (rawMix && mix) {
     const m: TidyMixChanges = {};
     if (rawMix.assignmentMode === "physical-only" || rawMix.assignmentMode === "physical-and-virtual") m.assignmentMode = rawMix.assignmentMode;
@@ -229,52 +230,76 @@ export interface ChangeLine {
   to: string;
 }
 
-const MIX_LABEL: Record<keyof TidyMixChanges, string> = {
-  assignmentMode: "출력 방식",
-  maxComponents: "섞는 필라멘트 수",
-  recipeResolution: "혼합 비율 단위",
-  accentProtection: "포인트 색 보존",
-  mappingStrategy: "색 짝짓기",
-  mixPriority: "혼합 우선",
-  autoPhysicalDirect: "가까우면 실물로",
-  physicalDirectDeltaE: "실물로 보낼 거리(ΔE)",
+/** Each mixing field under the name its row has in the 03 panel (the mix count: see describeChanges). */
+const MIX_LABEL: Record<Exclude<keyof TidyMixChanges, "assignmentMode" | "maxComponents">, Key> = {
+  recipeResolution: "mix.ratioStep",
+  accentProtection: "mix.accent",
+  mappingStrategy: "mix.mapping",
+  mixPriority: "mix.model",
+  autoPhysicalDirect: "mix.autoDirect",
+  physicalDirectDeltaE: "tidy.mix.directDeltaE",
 };
 
-function mixValue(key: keyof TidyMixChanges, value: unknown): string {
-  if (key === "assignmentMode") return value === "physical-only" ? "실물만" : "실물 + 가상 혼합";
+/** A mixing value as the 03 panel names it. */
+const MIX_VALUE: Partial<Record<keyof TidyMixChanges, Record<string, Key>>> = {
+  accentProtection: { off: "mix.accentOff", balanced: "mix.accentBalanced", strong: "mix.accentStrong" },
+  mappingStrategy: { closest: "mix.mapClosest", smooth: "mix.mapSmooth", "preserve-hue": "mix.mapHue", "preserve-accent": "mix.mapAccent", "warm-neutral": "mix.mapWarm" },
+  mixPriority: { accurate: "mix.modelAccurate", "preserve-hue": "mix.modelHue", "avoid-muddy": "mix.modelAccent" },
+};
+
+function mixValue(key: keyof TidyMixChanges, value: unknown, t: Translate): string {
   if (key === "recipeResolution") {
     const v = String(value);
     return v === "thirds" ? "1/3" : v === "half-thirds" ? "50% + 1/3" : `${v.replace("grid", "")}% + 1/3`;
   }
-  if (key === "autoPhysicalDirect") return value ? "켬" : "끔";
-  if (key === "maxComponents") return `${value}개까지`;
-  return String(value);
+  if (key === "autoPhysicalDirect") return t(value ? "tidy.val.on" : "tidy.val.off");
+  const named = MIX_VALUE[key]?.[String(value)];
+  return named ? t(named) : String(value);
 }
 
-/** Before → after, one line per field that really changes. */
-export function describeChanges(changes: TidyChanges, context: TidyContext): ChangeLine[] {
+/** A count with its unit, in the UI's language: faces, passes or border edges. */
+export function tidyCount(n: number, unit: "faces" | "passes" | "edges", t: Translate): string {
+  const one = n === 1;
+  if (unit === "faces") return t(one ? "tidy.val.face" : "tidy.val.faces", { n });
+  if (unit === "passes") return t(one ? "tidy.val.pass" : "tidy.val.passes", { n });
+  return t(one ? "tidy.val.edge" : "tidy.val.edges", { n });
+}
+
+/** Before → after, one line per field that really changes (labels as the panels name the fields). */
+export function describeChanges(changes: TidyChanges, context: TidyContext, t: Translate): ChangeLine[] {
   const lines: ChangeLine[] = [];
+  const onOff = (on: boolean) => t(on ? "tidy.val.on" : "tidy.val.off");
   if (changes.target !== undefined && changes.target !== context.target)
-    lines.push({ key: "target", label: "목표 색 수", from: String(context.target), to: String(changes.target) });
+    lines.push({ key: "target", label: t("clean.target"), from: String(context.target), to: String(changes.target) });
   if (changes.minBlob !== undefined && changes.minBlob !== context.minBlob)
-    lines.push({ key: "minBlob", label: "작은 조각 흡수", from: `${context.minBlob}면`, to: `${changes.minBlob}면` });
+    lines.push({ key: "minBlob", label: t("clean.islands"), from: tidyCount(context.minBlob, "faces", t), to: tidyCount(changes.minBlob, "faces", t) });
   if (changes.smoothing !== undefined && changes.smoothing !== context.smoothing)
-    lines.push({ key: "smoothing", label: "경계 톱니 다듬기", from: `${context.smoothing}회`, to: `${changes.smoothing}회` });
+    lines.push({ key: "smoothing", label: t("clean.smooth"), from: tidyCount(context.smoothing, "passes", t), to: tidyCount(changes.smoothing, "passes", t) });
   if (changes.smoothProtected !== undefined && changes.smoothProtected !== context.smoothProtected)
-    lines.push({ key: "smoothProtected", label: "보호한 색도 경계 다듬기", from: context.smoothProtected ? "켬" : "끔", to: changes.smoothProtected ? "켬" : "끔" });
+    lines.push({ key: "smoothProtected", label: t("clean.smoothProtected"), from: onOff(context.smoothProtected), to: onOff(changes.smoothProtected) });
   if (changes.trimTeeth !== undefined && changes.trimTeeth !== context.trimTeeth)
-    lines.push({ key: "trimTeeth", label: "톱니 깎기", from: `${context.trimTeeth}회`, to: `${changes.trimTeeth}회` });
+    lines.push({ key: "trimTeeth", label: t("clean.trim"), from: tidyCount(context.trimTeeth, "passes", t), to: tidyCount(changes.trimTeeth, "passes", t) });
   if (changes.lineSmooth !== undefined && changes.lineSmooth !== context.lineSmooth)
-    lines.push({ key: "lineSmooth", label: "경계 선 펴기", from: `${context.lineSmooth}칸`, to: `${changes.lineSmooth}칸` });
+    lines.push({ key: "lineSmooth", label: t("clean.line"), from: tidyCount(context.lineSmooth, "edges", t), to: tidyCount(changes.lineSmooth, "edges", t) });
   const isProtected = new Map(context.palette.map((c) => [c.hex, c.protected]));
-  for (const hex of changes.protect ?? []) if (!isProtected.get(hex)) lines.push({ key: "protect", label: `보호 ${hex}`, from: "안 함", to: "보호" });
-  for (const hex of changes.unprotect ?? []) if (isProtected.get(hex)) lines.push({ key: "protect", label: `보호 ${hex}`, from: "보호", to: "안 함" });
-  for (const m of changes.merge ?? []) lines.push({ key: "merge", label: "합치기", from: m.from, to: m.into });
-  if (changes.protectAccents) lines.push({ key: "protect", label: "작은 선명한 색", from: "자동", to: "보호" });
+  for (const hex of changes.protect ?? []) if (!isProtected.get(hex)) lines.push({ key: "protect", label: t("tidy.line.protectHex", { hex }), from: t("tidy.val.notProtected"), to: t("tidy.val.protected") });
+  for (const hex of changes.unprotect ?? []) if (isProtected.get(hex)) lines.push({ key: "protect", label: t("tidy.line.protectHex", { hex }), from: t("tidy.val.protected"), to: t("tidy.val.notProtected") });
+  for (const m of changes.merge ?? []) lines.push({ key: "merge", label: t("tidy.line.merge"), from: m.from, to: m.into });
+  if (changes.protectAccents) lines.push({ key: "protect", label: t("tidy.line.accents"), from: t("tidy.val.auto"), to: t("tidy.val.protected") });
+  // How many filaments mix is one row in the 03 panel ("single only / up to 2 / up to 3"), made of two
+  // fields: one line with the row's value before and after (none when the row shows the same).
+  if (changes.mix && (changes.mix.assignmentMode !== undefined || changes.mix.maxComponents !== undefined)) {
+    const howMany = (m: Pick<MixSettings, "assignmentMode" | "maxComponents">): Key =>
+      m.assignmentMode === "physical-only" ? "mix.onlySingle" : m.maxComponents === 3 ? "mix.upTo3" : "mix.upTo2";
+    const before = howMany(context.mix);
+    const after = howMany({ ...context.mix, ...changes.mix });
+    if (before !== after) lines.push({ key: changes.mix.maxComponents !== undefined ? "mix.maxComponents" : "mix.assignmentMode", label: t("mix.howMany"), from: t(before), to: t(after) });
+  }
   for (const [key, value] of Object.entries(changes.mix ?? {}) as Array<[keyof TidyMixChanges, unknown]>) {
+    if (key === "assignmentMode" || key === "maxComponents") continue;
     const now = context.mix[key];
     if (now === value) continue;
-    lines.push({ key: `mix.${key}`, label: MIX_LABEL[key], from: mixValue(key, now), to: mixValue(key, value) });
+    lines.push({ key: `mix.${key}`, label: t(MIX_LABEL[key]), from: mixValue(key, now, t), to: mixValue(key, value, t) });
   }
   return lines;
 }

@@ -23,8 +23,7 @@ export const RODIN_PROJECT_SETTINGS_PATH = "Metadata/project_settings.config";
 
 export const RODIN_TEXTURE_MODE_MESSAGE =
   "This 3MF has no face colours (it looks like a Texture Map export). " +
-  "In Rodin, set Output Mode to Face Color and download the 3MF again. " +
-  "/ Face Color 모드가 아닙니다. Rodin에서 Output Mode를 Face Color로 바꿔서 다시 받으세요.";
+  "In Rodin, set Output Mode to Face Color and download the 3MF again.";
 
 export interface Rodin3mfStats {
   vertexCount: number;

@@ -8,7 +8,7 @@ import { applyRecipeOverridesToPlan, normaliseRecipeCounts, type RecipeOverride 
 import { resolveCoordinateMode, transformNoTranslation } from "@core/export3mf";
 import { combineTurns, turnMode, turnRows, type FixedCoordinateMode } from "@core/orientation";
 import { accentPaletteIndices, fidelityScore, scoreSlotSet } from "@core/spoolAdvice";
-import { loadRodin3mf } from "@core/rodin3mf";
+import { loadRodin3mf, RODIN_TEXTURE_MODE_MESSAGE } from "@core/rodin3mf";
 import { parseObjFile } from "@core/objParser";
 import { readTemplate3mf, type Template3mfInfo } from "@core/template3mf";
 import { buildFaceAdjacency, type FaceAdjacency } from "@core/meshAdjacency";
@@ -25,7 +25,7 @@ import { buildColourFile } from "@core/exportColour";
 import { nearestPaletteIndex } from "@core/quantize";
 import { BAMBU_STUDIO_MAX_FILAMENTS, findPrinter, templateFitsPrinter } from "./engine/printers";
 import { decodePaintCode } from "@core/paintCodes";
-import { applyNomadObjToModel, buildNomadObj, parseNomadObj } from "@core/nomadRoundTrip";
+import { applyNomadObjToModel, buildNomadObj, NOMAD_NEW_MODEL_WARNING, NOMAD_OFF_PALETTE_WARNING, nomadRemeshWarning, parseNomadObj } from "@core/nomadRoundTrip";
 import { apparentLayerRgbs, deltaE2000, linearToSrgb, rgbToLab, srgbToLinear } from "@core/prusaFdmMixer";
 import { downloadBlob, downloadText } from "@core/exportCsv";
 import {
@@ -52,6 +52,7 @@ import {
   highlightGeometryCut,
   smoothVertexNormals,
   type FaceGeometry,
+  type HighlightCut,
   maskFromLabels,
   representativeColoursByPosition,
   sameLabelComponent,
@@ -108,6 +109,7 @@ import { edgeChanges, measurePatchEdge, type PatchEdge } from "./engine/patchEdg
 import { cleanGaps, discDiameter, piecesOf as placesOf } from "./engine/gapClean";
 import { NO_TONE, isNoTone, sameTone, toneColours, type Tone, type ToneColour, type ToneWalls } from "./engine/groupTone";
 import { cutsKeepingGroups } from "./engine/stripCuts";
+import { faceOfGroupNear } from "./engine/cutPick";
 import { WITH_CLAUDE } from "./features";
 import { renderViews } from "./ui/snapshot";
 import { aiAsk, aiStatus, loadApiKey, loadKeyUsage, maskKey, saveApiKey, type AiRoute, type KeyUsage } from "./engine/aiClient";
@@ -359,6 +361,8 @@ function livePins(pins: number[][] | undefined, strip: ColourStripData): number[
   if (!pins || pins.length === 0) return undefined;
   const present = new Set<number>();
   for (const family of strip.families) for (const colour of family.colours) present.add(colour.key);
+  // Nothing gone: the same pins (the strip worked out ahead for them is used as it is).
+  if (pins.every((keys) => keys.every((key) => present.has(key)))) return pins;
   const out = pins.map((keys) => keys.filter((key) => present.has(key))).filter((keys) => keys.length > 0);
   return out.length > 0 ? out : undefined;
 }
@@ -377,6 +381,28 @@ function stripStore(target: number, cuts: StripCuts, pins: number[][] | undefine
     if (Object.keys(kept).length > 0) stored.from = kept;
   }
   return stored;
+}
+
+/**
+ * A short print of a strip (each colour and its share of the area), to tell
+ * whether cuts kept for one set of face colours fit the colours shown now.
+ */
+function stripPrint(strip: ColourStripData): string {
+  let h = 2166136261;
+  const mix = (n: number) => {
+    h ^= n;
+    h = Math.imul(h, 16777619) >>> 0;
+  };
+  let total = 0;
+  for (const family of strip.families) total += family.weight;
+  for (const family of strip.families) {
+    mix(family.family + 1);
+    for (const colour of family.colours) {
+      mix(colour.key);
+      mix(Math.round((total > 0 ? colour.weight / total : 0) * 1e7));
+    }
+  }
+  return h.toString(36);
 }
 
 /** The strip's cuts forgotten (laid out again from the target) — the pinned pieces kept. */
@@ -467,6 +493,10 @@ interface LoadedModel {
 export default function App() {
   const [lang, setLangState] = useState<Lang>(() => loadStoredLang());
   const t = useCallback((key: Key, params?: Params) => translate(lang, key, params), [lang]);
+  useEffect(() => {
+    document.title = translate(lang, "app.docTitle");
+    document.documentElement.lang = lang;
+  }, [lang]);
   const setLang = useCallback((next: Lang) => {
     setLangState(next);
     storeLang(next);
@@ -1059,10 +1089,28 @@ export default function App() {
   const storedStrip = settings.stripByModel[stripKey];
   // Pieces split off as groups of their own: their colours sit at the end of their family.
   const pins = useMemo(() => pinMap(storedStrip?.pins), [storedStrip?.pins]);
-  const stripData = useMemo(() => (model ? buildColourStrip(model.triangleColors, areaWeightList, pins) : null), [model, areaWeightList, pins]);
+  /** The last strip worked out ahead for new colours (keepGroupsFor), so the render does not build it again. */
+  const stripAheadRef = useRef<{ colours: RGB[]; weights: typeof areaWeightList; pins: typeof pins; strip: ColourStripData } | null>(null);
+  const stripFor = (colours: RGB[]): ColourStripData => {
+    const ahead = stripAheadRef.current;
+    if (ahead && ahead.colours === colours && ahead.weights === areaWeightList && ahead.pins === pins) return ahead.strip;
+    const strip = buildColourStrip(colours, areaWeightList, pins);
+    stripAheadRef.current = { colours, weights: areaWeightList, pins, strip };
+    return strip;
+  };
+  const stripData = useMemo(
+    () => (model ? stripFor(model.triangleColors) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [model, areaWeightList, pins],
+  );
   const committedCuts = useMemo<StripCuts>(() => {
     if (!stripData) return {};
-    if (storedStrip && storedStrip.target === targetGroups) return storedStrip.cuts as unknown as StripCuts;
+    if (storedStrip && storedStrip.target === targetGroups) {
+      // Cuts kept for edited colours (a fill, a stroke) fit only those: with other colours — the
+      // file opened afresh, without its work — the cuts from before the edits stand.
+      if (!storedStrip.for || storedStrip.for === stripPrint(stripData)) return storedStrip.cuts as unknown as StripCuts;
+      if (storedStrip.base && storedStrip.base.target === targetGroups) return storedStrip.base.cuts as unknown as StripCuts;
+    }
     return initialCuts(stripData, targetGroups);
   }, [stripData, storedStrip, targetGroups]);
   /** Cuts being dragged right now; null while the strip is at rest. */
@@ -1090,6 +1138,34 @@ export default function App() {
     return { palette: built.palette, labels: faceLabels };
   }, [model, stripData, committedGroups]);
   const areaByPosition = useMemo(() => areaFractionByPosition(labels, palette.length, areaWeights), [labels, palette.length, areaWeights]);
+
+  /**
+   * New face colours that move faces from one group to another (a fill, a
+   * stroke, a gap clean, a tidy of picked patches) keep every colour in the
+   * group it is in.  The spectrum's cuts are shares of each family's area: left
+   * as they were, they fall on other colours once the areas change, and groups
+   * shift — patches turning up out of nowhere, a group's colour (and the
+   * "change to" colour) changing.  `also` names the group of a colour that is
+   * new (a palette colour given a new value).  ⌘Z puts the cuts back with the colours.
+   */
+  function keepGroupsFor(before: RGB[], next: RGB[], also?: Map<number, string>, pinned?: { pins: number[][] | undefined; from: Record<string, number> | undefined }): void {
+    if (!stripData || !model || model.triangleColors !== before || before === next) return;
+    const groupOfKey = new Map<number, string>();
+    for (const group of committedGroups) for (const colour of group.colours) groupOfKey.set(colour.key, `${group.family}:${group.index}`);
+    // A colour already in a group stays there (a colour given another group's value joins that group).
+    if (also) for (const [key, name] of also) if (!groupOfKey.has(key)) groupOfKey.set(key, name);
+    const pinsNext = pinned ? pinned.pins : storedStrip?.pins;
+    const strip = pinned ? buildColourStrip(next, areaWeightList, pinMap(pinned.pins)) : stripFor(next);
+    const stored = stripStore(targetGroups, cutsKeepingGroups(strip, groupOfKey), livePins(pinsNext, strip), pinned ? pinned.from : storedStrip?.from);
+    // These cuts fit these colours only; the ones from before the first such edit go along (see committedCuts).
+    const previous = settings.stripByModel[stripKey];
+    const base = previous?.for ? previous.base : previous ? { target: previous.target, cuts: previous.cuts } : undefined;
+    stored.for = stripPrint(strip);
+    if (base) stored.base = base;
+    cutsWithColours.current.set(before, previous ?? null);
+    cutsWithColours.current.set(next, stored);
+    setSettings((prev) => ({ ...prev, stripByModel: { ...prev.stripByModel, [stripKey]: stored } }));
+  }
   const areaByIndex = useMemo(() => {
     const map = new Map<number, number>();
     palette.forEach((entry, position) => map.set(entry.index, areaByPosition[position] ?? 0));
@@ -1489,6 +1565,21 @@ export default function App() {
   // ------------------------------------------------------------------
   const hexByPosition = useMemo(() => palette.map((entry) => rgbToHex(entry.rgb)), [palette]);
   const positionByHex = useMemo(() => new Map(hexByPosition.map((hex, position) => [hex, position])), [hexByPosition]);
+  // The "change to" colour follows its group when the group's colour changes
+  // (a band recoloured, a tidy): its colour is still in the model, only the group's name moved.
+  useEffect(() => {
+    if (!pickTarget || pickTarget === "__new__" || positionByHex.has(pickTarget)) return;
+    const key = stripColourKey(hexToRgb(pickTarget));
+    const group = committedGroups.find((g) => g.colours.length > 0 && g.colours.some((colour) => colour.key === key));
+    if (group) {
+      setPickTarget(rgbToHex(group.rep));
+      return;
+    }
+    // Its colour is gone from the model (the group recoloured): the group's new colour, if known; else let go.
+    const twin = [...(hexTwinsRef.current.get(pickTarget) ?? [])].find((hex) => positionByHex.has(hex));
+    setPickTarget(twin ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [positionByHex]);
   /** The colour the brush and the fill tool put down (the "change to" colour of the pick bar too). */
   const brushHex = useMemo(() => {
     const target = pickTarget || "__new__";
@@ -1632,7 +1723,22 @@ export default function App() {
   const [hoverPatch, setHoverPatch] = useState<{ id: number; face: number } | null>(null);
   const hoverFaceRef = useRef<number | null>(null);
   const hoverPatchTimer = useRef<number | null>(null);
-  function hoverFace(face: number | null): void {
+  /**
+   * The face that stands for what the pointer is on.  On a piece of the smooth
+   * borders' preview whose group is not its face's (the face is cut, not yet
+   * confirmed), a face of the piece's group beside it — so a hover or a click
+   * takes the patch the piece shows as part of, not the colour under it.
+   */
+  function faceShownAt(face: number, piece: number | undefined): number {
+    const group = piece !== undefined ? viewerCut?.group?.[piece] : undefined;
+    const current = modelRef.current;
+    if (group === undefined || group < 0 || !current) return face;
+    const { offsets, neighbours } = adjacencyFor(current);
+    return faceOfGroupNear(offsets, neighbours, labels, face, group);
+  }
+
+  function hoverFace(face: number | null, piece?: number): void {
+    if (face !== null && piece !== undefined) face = faceShownAt(face, piece);
     hoverFaceRef.current = face;
     if (hoverPatchTimer.current !== null) {
       window.clearTimeout(hoverPatchTimer.current);
@@ -1845,13 +1951,41 @@ export default function App() {
   // normals alike — so it sits on the model exactly as the model is shown.
   /** Outline geometry per colour set, valid until the faces or their labels change. */
   /** The cut the result view shows now (worked out for exactly these groups): outlines follow its line too. */
-  const outlineCut = useMemo(
-    () =>
-      model && cutLayer && cutSpan > 0 && !dragColours && cutLayer.triangles === model.triangles && cutLayer.paletteKey === paletteKey && cutLayer.labels === labels
-        ? cutLayer.cut
-        : null,
-    [model, cutLayer, cutSpan, dragColours, paletteKey, labels],
-  );
+  /**
+   * The cut as the views show it now, its groups in today's palette.  Right
+   * after a recolour the new cut is still being worked out (seconds on a big
+   * model): the last one stands in, by colour, on every face whose group is
+   * as it was then — a face's pieces all or none (no hole where one piece's
+   * colour has gone).  The pieces drawn and the outlines both come from here,
+   * so an outline never steps along triangles beside smooth pieces.
+   */
+  const cutNow = useMemo<{ cut: HighlightCut; group: Int32Array } | null>(() => {
+    if (!model || !cutLayer || cutSpan <= 0 || dragColours || cutLayer.triangles !== model.triangles) return null;
+    const { cut, labels: then, paletteHex: thenHex } = cutLayer;
+    if (cutLayer.paletteKey === paletteKey && cutLayer.labels === labels) return { cut, group: cut.pieceGroups };
+    // A group of the cut, found in the palette as it is now by its colour (-1: gone).
+    const nowOf = cutLayer.paletteKey === paletteKey ? null : new Map(hexByPosition.map((hex, position) => [hex, position]));
+    const toNow = (position: number) => (nowOf ? (nowOf.get(thenHex[position]) ?? -1) : position);
+    const faceOk = new Map<number, boolean>();
+    for (let p = 0; p < cut.pieceGroups.length; p++) {
+      const f = cut.pieceFaces[p];
+      const ok = toNow(then[f]) === labels[f] && toNow(cut.pieceGroups[p]) >= 0;
+      faceOk.set(f, (faceOk.get(f) ?? true) && ok);
+    }
+    const kept: number[] = [];
+    for (let p = 0; p < cut.pieceGroups.length; p++) if (faceOk.get(cut.pieceFaces[p])) kept.push(p);
+    const pieces = new Int32Array(kept.length * 3);
+    const pieceGroups = new Int32Array(kept.length);
+    const pieceFaces = new Int32Array(kept.length);
+    kept.forEach((p, i) => {
+      pieces.set(cut.pieces.subarray(p * 3, p * 3 + 3), i * 3);
+      pieceGroups[i] = toNow(cut.pieceGroups[p]);
+      pieceFaces[i] = cut.pieceFaces[p];
+    });
+    const replaced = Int32Array.from(cut.replaced.filter((f) => faceOk.get(f) === true));
+    return { cut: { addedVertices: cut.addedVertices, pieces, pieceGroups, pieceFaces, replaced }, group: pieceGroups };
+  }, [model, cutLayer, cutSpan, dragColours, paletteKey, hexByPosition, labels]);
+  const outlineCut = cutNow?.cut ?? null;
   const overlayShapes = useMemo(
     () => new Map<string, Pick<HighlightOverlay, "fill" | "fillNormals" | "edges" | "edgeNormals" | "edgeInside">>(),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2710,6 +2844,8 @@ export default function App() {
 
   async function handlePick(faceIndex: number | null, info: PickInfo = { double: false, toggle: false }): Promise<void> {
     if (!model) return;
+    // A click on a preview piece means the colour it shows (see faceShownAt): picking, the fill tool and the eyedropper alike.
+    if (faceIndex !== null && info.piece !== undefined) faceIndex = faceShownAt(faceIndex, info.piece);
     if (info.alt || eyedropperRef.current) {
       sampleFace(faceIndex);
       return;
@@ -2757,8 +2893,8 @@ export default function App() {
         if (row) setMixRowIndex(row.paletteIndex);
       }
       // The chosen colour stays for the next pick (and for the brush and the
-      // fill tool, which share it), unless it is the colour just picked.
-      if (pickTarget === patch.hex) setPickTarget("");
+      // fill tool, which share it) — even when the patch just picked has it:
+      // filling is off then, and the next patch is filled with it again.
     } finally {
       setBusy(null);
     }
@@ -2781,14 +2917,35 @@ export default function App() {
     }
     // Carry the merge flags of the old colour over to the new hex.
     setSettings((prev) => ({ ...prev, mergeFlags: carryFlags(prev.mergeFlags, oldHex, target) }));
+    const group = committedGroups.find((g) => g.colours.length > 0 && rgbToHex(g.rep) === oldHex);
+    const newKey = stripColourKey(rgb);
+    let pinned: { pins: number[][] | undefined; from: Record<string, number> | undefined } | undefined;
+    if (group) {
+      const own = new Set(group.colours.map((colour) => colour.key));
+      const pins = storedStrip?.pins;
+      const at = pins ? pins.findIndex((keys) => keys.some((key) => own.has(key))) : -1;
+      // A pinned piece given a new colour stays a piece of its own (and goes back where it came from);
+      // pieces split off from this group now came from its new colour.
+      const fromWas = storedStrip?.from;
+      const cameFrom = at >= 0 && pins ? pins[at].map((key) => fromWas?.[key]).find((was) => was !== undefined) : undefined;
+      const from = fromMoved(fromWas, (key) => (own.has(key) ? newKey : undefined));
+      if (at >= 0 && pins) {
+        const kept = { ...(from ?? {}) };
+        if (cameFrom !== undefined) kept[newKey] = cameFrom;
+        pinned = { pins: pins.map((keys, i) => (i === at ? [newKey] : keys)), from: kept };
+      } else if (from) pinned = { pins, from };
+    }
+    keepGroupsFor(model.triangleColors, next, group ? new Map([[newKey, `${group.family}:${group.index}`]]) : undefined, pinned);
     applyColours(model, next);
     setStatus(t("status.paletteRecoloured", { from: oldHex, to: target, n: n.toLocaleString() }));
   }
 
   /** A palette colour exactly as the model has it, or a new colour. */
   function fillRgb(current: MeshModel, targetHex: string): RGB {
+    // The group's own colour (the shade with the most area, as the palette shows it): filling with it
+    // keeps it the most, so the group's colour — and the "change to" colour — stay as they are.
     const position = positionByHex.get(targetHex);
-    return position !== undefined ? representativeColoursByPosition(current.triangleColors, labels, palette)[position] : hexToRgb(targetHex);
+    return position !== undefined && palette[position] ? palette[position].rgb : hexToRgb(targetHex);
   }
 
   function applyPickColour(): void {
@@ -2802,6 +2959,7 @@ export default function App() {
       for (let i = 0; i < patch.faces.length; i++) next[patch.faces[i]] = rgb;
       count += patch.faces.length;
     }
+    keepGroupsFor(model.triangleColors, next);
     applyColours(model, next);
     setStatus(t("status.recoloured", { n: count.toLocaleString(), hex: targetHex, patches: pickedPatches.length }));
   }
@@ -2924,6 +3082,7 @@ export default function App() {
       if (scope === "part") regrabRef.current = pickedPatches.map((patch) => patch.anchor);
       // Melted colours may be gone: the spectrum lets go of them.
       if (scope === "picked") setSelectedHexes([]);
+      keepGroupsFor(model.triangleColors, result.colours);
       applyColours(model, result.colours, { keepSelection: scope === "part" });
       const done = t(scope === "part" ? "gap.donePart" : scope === "picked" ? "gap.donePicked" : "gap.doneAll", { n: result.changed.length.toLocaleString(), detail });
       setStatus((result.left > 0 ? `${done} ${t("gap.leftPicked", { n: result.left.toLocaleString() })}` : done) + kept);
@@ -3037,6 +3196,7 @@ export default function App() {
       setStatus(t("status.fillSame", { hex: brushHex }));
       return;
     }
+    keepGroupsFor(model.triangleColors, next);
     applyColours(model, next, { keepSelection: !inSelection });
     setStatus(
       inSelection
@@ -3306,7 +3466,8 @@ export default function App() {
       setStatus(loaded.status);
       countAction(`load/${kind}`);
     } catch (err) {
-      setStatus(t("status.error", { message: err instanceof Error ? err.message : String(err) }));
+      const message = err instanceof Error ? err.message : String(err);
+      setStatus(t("status.error", { message: message === RODIN_TEXTURE_MODE_MESSAGE ? t("load.rodinTextureMode") : message }));
     } finally {
       setBusy(null);
     }
@@ -3503,6 +3664,9 @@ export default function App() {
     atlasRef.current = null;
     faceGeometryRef.current = null;
     strokeRef.current = null;
+    stripAheadRef.current = null;
+    dragBuffers.current = [];
+    tidyStableShotsRef.current = null;
     setAtlas(null);
     originalColoursRef.current = null;
     lastSavedColoursRef.current = null;
@@ -3695,6 +3859,7 @@ export default function App() {
       setStatus(t("status.brushNothing"));
       return;
     }
+    keepGroupsFor(current.triangleColors, stroke.working);
     applyColours(current, stroke.working, { keepSelection: true });
     setStatus(t("status.brushed", { n: stroke.count.toLocaleString(), hex: stroke.hex }));
   }
@@ -4083,13 +4248,15 @@ export default function App() {
         geometry: { triangles: model.triangles, vertices: model.vertices },
       });
       const representatives = representativeColoursByPosition(model.triangleColors, labels, palette);
-      const groupColour = heads.map((head) => representatives[head]);
+      // A tidy of picked patches paints with the groups' own colours (as the palette shows them), so the groups keep them.
+      const groupColour = heads.map((head) => (options?.limitTo ? palette[head].rgb : representatives[head]));
       const next: RGB[] = new Array(result.groups.length);
       for (let i = 0; i < result.groups.length; i++) next[i] = groupColour[result.groups[i]];
       if (options?.limitTo) {
         // A face changed when the tidy moved it to another group; everything else keeps its colour.
         const keep = limitTidyToPicked(adjacency, options.limitTo, (f) => result.groups[f] !== labelToGroup[labels[f]]);
         const limited = model.triangleColors.map((colour, f) => (keep[f] ? next[f] : colour));
+        keepGroupsFor(model.triangleColors, limited);
         applyColours(model, limited, { keepSelection: true });
         return limited;
       }
@@ -4375,8 +4542,8 @@ export default function App() {
     const context = buildTidyContext();
     if (!context) return null;
     // On picked patches the values are baked whatever the model's are: show them, not a difference.
-    if (tidyArea === "picked") return pickedValueLines(pickedOnly(presetChanges(id, context, "clean")));
-    return describeChanges(presetChanges(id, context, tidyScope), context);
+    if (tidyArea === "picked") return pickedValueLines(pickedOnly(presetChanges(id, context, "clean")), t);
+    return describeChanges(presetChanges(id, context, tidyScope), context, t);
   }
 
   /**
@@ -4392,7 +4559,7 @@ export default function App() {
     const changes = pickedOnly(presetChanges(id, context, "clean"));
     // Lines are the values that differ from the model's; the bake runs even when
     // none do, since the patch itself may not be tidy yet.
-    const lines = describeChanges(changes, context);
+    const lines = describeChanges(changes, context, t);
     const title = t("tidy.presetLogPicked", { name: t(`tidy.preset.${id}` as Key) });
     const entryId = `t${Date.now()}`;
     const clean = cleanSettingsAfter(settings.merge, settings.mergeFlags, changes);
@@ -4432,7 +4599,7 @@ export default function App() {
     if (!context || busy !== null) return;
     if (id === "line") setCutNotice(cutSpan > 0 ? "on" : "off");
     const changes = presetChanges(id, context, tidyScope);
-    const lines = describeChanges(changes, context);
+    const lines = describeChanges(changes, context, t);
     const name = t(`tidy.preset.${id}` as Key);
     const title = t("tidy.presetLog", { name, scope: t(tidyScope === "clean" ? "tidy.scopeClean" : tidyScope === "mix" ? "tidy.scopeMix" : "tidy.scopeBoth") });
     const entry: TidyLogEntry = {
@@ -4463,8 +4630,8 @@ export default function App() {
     const context = buildTidyContext();
     if (!entry?.changes || !context || busy !== null) return;
     // The values as shown, re-checked against the palette as it is now.
-    const { changes, dropped } = sanitizeChanges(entry.changes, context, entry.scope);
-    const lines = describeChanges(changes, context);
+    const { changes, dropped } = sanitizeChanges(entry.changes, context, entry.scope, t);
+    const lines = describeChanges(changes, context, t);
     setTidyLog((prev) => prev.map((e) => (e.id === entryId ? { ...e, status: lines.length > 0 ? "applied" : "none", lines } : e)));
     applyTidy(changes, entryId, t("tidy.bySuggestion"), lines, dropped);
   }
@@ -4507,8 +4674,8 @@ export default function App() {
       const raw = answer.result;
       // The state may have moved while Claude was thinking: check against it as it is now.
       const now = buildTidyContext() ?? context;
-      const { changes, dropped } = sanitizeChanges(raw.changes, now, scope);
-      const lines = describeChanges(changes, now);
+      const { changes, dropped } = sanitizeChanges(raw.changes, now, scope, t);
+      const lines = describeChanges(changes, now, t);
       const asked = raw.asked_to_change === true && !analyse;
       const observations = Array.isArray(raw.observations) ? raw.observations.map(String).filter(Boolean).slice(0, 6) : [];
       const entry: TidyLogEntry = {
@@ -4939,6 +5106,7 @@ export default function App() {
         splitObjects: e.splitObjects,
         // PrusaSlicer's XL profiles and the template's config mean nothing to other slicers.
         printPreset: prusa ? e.printPreset : null,
+        printPresetSupportWord: t("exp.supportPresetSuffix"),
         includePrinterConfig: prusa && e.includePrinterConfig && templateFitsPrinter(printer, template?.info.printerModel),
         effectiveRgbByPaletteIndex: effectiveByIndex,
       });
@@ -5005,12 +5173,9 @@ export default function App() {
       const paletteRgb = palette.map((entry) => entry.rgb);
       const result = applyNomadObjToModel(model, parsed, paletteRgb, file.name);
       if (result.mode === "colours-only" && model) {
-        const representatives = representativeColoursByPosition(model.triangleColors, labels, palette);
-        const positionByKey = new Map(paletteRgb.map((rgb, position) => [colourKey(rgb), position]));
-        const next = result.model.triangleColors.map((rgb) => {
-          const position = positionByKey.get(colourKey(rgb));
-          return position === undefined ? rgb : representatives[position];
-        });
+        // Colours snapped to the palette come in as the palette's own colours (each group keeps its colour).
+        const next = result.model.triangleColors;
+        keepGroupsFor(model.triangleColors, next);
         applyColours(model, next);
       } else {
         installModel(
@@ -5025,8 +5190,20 @@ export default function App() {
         off: result.snap.offPaletteVertexCount.toLocaleString(),
         max: result.snap.maxDeltaE.toFixed(1),
       });
-      setNomadReport({ message, warnings: result.warnings });
-      setStatus(result.warnings[0] ? `${message} · ${result.warnings[0]}` : message);
+      // The core's warnings are English: say the ones it names in the UI's language.
+      const before = model ? { vertices: model.vertices.length, faces: model.triangles.length } : null;
+      const remeshed = before ? nomadRemeshWarning(before, { vertices: parsed.vertices.length, faces: parsed.triangles.length }) : null;
+      const warnings = result.warnings.map((warning) =>
+        warning === NOMAD_OFF_PALETTE_WARNING
+          ? t("nomad.warnOffPalette")
+          : warning === NOMAD_NEW_MODEL_WARNING
+            ? t("nomad.warnNewModel")
+            : before && warning === remeshed
+              ? t("nomad.warnRemeshed", { a: before.vertices, b: before.faces, c: parsed.vertices.length, d: parsed.triangles.length })
+              : warning,
+      );
+      setNomadReport({ message, warnings });
+      setStatus(warnings[0] ? `${message} · ${warnings[0]}` : message);
     } catch (err) {
       setNomadReport({ message: t("status.error", { message: err instanceof Error ? err.message : String(err) }), warnings: [] });
       setStatus(t("status.error", { message: err instanceof Error ? err.message : String(err) }));
@@ -5274,24 +5451,15 @@ export default function App() {
    * moment later), so the line does not flicker back to the faces.
    */
   const viewerCut = useMemo<ViewerCut | null>(() => {
-    if (!model || !cutLayer || cutSpan <= 0 || dragColours || resultMode === "source") return null;
-    if (cutLayer.triangles !== model.triangles) return null;
-    const { cut, labels: then, paletteHex: thenHex } = cutLayer;
-    // A group of the cut, found in the palette as it is now by its colour (-1: gone).
-    const samePalette = cutLayer.paletteKey === paletteKey;
-    const nowOf = samePalette ? null : new Map(hexByPosition.map((hex, position) => [hex, position]));
-    const toNow = (position: number) => (nowOf ? (nowOf.get(thenHex[position]) ?? -1) : position);
+    if (!model || !cutNow || resultMode === "source") return null;
+    const { cut, group: pieceGroup } = cutNow;
     const vertexCount = model.vertices.length;
     const kept: number[] = [];
     const keptGroup: number[] = [];
-    for (let p = 0; p < cut.pieceGroups.length; p++) {
-      const f = cut.pieceFaces[p];
-      // Only where the face's group is as it was when cut (by colour); the rest waits for the new cut.
-      if (toNow(then[f]) !== labels[f]) continue;
-      const group = toNow(cut.pieceGroups[p]);
-      if (group < 0 || !palette[group]) continue;
+    for (let p = 0; p < pieceGroup.length; p++) {
+      if (!palette[pieceGroup[p]]) continue;
       kept.push(p);
-      keptGroup.push(group);
+      keptGroup.push(pieceGroup[p]);
     }
     const linearOf = new Map<number, [number, number, number]>();
     const colourOf = (position: number) => {
@@ -5331,8 +5499,8 @@ export default function App() {
       }
       parentFace[i] = cut.pieceFaces[p];
     });
-    return { positions: toViewSpace(points), colours, parentFace, corners };
-  }, [model, cutLayer, cutSpan, dragColours, resultMode, palette, paletteKey, hexByPosition, labels, effectiveByIndex, toViewSpace]);
+    return { positions: toViewSpace(points), colours, parentFace, corners, group: Int32Array.from(keptGroup) };
+  }, [model, cutNow, resultMode, palette, effectiveByIndex, toViewSpace]);
   const paneCount = (showSource ? 1 : 0) + (showResult ? 1 : 0) + (showMap ? 1 : 0);
   // A chip about the 3D view keeps off the colour map (the last column).
   const chipStyle: CSSProperties | undefined = showMap && paneCount > 1 ? { right: `calc(${100 / paneCount}% + 12px)` } : undefined;
@@ -5437,7 +5605,13 @@ export default function App() {
             {(close) => (
               <>
                 <div className="menu-label">{t("top.settings")}</div>
-                <button type="button" className="menu-item" onClick={() => { setLang(lang === "ko" ? "en" : "ko"); close(); }}>
+                <button type="button" className="menu-item" onClick={() => {
+                    const next = lang === "ko" ? "en" : "ko";
+                    setLang(next);
+                    // What the status line said is in the old language: say what just happened in the new one.
+                    setStatus(translate(next, "status.langChanged"));
+                    close();
+                  }}>
                   <span>{t("app.language")}</span>
                   <span className="menu-key">{lang === "ko" ? "KO" : "EN"}</span>
                 </button>

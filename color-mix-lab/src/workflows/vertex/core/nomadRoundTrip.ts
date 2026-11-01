@@ -17,9 +17,16 @@ import { majorityVertexLabels } from "./meshAdjacency";
 
 export const NOMAD_OFF_PALETTE_DELTA_E = 8;
 export const NOMAD_OFF_PALETTE_WARN_FRACTION = 0.01;
+// Messages stay English here; an app with its own languages tells them apart
+// by these constants and says them in its own words.
 export const NOMAD_OFF_PALETTE_WARNING =
-  "Colours outside the palette were painted. In Nomad, pick existing model colours with the eyedropper only. " +
-  "/ 팔레트에 없는 색이 칠해져 있습니다. 노마드에서 스포이트로 기존 색만 쓰세요.";
+  "Colours outside the palette were painted. In Nomad, pick existing model colours with the eyedropper only.";
+export const NOMAD_NEW_MODEL_WARNING = "No model was loaded; the Nomad OBJ was loaded as a new model.";
+
+/** The warning when the Nomad OBJ's counts differ from the model's (remeshed): the geometry is replaced. */
+export function nomadRemeshWarning(before: { vertices: number; faces: number }, after: { vertices: number; faces: number }): string {
+  return `Vertex/face counts differ from the loaded model (${before.vertices}/${before.faces} vs ${after.vertices}/${after.faces}); the Nomad geometry replaced the model.`;
+}
 
 export const NOMAD_USAGE_RULES: string[] = [
   "Do not create new colours: pick the model's existing colours with the eyedropper and paint with those.",
@@ -377,8 +384,11 @@ export function applyNomadObjToModel(
   if (!sameTopology) {
     warnings.push(
       current
-        ? `Vertex/face counts differ from the loaded model (${current.vertices.length}/${current.triangles.length} vs ${parsed.vertices.length}/${parsed.triangles.length}); the Nomad geometry replaced the model. / 노마드에서 리메쉬된 것 같습니다. 전체를 다시 불러왔습니다.`
-        : "No model was loaded; the Nomad OBJ was loaded as a new model.",
+        ? nomadRemeshWarning(
+            { vertices: current.vertices.length, faces: current.triangles.length },
+            { vertices: parsed.vertices.length, faces: parsed.triangles.length },
+          )
+        : NOMAD_NEW_MODEL_WARNING,
     );
   }
 

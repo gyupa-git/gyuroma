@@ -255,7 +255,7 @@ export function GatherDialog({ open, onClose }: { open: boolean; onClose: () => 
   const reading = entries.some((entry) => !entry.source && !entry.error);
   const unknownPrinter = Boolean(plan?.warnings.some((warning) => warning.key === "bambuPrinter"));
   const canWrite = Boolean(plan && plan.used.length >= 2 && !plan.tooMany && !unknownPrinter && !reading && writing === null);
-  const defaultName = plan && plan.used.length > 0 ? `모아뽑기_${plan.used.length}개.3mf` : "모아뽑기.3mf";
+  const defaultName = plan && plan.used.length > 0 ? t("gather.defaultName", { n: plan.used.length }) : t("gather.defaultNameNone");
 
   const move = (id: number, by: number) =>
     setEntries((prev) => {

@@ -95,6 +95,12 @@ export interface Export3mfOptions {
    */
   printPreset?: PrintPresetId | null;
   /**
+   * The word after the template's own preset name in the renamed print
+   * preset ("0.20mm SPEED (… support)"); PrusaSlicer shows it, so an app says
+   * it in its UI's language.  Default "support".
+   */
+  printPresetSupportWord?: string;
+  /**
    * Write each connected shell as its own 3MF object so that pieces can be
    * laid down separately in PrusaSlicer.  Splitting inside PrusaSlicer would
    * delete the multi-material painting, so the split has to happen here.
@@ -1488,7 +1494,7 @@ export async function buildPrusa3mfBlob(
       preset
         ? applyPrintPresetToConfig(withSlots, preset).replace(
             /^; print_settings_id = (.*)$/m,
-            (_line, name: string) => `; print_settings_id = ${preset.source} (${name.trim()} 서포트)`,
+            (_line, name: string) => `; print_settings_id = ${preset.source} (${name.trim()} ${options.printPresetSupportWord ?? "support"})`,
           )
         : withSlots,
     );

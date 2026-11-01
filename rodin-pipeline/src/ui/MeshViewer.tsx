@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { RGB } from "@core/types";
 import type { ViewName } from "../engine/types";
+import { pieceAt } from "../engine/cutPick";
 import { srgbToLinear } from "../engine/mesh";
 import { backgroundStyle, DEFAULT_BACKGROUND, type ViewBackground } from "./background";
 
@@ -15,6 +16,8 @@ export interface PickInfo {
   source?: "3d" | "map";
   /** Alt held or eyedropper mode: sample the colour under the cursor instead of picking. */
   alt?: boolean;
+  /** The cut piece clicked (an index into the view's `cut`), when the face is shown cut. */
+  piece?: number;
 }
 
 export interface HighlightOverlay {
@@ -49,6 +52,8 @@ export interface ViewerHit {
   faceIndex: number;
   point: [number, number, number];
   normal: [number, number, number];
+  /** The cut piece under the pointer (an index into the view's `cut`), when the face is shown cut. */
+  piece?: number;
 }
 
 export interface BrushCursor {
@@ -112,9 +117,9 @@ export interface MeshViewerProps {
   /**
    * The face under the pointer while it is not painting (null when it leaves
    * the model or starts a drag), so the patch a click would take can be shown
-   * before clicking.
+   * before clicking; with the cut piece under it when the face is shown cut.
    */
-  onHoverFace?: (faceIndex: number | null) => void;
+  onHoverFace?: (faceIndex: number | null, piece?: number) => void;
   onBrushHover?: (hit: ViewerHit | null) => void;
   onBrushStart?: (hit: ViewerHit | null) => void;
   onBrushDrag?: (hit: ViewerHit | null) => void;
@@ -157,6 +162,8 @@ export interface ViewerCut {
   colours: Float32Array;
   /** The face of the model each piece comes from; the pieces of one face are listed together. */
   parentFace: Int32Array;
+  /** The palette position each piece shows (what a click on it means). */
+  group?: Int32Array;
   /**
    * The vertex at each piece corner (3 per piece): a model vertex, or one the cut
    * added (numbered from the model's vertex count on).  With soft edges the
@@ -978,6 +985,8 @@ interface CutPieces {
   softened: Int32Array;
   /** The first piece of each hidden face and how many: [face, first, count] runs. */
   runs: Map<number, [number, number]>;
+  /** The pieces' corners (as the cut gave them), to tell which piece a pick lands on. */
+  positions: Float32Array;
 }
 
 /**
@@ -1147,7 +1156,7 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
   mesh.frustumCulled = false;
   mesh.visible = state.mesh.visible;
   state.scene.add(mesh);
-  state.cut = { mesh, hidden, runs, softened };
+  state.cut = { mesh, hidden, runs, softened, positions: cut.positions };
 }
 
 /** While faces are painted, their pieces step aside so the paint shows (the next colours bring a new cut). */
@@ -1486,7 +1495,12 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(new THREE.Vector2(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1), camera);
   const point = raycaster.ray.intersectTriangle(a, b, c, false, new THREE.Vector3()) ?? a.clone().add(b).add(c).multiplyScalar(1 / 3);
-  return { faceIndex: id, point: [point.x, point.y, point.z], normal: [normal.x, normal.y, normal.z] };
+  // A face shown cut: the piece the point is on (they lie in the face's plane).
+  // (Pieces stepped aside for paint are marked below zero: the face shows as it is.)
+  const run = cutShown ? state.cut?.runs.get(id) : undefined;
+  const pieceColours = state.cut ? ((state.cut.mesh.geometry.getAttribute("color") as THREE.BufferAttribute).array as Float32Array) : null;
+  const piece = run && state.cut && pieceColours && pieceColours[run[0] * 9] >= 0 ? pieceAt(state.cut.positions, run[0], run[1], [point.x, point.y, point.z]) : undefined;
+  return { faceIndex: id, point: [point.x, point.y, point.z], normal: [normal.x, normal.y, normal.z], piece };
 }
 
 function makeCursorLine(): THREE.LineLoop {
@@ -1736,10 +1750,12 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     // Outside the brush the pointer reports the face under it, at most once a
     // frame and only when it changes; a drag (rotating) reports null once.
     let hoverFace: number | null = null;
-    const reportHover = (face: number | null) => {
-      if (face === hoverFace) return;
+    let hoverPiece: number | undefined;
+    const reportHover = (face: number | null, piece?: number) => {
+      if (face === hoverFace && piece === hoverPiece) return;
       hoverFace = face;
-      callbacksRef.current.onHoverFace?.(face);
+      hoverPiece = piece;
+      callbacksRef.current.onHoverFace?.(face, piece);
     };
     const flushMove = () => {
       moveRaf = null;
@@ -1753,7 +1769,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       }
       const hit = gpuPick(state, move.x, move.y);
       if (!brushRef.current) {
-        reportHover(hit ? hit.faceIndex : null);
+        reportHover(hit ? hit.faceIndex : null, hit?.piece);
         return;
       }
       hoverFace = null;
@@ -1812,7 +1828,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       const now = performance.now();
       const double = face !== null && lastClick !== null && lastClick.face === face && now - lastClick.time < 400;
       lastClick = double ? null : { face, time: now };
-      handler(face, { double, toggle: event.shiftKey || event.ctrlKey || event.metaKey, alt: event.altKey || eyedropperRef.current, source: "3d" });
+      handler(face, { double, toggle: event.shiftKey || event.ctrlKey || event.metaKey, alt: event.altKey || eyedropperRef.current, source: "3d", piece: hit?.piece });
     };
     const onPointerLeave = () => {
       pendingMove = null;

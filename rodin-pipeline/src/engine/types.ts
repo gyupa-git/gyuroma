@@ -139,7 +139,15 @@ export interface PipelineSettings {
    * `from`: for each pinned colour key, the colour key it had before it was
    * split off — so the piece can go back to the group it came from.
    */
-  stripByModel: Record<string, { target: number; cuts: Record<string, number[]>; pins?: number[][]; from?: Record<string, number> }>;
+  /**
+   * The spectrum's cuts per model file.  `for`: the print of the face colours
+   * the cuts were kept for (a fill, a stroke): they fit only those; `base`: the
+   * cuts from before such edits, for the file opened afresh.
+   */
+  stripByModel: Record<
+    string,
+    { target: number; cuts: Record<string, number[]>; pins?: number[][]; from?: Record<string, number>; for?: string; base?: { target: number; cuts: Record<string, number[]> } }
+  >;
 }
 
 export const FILAMENT_PRESETS: Array<{ name: string; hex: string[]; label: string }> = [
