@@ -211,7 +211,7 @@ function welcomeTiming(tagline: string, about: string, written = false) {
  * already written in rainbow, standing still while `held`; then the snap,
  * the white and the burst play.
  */
-export function Welcome({ hint, still = false, written = false, held = false }: { hint?: string; still?: boolean; written?: boolean; held?: boolean }) {
+export function Welcome({ hint, still = false, written = false, held = false, action }: { hint?: string; still?: boolean; written?: boolean; held?: boolean; action?: ReactNode }) {
   const t = useT();
   const tagline = t("brand.tagline");
   const about = t("brand.about");
@@ -228,6 +228,11 @@ export function Welcome({ hint, still = false, written = false, held = false }: 
       {hint && (
         <div className="welcome-hint" style={{ "--rise": `${settle + 500}ms` } as CSSProperties}>
           {hint}
+        </div>
+      )}
+      {action && (
+        <div className="welcome-hint welcome-action" style={{ "--rise": `${settle + 700}ms` } as CSSProperties}>
+          {action}
         </div>
       )}
     </div>
@@ -397,6 +402,7 @@ export function Menu({
   title,
   triggerClassName = "icon-btn",
   label,
+  guide,
 }: {
   trigger: ReactNode;
   children: ReactNode | ((close: () => void) => ReactNode);
@@ -405,6 +411,8 @@ export function Menu({
   title?: string;
   triggerClassName?: string;
   label?: string;
+  /** Names it for the app guide to walk to (data-guide). */
+  guide?: string;
 }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -430,7 +438,7 @@ export function Menu({
   }, [open]);
   const close = () => setOpen(false);
   return (
-    <div className="menu-wrap" ref={wrapRef}>
+    <div className="menu-wrap" ref={wrapRef} data-guide={guide}>
       <button type="button" className={triggerClassName} aria-haspopup="menu" aria-expanded={open} aria-label={label} title={title} onClick={() => setOpen((v) => !v)}>
         {trigger}
       </button>

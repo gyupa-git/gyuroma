@@ -142,6 +142,8 @@ import { Brand, Glossary, Icon, Intro, Menu, Segmented, StepNav, Welcome, suppor
 import { ColourSelect } from "./ui/ColourSelect";
 import { ColourPicker } from "./ui/ColourPicker";
 import { GatherDialog } from "./ui/GatherDialog";
+import { GuideTour } from "./ui/GuideTour";
+import { GyupaFaceIcon } from "./ui/GuideGyupa";
 import { countAction } from "./engine/counter";
 import { LangContext, loadStoredLang, storeLang, translate, type Lang, type Params, type Key } from "./i18n";
 
@@ -831,6 +833,8 @@ export default function App() {
   });
   /** 모아 뽑기 is open (it keeps its files while closed). */
   const [gatherOpen, setGatherOpen] = useState(false);
+  /** The app guide: Gyupa walking the screen (ui/GuideTour, the lines in guide.ts). */
+  const [guideOpen, setGuideOpen] = useState(false);
   /** Which of the four steps is on screen (load · colours · filaments · export). */
   const [step, setStepState] = useState<number>(() => {
     try {
@@ -5643,7 +5647,23 @@ export default function App() {
     background,
     // The welcome card (already played by the intro) in the first pane, once the intro has gone (two cards at
     // once read as a double); a second pane (side by side) just says what comes there.
-    emptyLabel: slot === 0 ? (intro ? "" : <Welcome hint={t("view.empty")} still />) : t("view.empty"),
+    emptyLabel:
+      slot === 0
+        ? intro
+          ? ""
+          : (
+            <Welcome
+              hint={t("view.empty")}
+              still
+              action={
+                <button type="button" className="guide-welcome" onClick={() => setGuideOpen(true)}>
+                  <GyupaFaceIcon size={20} />
+                  {t("guide.welcome")}
+                </button>
+              }
+            />
+          )
+        : t("view.empty"),
     onPick: (face: number | null, info: PickInfo) => void handlePick(face, info),
     onHoverFace: hoverFace,
     onBrushHover: brushHover3D,
@@ -5864,7 +5884,7 @@ export default function App() {
         <StepNav steps={stepInfo} current={step} onChange={changeStep} />
         <div className="top-actions">
           {/* how many steps ⌘Z can still take back (colour changes and strip cuts), and ⇧⌘Z bring again */}
-          <button type="button" className="icon-btn with-count" aria-label={t("app.undo")} title={`${t("top.undo")} · ${t("top.stepsLeft", { n: history.length + stripUndo.length + meshUndoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || (history.length === 0 && stripUndo.length === 0 && meshUndoRef.current.length === 0)} onClick={undoAny}>
+          <button type="button" className="icon-btn with-count" data-guide="undo" aria-label={t("app.undo")} title={`${t("top.undo")} · ${t("top.stepsLeft", { n: history.length + stripUndo.length + meshUndoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || (history.length === 0 && stripUndo.length === 0 && meshUndoRef.current.length === 0)} onClick={undoAny}>
             <Icon name="undo" />
             {history.length + stripUndo.length + meshUndoRef.current.length > 0 && <span className="step-count mono">{history.length + stripUndo.length + meshUndoRef.current.length}</span>}
           </button>
@@ -5873,10 +5893,14 @@ export default function App() {
             {future.length > 0 && <span className="step-count mono">{future.length}</span>}
           </button>
           <span className="top-sep" aria-hidden="true" />
-          <Menu trigger={<Icon name="help" />} label={t("top.glossary")} title={t("top.glossary")} className="glossary">
+          <button type="button" className="guide-btn" data-guide="guide" title={t("guide.openHint")} onClick={() => setGuideOpen(true)}>
+            <GyupaFaceIcon size={18} />
+            <span>{t("guide.open")}</span>
+          </button>
+          <Menu trigger={<Icon name="help" />} label={t("top.glossary")} title={t("top.glossary")} className="glossary" guide="glossary">
             <Glossary />
           </Menu>
-          <Menu trigger={<Icon name="settings" />} label={t("top.settings")} title={t("top.settings")}>
+          <Menu trigger={<Icon name="settings" />} label={t("top.settings")} title={t("top.settings")} guide="settings">
             {(close) => (
               <>
                 <div className="menu-label">{t("top.settings")}</div>
@@ -6289,6 +6313,7 @@ export default function App() {
                 type="button"
                 className="icon-btn small"
                 aria-pressed={cutSpan > 0}
+                data-guide="cut"
                 aria-label={t("view.cut")}
                 title={`${t("view.cut")} — ${t(cutSpan > 0 ? "view.cutOnHint" : "view.cutOffHint")}`}
                 onClick={() => toggleCut(cutSpan <= 0)}
@@ -6935,6 +6960,7 @@ export default function App() {
         </button>
       </footer>
       <GatherDialog open={gatherOpen} onClose={() => setGatherOpen(false)} />
+      <GuideTour open={guideOpen} onClose={() => setGuideOpen(false)} step={step} onStep={changeStep} />
       {intro && <Intro onDone={endIntro} hold={startupLoading} />}
       {about && <Intro onDone={endAbout} about={{ note: `${t("app.subtitle")} · ${t("top.version", { v: APP_VERSION })} · ${t("license.short")}` }} />}
     </div>
