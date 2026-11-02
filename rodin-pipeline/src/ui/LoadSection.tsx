@@ -25,9 +25,14 @@ export interface SourceInfo {
 export interface WorkState {
   /** The model came back from the browser autosave on startup. */
   restored: boolean;
-  /** Undo steps available (0 = colours are the original file colours). */
+  /** Undo steps available. */
   undoSteps: number;
+  /** The colours differ from the loaded file's own. */
+  changed: boolean;
 }
+
+/** Where the autosave lives: files in the app's folder, or the browser (asked to keep it or not, or not known). */
+export type WorkStore = "folder" | "kept" | "notKept" | "browser";
 
 function Dropzone({
   accept,
@@ -89,6 +94,10 @@ export function LoadSection({
   onRememberWork,
   workState,
   onClearWork,
+  onSaveWork,
+  saveState,
+  onRevertOriginal,
+  workStore,
   onRecolour,
   onOpenGather,
 }: {
@@ -106,6 +115,11 @@ export function LoadSection({
   onRememberWork: (next: boolean) => void;
   workState: WorkState | null;
   onClearWork: () => void;
+  /** Saves the work as a file of the person's own (.gyuroma). */
+  onSaveWork: () => void;
+  saveState: "idle" | "saving" | "saved";
+  onRevertOriginal: () => void;
+  workStore: WorkStore;
   onRecolour: (hex: string, next: string) => void;
   /** Opens 모아 뽑기 (several finished files on one bed). */
   onOpenGather: () => void;
@@ -117,7 +131,7 @@ export function LoadSection({
     : t("load.noBed");
   return (
     <Section step={1} title={t("load.title")} subtitle={t("load.subtitle")} help={t("help.load")} badge={model ? t("load.faces", { n: model.stats.triangleCount.toLocaleString() }) : t("load.noModel")}>
-      <Dropzone accept=".3mf,.obj" title={t("load.dropTitle")} hint={t("load.dropHint")} disabled={busy} onFile={onModelFile} />
+      <Dropzone accept=".3mf,.obj,.gyuroma" title={t("load.dropTitle")} hint={t("load.dropHint")} disabled={busy} onFile={onModelFile} />
       <button type="button" className="text-link iris load-gather" onClick={onOpenGather}>
         {t("load.gather")}
       </button>
@@ -152,7 +166,11 @@ export function LoadSection({
                 <span>{t("load.work")}</span>
                 <b className="work-state">
                   {workState.restored ? `${t("load.workRestored")} · ` : ""}
-                  {workState.undoSteps > 0 ? t("load.workModified", { n: workState.undoSteps }) : t("load.workUnmodified")}
+                  {!workState.changed
+                    ? t("load.workUnmodified")
+                    : workState.undoSteps > 0
+                      ? t("load.workModified", { n: workState.undoSteps })
+                      : t("load.workModifiedNoUndo")}
                 </b>
               </>
             )}
@@ -171,6 +189,14 @@ export function LoadSection({
             </div>
           ))}
           <div className="inline" style={{ marginTop: 6 }}>
+            <button type="button" className="btn small primary save-work" disabled={busy || saveState === "saving"} title={t("load.saveWorkHint")} onClick={onSaveWork}>
+              {saveState === "saving" ? t("load.saving") : saveState === "saved" ? t("load.saved") : t("load.saveWork")}
+            </button>
+            {workState?.changed && (
+              <button type="button" className="btn small revert-original" disabled={busy} title={t("load.revertHint")} onClick={onRevertOriginal}>
+                {t("load.revert")}
+              </button>
+            )}
             <button type="button" className="btn small danger new-work" disabled={busy} onClick={onClearWork}>
               {t("load.newWork")}
             </button>
@@ -181,6 +207,11 @@ export function LoadSection({
         <input type="checkbox" checked={rememberWork} onChange={(e) => onRememberWork(e.target.checked)} />
         <span className="muted">{t("load.rememberWork")}</span>
       </label>
+      {rememberWork && (
+        <div className={`muted work-store${workStore === "notKept" ? " warn" : ""}`}>
+          {t(workStore === "folder" ? "load.storeFolder" : workStore === "kept" ? "load.storeKept" : workStore === "notKept" ? "load.storeNotKept" : "load.storeBrowser")}
+        </div>
+      )}
       <details className="template-block">
         <summary className={templateInfo ? "template-summary attached" : "template-summary muted"}>
           {templateInfo ? (

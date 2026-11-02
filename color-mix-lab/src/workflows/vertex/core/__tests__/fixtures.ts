@@ -81,6 +81,60 @@ export function foldedGrid(options: { lean?: number; jitter?: number; seed?: num
   return { vertices, triangles, cellOfFace, groups, nx, crease };
 }
 
+export interface PaintedGrid {
+  vertices: Vec3[];
+  triangles: Tri[];
+  /** Group 0 the ground, 1 the dots, 2 the band. */
+  groups: Int32Array;
+  /** The dots: centre x, y and radius each. */
+  dots: Array<[number, number, number]>;
+  /** The grid's own random numbers, going on from where it left off (to paint it over the same way each run). */
+  rand: () => number;
+}
+
+/**
+ * A bumpy grid painted as a model is: round dots (group 1) and a wavy band
+ * (group 2) on a ground (group 0), every border ragged — a face beside another
+ * group took that group now and then, as a brush leaves it.  The points are
+ * jittered and the grid bends up and down, so the surface turns under the borders.
+ */
+export function paintedGrid(seed: number): PaintedGrid {
+  const nx = 60;
+  const ny = 44;
+  const grid = gridMesh(nx, ny);
+  let state = seed * 7919;
+  const rand = () => (state = (state * 1103515245 + 12345) >>> 0) / 4294967296;
+  const vertices: Vec3[] = grid.vertices.map(([x, y]) => {
+    const jx = x + (rand() - 0.5) * 0.5;
+    const jy = y + (rand() - 0.5) * 0.5;
+    return [jx, jy, 3 * Math.sin(jx / 6) * Math.cos(jy / 8)];
+  });
+  const dots = Array.from({ length: 6 }, (): [number, number, number] => [5 + rand() * (nx - 10), 5 + rand() * (ny - 10), 1.5 + rand() * 2.5]);
+  const groupAt = (x: number, y: number) => {
+    for (const [cx, cy, r] of dots) if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) return 1;
+    return Math.abs(y - 22 - 4 * Math.sin(x / 7)) < 3 ? 2 : 0;
+  };
+  const clean = grid.triangles.map((t) => groupAt((grid.vertices[t[0]][0] + grid.vertices[t[1]][0] + grid.vertices[t[2]][0]) / 3, (grid.vertices[t[0]][1] + grid.vertices[t[1]][1] + grid.vertices[t[2]][1]) / 3));
+  const facesOfSide = new Map<string, number[]>();
+  grid.triangles.forEach((t, f) => {
+    for (let k = 0; k < 3; k++) {
+      const a = t[k], b = t[(k + 1) % 3];
+      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      facesOfSide.set(key, [...(facesOfSide.get(key) ?? []), f]);
+    }
+  });
+  const groups = Int32Array.from(clean);
+  grid.triangles.forEach((t, f) => {
+    const others: number[] = [];
+    for (let k = 0; k < 3; k++) {
+      const a = t[k], b = t[(k + 1) % 3];
+      for (const g of facesOfSide.get(a < b ? `${a},${b}` : `${b},${a}`) ?? []) if (clean[g] !== clean[f]) others.push(clean[g]);
+    }
+    if (others.length > 0 && rand() < 0.25) groups[f] = others[Math.floor(rand() * others.length)];
+  });
+  return { vertices, triangles: grid.triangles, groups, dots, rand };
+}
+
 export function makeSlots(hexes: string[]): PhysicalSlot[] {
   return hexes.map((hex, index) => {
     const rgb: RGB = [

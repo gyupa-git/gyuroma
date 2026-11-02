@@ -22,7 +22,10 @@ import type { Tri, Vec3 } from "./types";
  * Faces are left as they are (only cut through where a neighbour's cut points
  * lie on their edges, keeping their group) where the corners are measured
  * against different borders (where three groups meet), where a corner is out
- * of reach of the line, in a third colour, and in protected groups.
+ * of reach of the line, in a third colour, and in protected groups.  A vertex
+ * inside a part goes across the line only where the line swept over it (between
+ * the border and the line); and pieces that went to a group must join what was
+ * that group already — a run of them on its own (a crumb) goes back.
  *
  * The mesh passed in is untouched: the result lists the faces replaced and the
  * pieces replacing them, over the original vertices and the added ones.
@@ -51,6 +54,12 @@ const EMPTY: BorderCut = {
 /** Nearer the line than this (in edge lengths), a vertex counts as on it: no sliver is cut off beside it. */
 const SNAP = 0.12;
 
+/**
+ * A vertex inside a part goes across the line only within this many edge lengths
+ * of where the line swept (between the border and the line, as far as the line moved).
+ */
+const SWEPT = 0.5;
+
 export function cutAlongBorderLines(
   adjacency: FaceAdjacency,
   triangles: MeshFaces,
@@ -61,17 +70,22 @@ export function cutAlongBorderLines(
   const corners = flatCorners(triangles);
   const positions = flatPositions(vertices);
   const own = Int32Array.from(groups);
-  const trace = traceBorderLine(adjacency, corners, positions, own, options);
+  // A settled stretch the last cut left rough (teeth) is cut afresh: the preview shows it smooth.
+  const trace = traceBorderLine(adjacency, corners, positions, own, { ...options, reopenRough: true });
   if (!trace) return EMPTY;
   const { offsets, neighbours, faceCount } = adjacency;
   const vertexCount = positions.length / 3;
   const isProtected = (group: number) => options.protectedGroup[group] === 1;
-  const { edgeLength, maxMove, eLeft, eRight, eFace, eAcross, slotA, slotB, line, along, stays, borderFace } = trace;
+  const { edgeLength, maxMove, eu, ev, eLeft, eRight, eFace, eAcross, slotA, slotB, line, along, stays, opened, borderFace } = trace;
   const edgeCount = eLeft.length;
   // Settled borders (a border already when the mesh was last cut) are the line
-  // already: nothing is measured against them and nothing near them is cut again.
+  // already: the line stays on them and no cut starts from them — except a stretch
+  // still rough (teeth the last cut left, `opened`).  A vertex beside one is measured
+  // against the border as it is: on its own side (or on it, SNAP) nothing changes;
+  // only a face across it, a notch beside a smooth stretch, is cut.  Held back as a
+  // clash instead, such a notch stayed for good.
   const settled = options.settled;
-  const edgeSettled = (e: number) => !!settled && settled[eFace[e]] !== settled[eAcross[e]];
+  const edgeSettled = (e: number) => !!settled && settled[eFace[e]] !== settled[eAcross[e]] && !opened[slotA[e]] && !opened[slotB[e]];
 
   // The stretches of line, with the normals of the two faces of the border edge each came from, in a grid of cells.
   const nx = new Float64Array(edgeCount * 3);
@@ -111,6 +125,23 @@ export function cutAlongBorderLines(
       vertexNormal[v + 2] += z;
     }
   }
+  // Each vertex's group: that of all its faces, or MIXED on a border.
+  const MIXED = -1;
+  const homeOf = new Int32Array(vertexCount).fill(-2);
+  for (let f = 0; f < faceCount; f++)
+    for (let k = 0; k < 3; k++) {
+      const v = corners[f * 3 + k];
+      homeOf[v] = homeOf[v] === -2 || homeOf[v] === own[f] ? own[f] : MIXED;
+    }
+  // How far each stretch of line lies off its border edge (its further end).
+  const moved = new Float64Array(edgeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    const a = slotA[e] * 3, b = slotB[e] * 3, u = eu[e] * 3, w = ev[e] * 3;
+    moved[e] = Math.max(
+      Math.hypot(line[a] - positions[u], line[a + 1] - positions[u + 1], line[a + 2] - positions[u + 2]),
+      Math.hypot(line[b] - positions[w], line[b + 1] - positions[w + 1], line[b + 2] - positions[w + 2]),
+    );
+  }
   const reach = maxMove + edgeLength;
   const cell = Math.max(1e-9, reach);
   const keyOf = (ix: number, iy: number, iz: number) => (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
@@ -141,6 +172,15 @@ export function cutAlongBorderLines(
   const pairOf = new Map<number, number>();
   const distanceOf = new Map<number, number>();
   const tie = 0.05 * edgeLength;
+  /** How far the point lies from stretch e. */
+  const distanceTo = (e: number, px: number, py: number, pz: number) => {
+    const A = slotA[e] * 3;
+    const B = slotB[e] * 3;
+    const sx = line[B] - line[A], sy = line[B + 1] - line[A + 1], sz = line[B + 2] - line[A + 2];
+    const len2 = sx * sx + sy * sy + sz * sz;
+    const tt = len2 > 0 ? Math.max(0, Math.min(1, ((px - line[A]) * sx + (py - line[A + 1]) * sy + (pz - line[A + 2]) * sz) / len2)) : 0;
+    return Math.hypot(px - line[A] - sx * tt, py - line[A + 1] - sy * tt, pz - line[A + 2] - sz * tt);
+  };
   const measure = (v: number, f0: number, f1: number, f2: number): number => {
     const known = pairOf.get(v);
     if (known !== undefined) return known;
@@ -166,7 +206,6 @@ export function cutAlongBorderLines(
     let best = Infinity;
     let bestSide = 0;
     let bestPair = NONE;
-    let bestSettled = false;
     for (let dx = -1; dx <= 1; dx++)
       for (let dy = -1; dy <= 1; dy++)
         for (let dz = -1; dz <= 1; dz++) {
@@ -216,11 +255,13 @@ export function cutAlongBorderLines(
               best = d;
               bestSide = signed;
               bestPair = pair;
-              bestSettled = edgeSettled(e);
             } else {
-              if (edgeSettled(e)) bestSettled = true;
-              // As near as the best: they must agree, or the vertex is left alone.
-              if (pair !== bestPair || Math.sign(signed) !== Math.sign(bestSide)) bestPair = CLASH;
+              // As near as the best: they must agree, or the vertex is left alone — but a
+              // vertex on the line (within SNAP of both) is a point of it whichever side the
+              // stretches put it on by a hair, not a disagreement.  Held back as one, a
+              // tooth with a corner on the line stayed whole across it.
+              const onLine = Math.abs(signed) < SNAP * edgeLength && Math.abs(bestSide) < SNAP * edgeLength;
+              if (pair !== bestPair || (!onLine && Math.sign(signed) !== Math.sign(bestSide))) bestPair = CLASH;
               if (d < best) {
                 best = d;
                 if (bestPair !== CLASH) bestSide = signed;
@@ -228,7 +269,34 @@ export function cutAlongBorderLines(
             }
           }
         }
-    if (bestPair >= 0 && (bestSettled || isProtected(Math.floor(bestPair / 65536)) || isProtected(bestPair % 65536))) bestPair = CLASH;
+    // A vertex inside a part measured across the line from it: only where the line swept
+    // over it — between the border and the line, as far as a stretch of this border moved
+    // off it.  Further out (whole edges inside a part, off a line that hardly moved) the
+    // side turns on the line's ends and corners: it took points across by chance, crumbs.
+    if (bestPair >= 0 && Math.abs(bestSide) >= SNAP * edgeLength) {
+      const lower = Math.floor(bestPair / 65536);
+      const upper = bestPair % 65536;
+      const home = homeOf[v];
+      if ((home === lower || home === upper) && home !== (bestSide > 0 ? lower : upper)) {
+        let swept = false;
+        for (let dx = -1; dx <= 1 && !swept; dx++)
+          for (let dy = -1; dy <= 1 && !swept; dy++)
+            for (let dz = -1; dz <= 1 && !swept; dz++) {
+              const list = grid.get(keyOf(ix + dx, iy + dy, iz + dz));
+              if (!list) continue;
+              for (const e of list) {
+                if (eLeft[e] * 65536 + eRight[e] !== bestPair) continue;
+                if (nx[e * 3] * n0 + nx[e * 3 + 1] * n1 + nx[e * 3 + 2] * n2 < -THIN_WALL && na[e * 3] * n0 + na[e * 3 + 1] * n1 + na[e * 3 + 2] * n2 < -THIN_WALL) continue;
+                if (distanceTo(e, px, py, pz) <= moved[e] + SWEPT * edgeLength) {
+                  swept = true;
+                  break;
+                }
+              }
+            }
+        if (!swept) bestSide = -bestSide;
+      }
+    }
+    if (bestPair >= 0 && (isProtected(Math.floor(bestPair / 65536)) || isProtected(bestPair % 65536))) bestPair = CLASH;
     pairOf.set(v, bestPair);
     if (bestPair >= 0) distanceOf.set(v, Math.abs(bestSide) < SNAP * edgeLength ? 0 : bestSide);
     return bestPair;
@@ -401,9 +469,11 @@ export function cutAlongBorderLines(
     }
   }
 
-  // A piece (or a whole face) that went to the other group has to touch that group:
+  // A piece (or a whole face) that went to the other group has to join that group:
   // where the faces beside it were left as they are (three groups meet, a protected
-  // colour), it would stay a speck of its own — it goes back to its face's group.
+  // colour), it would stay a speck of its own — and pieces side by side, a crumb.  So
+  // each run of changed pieces that reaches no piece or face that was that group
+  // already goes back to its faces' groups.
   {
     const total = vertexCount + added.length / 3;
     const items = new Map<number, number[]>(); // side → pieces (p) and faces left whole (-(f + 1)) on it
@@ -427,21 +497,35 @@ export function cutAlongBorderLines(
         beside[n] = 1;
         for (let k = 0; k < 3; k++) add(corners[n * 3 + k], corners[n * 3 + ((k + 1) % 3)], -(n + 1));
       }
-    for (let round = 0; round < 3; round++) {
+    const changed = (item: number) => item >= 0 && pieceGroups[item] !== own[pieceFaces[item]];
+    const run = new Int32Array(pieceGroups.length);
+    const members: number[] = [];
+    for (let round = 1; round <= 3; round++) {
       let back = 0;
-      for (let p = 0; p < pieceGroups.length; p++) {
-        const home = own[pieceFaces[p]];
-        const group = pieceGroups[p];
-        if (group === home) continue;
-        let touches = false;
-        for (let k = 0; k < 3 && !touches; k++) {
-          const list = items.get(side(pieces[p * 3 + k], pieces[p * 3 + ((k + 1) % 3)])) as number[];
-          for (const other of list) if (other !== p && groupOf(other) === group) touches = true;
+      for (let p0 = 0; p0 < pieceGroups.length; p0++) {
+        if (run[p0] === round || !changed(p0)) continue;
+        const group = pieceGroups[p0];
+        run[p0] = round;
+        members.length = 0;
+        members.push(p0);
+        let joins = false;
+        for (let i = 0; i < members.length; i++) {
+          const p = members[i];
+          for (let k = 0; k < 3; k++) {
+            const list = items.get(side(pieces[p * 3 + k], pieces[p * 3 + ((k + 1) % 3)])) as number[];
+            for (const other of list) {
+              if (other === p || groupOf(other) !== group) continue;
+              if (!changed(other)) joins = true;
+              else if (run[other] !== round) {
+                run[other] = round;
+                members.push(other);
+              }
+            }
+          }
         }
-        if (!touches) {
-          pieceGroups[p] = home;
-          back++;
-        }
+        if (joins) continue;
+        for (const p of members) pieceGroups[p] = own[pieceFaces[p]];
+        back += members.length;
       }
       if (back === 0) break;
     }

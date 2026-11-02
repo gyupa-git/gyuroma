@@ -110,6 +110,7 @@ import { cleanGaps, discDiameter, piecesOf as placesOf } from "./engine/gapClean
 import { NO_TONE, isNoTone, sameTone, toneColours, type Tone, type ToneColour, type ToneWalls } from "./engine/groupTone";
 import { cutsKeepingGroups } from "./engine/stripCuts";
 import { faceOfGroupNear } from "./engine/cutPick";
+import { packWorkFile, readWorkFile, WORK_FILE_EXT, WorkFileError, workFileName } from "./engine/workFile";
 import { WITH_CLAUDE } from "./features";
 import { renderViews } from "./ui/snapshot";
 import { aiAsk, aiStatus, loadApiKey, loadKeyUsage, maskKey, saveApiKey, type AiRoute, type KeyUsage } from "./engine/aiClient";
@@ -980,6 +981,45 @@ export default function App() {
     setSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
 
+  /**
+   * A site's store in the browser is "best effort" unless the site asks: when
+   * the disk runs low the browser may clear it.  Asked (the browser decides —
+   * Chrome says yes to sites in use), the autosave stays until someone clears
+   * the site's data.  null = not known.
+   */
+  const [storageKept, setStorageKept] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!settings.rememberWork) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const storage = typeof navigator === "undefined" ? undefined : navigator.storage;
+        if (!storage?.persist) return;
+        const kept = (await storage.persisted()) || (await storage.persist());
+        if (!cancelled) setStorageKept(kept);
+      } catch {
+        // not offered here
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.rememberWork]);
+
+  // Leaving by accident — a reload, the back button or swipe, the tab closed —
+  // asks first while a model is open: the work is autosaved, but the steps to
+  // undo and the view are not, and a big model takes a second or two to store
+  // (leaving before it is down loses the last change).
+  useEffect(() => {
+    const onLeave = (event: BeforeUnloadEvent) => {
+      if (!modelRef.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onLeave);
+    return () => window.removeEventListener("beforeunload", onLeave);
+  }, []);
+
   // ------------------------------------------------------------------
   // Derived data
   // ------------------------------------------------------------------
@@ -1131,13 +1171,65 @@ export default function App() {
     () => (stripData && previewCuts ? groupsFromCuts(stripData, previewCuts) : committedGroups),
     [stripData, previewCuts, committedGroups],
   );
-  const { palette, labels } = useMemo(() => {
-    if (!model || !stripData) return { palette: [] as PaletteEntry[], labels: new Int32Array(0) };
+  const { palette, labels, positionOfKey } = useMemo(() => {
+    if (!model || !stripData) return { palette: [] as PaletteEntry[], labels: new Int32Array(0), positionOfKey: new Map<number, number>() };
     const built = stripPalette(committedGroups);
     const faceLabels = stripLabels(model.triangleColors, built.groupOfKey, built.palette);
-    return { palette: built.palette, labels: faceLabels };
+    return { palette: built.palette, labels: faceLabels, positionOfKey: built.groupOfKey };
   }, [model, stripData, committedGroups]);
   const areaByPosition = useMemo(() => areaFractionByPosition(labels, palette.length, areaWeights), [labels, palette.length, areaWeights]);
+
+  /**
+   * The print choices made by hand in 03 (one filament alone, a re-mixed
+   * recipe) are kept by palette number, and the palette is numbered anew when
+   * a band is split or merged or a colour change moves a group.  They follow
+   * the colour they were made for: each old entry's colour, found in the new
+   * palette, takes its choice along (a colour gone takes it away).  They used
+   * to be wiped on every colour change and every reload instead.
+   */
+  const choicesPaletteRef = useRef<{ generation: number; keys: number[] } | null>(null);
+  useEffect(() => {
+    const before = choicesPaletteRef.current;
+    const generation = loadGenerationRef.current;
+    if (palette.length === 0) return;
+    const keys = palette.map((entry) => stripColourKey(entry.rgb));
+    choicesPaletteRef.current = { generation, keys };
+    // Another model, or the work just put back: its choices are numbered for this palette already.
+    if (!before || before.generation !== generation) return;
+    const moved = new Map<number, number>();
+    before.keys.forEach((key, position) => {
+      const now = positionOfKey.get(key);
+      if (now !== undefined) moved.set(position + 1, now + 1);
+    });
+    if (moved.size === before.keys.length && [...moved].every(([from, to]) => from === to)) return;
+    const carry = <T,>(choices: Record<string, T>): Record<string, T> => {
+      const out: Record<string, T> = {};
+      for (const [key, value] of Object.entries(choices)) {
+        const to = moved.get(Number(key));
+        if (to !== undefined && out[String(to)] === undefined) out[String(to)] = value;
+      }
+      return out;
+    };
+    setSettings((prev) => {
+      if (Object.keys(prev.manualPhysical).length === 0 && Object.keys(prev.recipeOverrides).length === 0) return prev;
+      return { ...prev, manualPhysical: carry(prev.manualPhysical), recipeOverrides: carry(prev.recipeOverrides) };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [palette]);
+
+  /** The colours differ from the loaded file's own (what "원본 색으로" would put back). */
+  const coloursChanged = useMemo(() => {
+    const original = originalColoursRef.current;
+    const colours = model?.triangleColors;
+    if (!colours || !original || colours === original) return false;
+    if (colours.length !== original.length) return true;
+    for (let f = 0; f < colours.length; f++) {
+      const a = colours[f];
+      const b = original[f];
+      if (a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2]) return true;
+    }
+    return false;
+  }, [model?.triangleColors]);
 
   /**
    * New face colours that move faces from one group to another (a fill, a
@@ -3445,8 +3537,10 @@ export default function App() {
     next: MeshModel,
     info: SourceInfo,
     source: WorkSource | null,
-    options?: { persist?: boolean; original?: RGB[]; history?: RGB[][]; restored?: boolean },
+    options?: { persist?: boolean; original?: RGB[]; history?: RGB[][]; restored?: boolean; sameWork?: boolean },
   ): void {
+    // Work put back (the autosave, a work file) keeps its hand-set print choices and orientation.
+    const sameWork = options?.restored || options?.sameWork;
     loadGenerationRef.current += 1;
     modelFileRef.current = source;
     adjacencyRef.current = null;
@@ -3477,10 +3571,13 @@ export default function App() {
     setTidyResult(null);
     setSettings((prev) => ({
       ...prev,
-      manualPhysical: {},
+      // The print choices made by hand (03) are numbered by palette colour: another
+      // model's do not fit this one.  Work put back keeps its own — they used to be
+      // wiped on every reload.
+      ...(sameWork ? {} : { manualPhysical: {}, recipeOverrides: {} }),
       // The orientation belongs to the model: a face put down for the last one
       // used to stay and lay the next one over.  Restored work keeps its own.
-      export: { ...prev.export, fileName: "", ...(options?.restored ? {} : { coordinateMode: orientationFor(info.kind) }) },
+      export: { ...prev.export, fileName: "", ...(sameWork ? {} : { coordinateMode: orientationFor(info.kind) }) },
     }));
     setFitNonce((n) => n + 1);
     if (options?.persist === false) return;
@@ -3489,6 +3586,7 @@ export default function App() {
   }
 
   async function onModelFile(file: File): Promise<void> {
+    if (file.name.toLowerCase().endsWith(WORK_FILE_EXT)) return openWorkFile(file);
     const kind: StoredWorkFile["kind"] = file.name.toLowerCase().endsWith(".3mf") ? "rodin" : "obj";
     setBusy(kind === "rodin" ? t("busy.readingRodin") : t("busy.readingObj"));
     await yieldToUi();
@@ -3628,6 +3726,61 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /**
+   * Puts stored work back — the model file, the confirmed cuts made again in
+   * order on it, then the colours — from the autosave or from a work file.
+   * Null when another model came in meanwhile.  ⌘Z has nothing to take back
+   * afterwards: it used to hold the file's own colours, so one ⌘Z after a
+   * reload undid all the colour work at once, and the autosave kept that.
+   */
+  async function putBackWork(
+    stored: StoredWorkFile,
+    storedColours: unknown,
+    storedCuts: unknown,
+    from: "autosave" | "file",
+  ): Promise<{ model: MeshModel; cuts: StoredCut[]; colours: boolean } | null> {
+    const generation = loadGenerationRef.current;
+    const file = new File([stored.buffer], stored.name);
+    const nomadPalette = stored.palette ? (unpackColours(stored.palette, Math.floor(stored.palette.length / 3)) ?? undefined) : undefined;
+    const loaded = await parseModelFile(file, stored.kind, nomadPalette);
+    if (loadGenerationRef.current !== generation) return null;
+    // The cuts confirmed before, made again in order on the file (the colours belong to the cut mesh).
+    let base = loaded.model;
+    let original = loaded.model.triangleColors;
+    let log: StoredCut[] = [];
+    const wanted = isStoredWorkColours(storedColours) ? (storedColours.cuts ?? 0) : 0;
+    if (wanted > 0 && isStoredWorkCuts(storedCuts) && storedCuts.fileName === stored.name && storedCuts.cuts.length >= wanted) {
+      for (const made of storedCuts.cuts.slice(0, wanted)) {
+        if (made.faces !== base.triangles.length || made.vertices !== base.vertices.length) break;
+        const mesh = meshWithCut(base.vertices, base.triangles, made);
+        original = Array.from(mesh.originalFace, (f) => original[f]);
+        base = { ...base, vertices: mesh.vertices, triangles: mesh.triangles, triangleColors: original, stats: { ...base.stats, vertexCount: mesh.vertices.length, triangleCount: mesh.triangles.length } };
+        log = [...log, made];
+      }
+      if (log.length !== wanted) {
+        base = loaded.model;
+        original = loaded.model.triangleColors;
+        log = [];
+      }
+    }
+    cutLogRef.current.set(base.triangles, log);
+    const lastCut = log[log.length - 1];
+    const settledBack = lastCut?.settled ? unpackRuns(lastCut.settled, base.triangles.length) : null;
+    if (settledBack) settledRef.current.set(base.triangles, settledBack);
+    const colours =
+      isStoredWorkColours(storedColours) && storedColours.faceCount === base.triangles.length
+        ? unpackColours(storedColours.colours, storedColours.faceCount)
+        : null;
+    const backModel = colours ? { ...base, triangleColors: colours, stats: { ...base.stats, uniqueFaceColors: countUniqueColours(colours) } } : base;
+    installModel(
+      backModel,
+      { ...loaded.info, uniqueColours: backModel.stats.uniqueFaceColors },
+      { file, kind: stored.kind, palette: nomadPalette },
+      from === "autosave" ? { persist: false, original, restored: true } : { persist: false, original, sameWork: true },
+    );
+    return { model: backModel, cuts: log, colours: colours !== null };
+  }
+
   async function restoreWork(): Promise<void> {
     const stored = await dataGet<unknown>(WORK_FILE_KEY);
     if (!isStoredWorkFile(stored) || loadGenerationRef.current !== 0) return;
@@ -3636,49 +3789,11 @@ export default function App() {
     try {
       const storedColours = await dataGet<unknown>(WORK_COLOURS_KEY);
       const storedCuts = await dataGet<unknown>(WORK_CUTS_KEY);
-      const file = new File([stored.buffer], stored.name);
-      const nomadPalette = stored.palette ? (unpackColours(stored.palette, Math.floor(stored.palette.length / 3)) ?? undefined) : undefined;
-      const loaded = await parseModelFile(file, stored.kind, nomadPalette);
-      if (loadGenerationRef.current !== 0) return;
-      // The cuts confirmed before, made again in order on the file (the colours belong to the cut mesh).
-      let base = loaded.model;
-      let original = loaded.model.triangleColors;
-      let log: StoredCut[] = [];
-      const wanted = isStoredWorkColours(storedColours) ? (storedColours.cuts ?? 0) : 0;
-      if (wanted > 0 && isStoredWorkCuts(storedCuts) && storedCuts.fileName === stored.name && storedCuts.cuts.length >= wanted) {
-        for (const made of storedCuts.cuts.slice(0, wanted)) {
-          if (made.faces !== base.triangles.length || made.vertices !== base.vertices.length) break;
-          const mesh = meshWithCut(base.vertices, base.triangles, made);
-          original = Array.from(mesh.originalFace, (f) => original[f]);
-          base = { ...base, vertices: mesh.vertices, triangles: mesh.triangles, triangleColors: original, stats: { ...base.stats, vertexCount: mesh.vertices.length, triangleCount: mesh.triangles.length } };
-          log = [...log, made];
-        }
-        if (log.length !== wanted) {
-          base = loaded.model;
-          original = loaded.model.triangleColors;
-          log = [];
-        }
-      }
-      cutLogRef.current.set(base.triangles, log);
-      const lastCut = log[log.length - 1];
-      const settledBack = lastCut?.settled ? unpackRuns(lastCut.settled, base.triangles.length) : null;
-      if (settledBack) settledRef.current.set(base.triangles, settledBack);
-      const colours =
-        isStoredWorkColours(storedColours) && storedColours.faceCount === base.triangles.length
-          ? unpackColours(storedColours.colours, storedColours.faceCount)
-          : null;
-      const restoredModel = colours
-        ? { ...base, triangleColors: colours, stats: { ...base.stats, uniqueFaceColors: countUniqueColours(colours) } }
-        : base;
-      installModel(
-        restoredModel,
-        { ...loaded.info, uniqueColours: restoredModel.stats.uniqueFaceColors },
-        { file, kind: stored.kind, palette: nomadPalette },
-        { persist: false, original, history: colours ? [original] : [], restored: true },
-      );
-      const savedAt = colours && isStoredWorkColours(storedColours) ? storedColours.savedAt : stored.savedAt;
+      const back = await putBackWork(stored, storedColours, storedCuts, "autosave");
+      if (!back) return;
+      const savedAt = back.colours && isStoredWorkColours(storedColours) ? storedColours.savedAt : stored.savedAt;
       setAutosave({ state: "saved", at: Number.isFinite(savedAt) ? savedAt : Date.now() });
-      setStatus(t("status.workRestored", { name: stored.name, info: colours ? t("status.workRestoredColours") : t("status.workRestoredOriginal") }));
+      setStatus(t("status.workRestored", { name: stored.name, info: back.colours ? t("status.workRestoredColours") : t("status.workRestoredOriginal") }));
     } catch (err) {
       // Left in place: a failure in this window is no reason to delete what
       // another window may still be relying on.  "새로 시작" clears on purpose.
@@ -3686,6 +3801,128 @@ export default function App() {
     } finally {
       setBusy(null);
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Work files (.gyuroma): the work kept as a file of the person's own, out of
+  // the browser's reach — opened again here, in another browser or computer.
+  // ------------------------------------------------------------------
+  const [workFileSave, setWorkFileSave] = useState<"idle" | "saving" | "saved">("idle");
+
+  async function saveWorkFile(): Promise<void> {
+    const source = modelFileRef.current;
+    const current = modelRef.current;
+    if (!source || !current || workFileSave === "saving") return;
+    const name = workFileName(source.file.name, new Date());
+    // Where first, while the press still counts as the person's: the browser
+    // opens a save dialog only then, not after the packing that follows.
+    type SavePicker = (options: { suggestedName: string; types: Array<{ description: string; accept: Record<string, string[]> }> }) => Promise<FileSystemFileHandle>;
+    const picker = (window as unknown as { showSaveFilePicker?: SavePicker }).showSaveFilePicker;
+    let handle: FileSystemFileHandle | null = null;
+    if (picker) {
+      try {
+        handle = await picker({ suggestedName: name, types: [{ description: t("workFile.kind"), accept: { "application/octet-stream": [WORK_FILE_EXT] } }] });
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        handle = null;
+      }
+    }
+    setWorkFileSave("saving");
+    setBusy(t("busy.packingWork"));
+    await yieldToUi();
+    try {
+      const now = Date.now();
+      const cuts = cutLogRef.current.get(current.triangles) ?? [];
+      const ownColours = current.triangleColors === originalColoursRef.current && cuts.length === 0;
+      const blob = await packWorkFile({
+        file: { name: source.file.name, kind: source.kind, buffer: await source.file.arrayBuffer(), palette: source.palette ? packColours(source.palette) : undefined, savedAt: now },
+        colours: ownColours ? null : { faceCount: current.triangleColors.length, colours: packColours(current.triangleColors), savedAt: now, cuts: cuts.length },
+        cuts: cuts.length > 0 ? { fileName: source.file.name, cuts, savedAt: now } : null,
+        settings,
+        app: `GYUROMA ${APP_VERSION}`,
+        savedAt: now,
+      });
+      if (handle) {
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } else downloadBlob(name, blob);
+      setStatus(t("status.workFileSaved", { name: handle?.name ?? name, mb: (blob.size / 1e6).toFixed(1) }));
+      countAction("work/save");
+      setWorkFileSave("saved");
+      window.setTimeout(() => setWorkFileSave((state) => (state === "saved" ? "idle" : state)), 3000);
+    } catch (err) {
+      setWorkFileSave("idle");
+      setStatus(t("status.workFileSaveFailed", { message: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /** Opens a work file: it becomes the work, and the autosave keeps it from here. */
+  async function openWorkFile(file: File): Promise<void> {
+    setBusy(t("busy.openingWork"));
+    await yieldToUi();
+    try {
+      const work = await readWorkFile(file);
+      const back = await putBackWork(work.file, work.colours, work.cuts, "file");
+      if (!back) return;
+      takeWorkSettings(work.settings, work.file.name);
+      setStatus(t("status.workFileOpened", { name: file.name, at: new Date(work.savedAt).toLocaleString(lang === "ko" ? "ko-KR" : "en-GB") }));
+      countAction("load/work");
+      if (!rememberWorkRef.current) {
+        setAutosave({ state: "none", at: null });
+        return;
+      }
+      const generation = loadGenerationRef.current;
+      const source = modelFileRef.current;
+      if (!source || !(await persistWorkFile(source, generation))) return;
+      lastSavedCutsRef.current = null;
+      if (back.colours || back.cuts.length > 0) await persistWorkColours(back.model.triangleColors, generation, back.cuts);
+    } catch (err) {
+      setStatus(err instanceof WorkFileError ? t(`workFile.${err.code}`) : t("status.error", { message: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * What a work file's settings bring: what belongs to the work — its colour
+   * bands, the print choices made by hand, colour protection, the tidy and
+   * palette settings, the orientation — as it was; the filaments and the
+   * mixing are the workshop's own, taken only when the person says so.
+   */
+  function takeWorkSettings(raw: unknown, modelName: string): void {
+    const saved = mergeSettings(raw);
+    const workshop = JSON.stringify([saved.filaments.count, saved.filaments.hex.slice(0, saved.filaments.count), saved.mix]) !== JSON.stringify([settings.filaments.count, settings.filaments.hex.slice(0, settings.filaments.count), settings.mix]);
+    const takeWorkshop = workshop && window.confirm(t("workFile.takeWorkshop"));
+    setSettings((prev) => {
+      const stripByModel = { ...prev.stripByModel };
+      if (saved.stripByModel[modelName]) stripByModel[modelName] = saved.stripByModel[modelName];
+      else delete stripByModel[modelName];
+      return {
+        ...prev,
+        stripByModel,
+        manualPhysical: saved.manualPhysical,
+        recipeOverrides: saved.recipeOverrides,
+        mergeFlags: { ...prev.mergeFlags, ...saved.mergeFlags },
+        merge: saved.merge,
+        palette: saved.palette,
+        export: { ...prev.export, coordinateMode: saved.export.coordinateMode },
+        ...(takeWorkshop ? { filaments: saved.filaments, mix: saved.mix } : {}),
+      };
+    });
+  }
+
+  /** The file's own colours back, as one step ⌘Z takes back. */
+  function revertToOriginal(): void {
+    const current = modelRef.current;
+    const original = originalColoursRef.current;
+    if (!current || !original || original.length !== current.triangles.length || current.triangleColors === original) return;
+    if (!window.confirm(t("load.revertConfirm"))) return;
+    keepGroupsFor(current.triangleColors, original);
+    applyColours(current, original);
+    setStatus(t("status.revertedToOriginal"));
   }
 
   function clearWork(): void {
@@ -3765,9 +4002,9 @@ export default function App() {
     meshRedoRef.current = [];
     redoOrderRef.current = [];
     setModel({ ...current, triangleColors: next, stats: { ...current.stats, uniqueFaceColors: countUniqueColours(next) } });
-    // the palette may be numbered anew: earlier recipe choices no longer line up
+    // The palette may be numbered anew: the recipe panel's undo steps no longer line
+    // up.  The hand-set choices themselves follow their colours (choicesPaletteRef).
     forgetRecipeUndo();
-    setSettings((prev) => ({ ...prev, manualPhysical: {} }));
     if (!options?.keepSelection) clearPick();
   }
 
@@ -5618,6 +5855,10 @@ export default function App() {
             <span className="mono">{t("top.faces", { n: model.triangles.length.toLocaleString() })}</span>
             <span className={`save-dot ${saveDot}`} aria-hidden="true" />
             <span className="save-text">{autosaveLabel}</span>
+            <button type="button" className="chip-btn save-file" disabled={isBusy || workFileSave === "saving"} title={t("load.saveWorkHint")} onClick={() => void saveWorkFile()}>
+              <Icon name="download" size={12} stroke={1.6} />
+              <span>{workFileSave === "saving" ? t("load.saving") : workFileSave === "saved" ? t("load.saved") : t("top.saveWork")}</span>
+            </button>
           </div>
         )}
         <StepNav steps={stepInfo} current={step} onChange={changeStep} />
@@ -5721,8 +5962,12 @@ export default function App() {
                 onRememberTemplate={(next) => patchSettings("rememberTemplate", next)}
                 rememberWork={settings.rememberWork}
                 onRememberWork={(next) => patchSettings("rememberWork", next)}
-                workState={model ? { restored: workRestored, undoSteps: history.length } : null}
+                workState={model ? { restored: workRestored, undoSteps: history.length, changed: coloursChanged } : null}
                 onClearWork={clearWork}
+                onSaveWork={() => void saveWorkFile()}
+                saveState={workFileSave}
+                onRevertOriginal={revertToOriginal}
+                workStore={storageMode === "folder" ? "folder" : storageKept === true ? "kept" : storageKept === false ? "notKept" : "browser"}
                 onRecolour={recolourPaletteColour}
                 onOpenGather={() => setGatherOpen(true)}
               />

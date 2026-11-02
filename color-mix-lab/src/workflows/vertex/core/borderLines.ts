@@ -47,6 +47,12 @@ export interface BorderLineOptions {
    * colours on either side have become since.  Omitted: every border is drawn afresh.
    */
   settled?: ArrayLike<number>;
+  /**
+   * With `settled`: a settled stretch that is still rough — teeth a cut once left
+   * (a corner held back then), told from the settled line alone — is drawn afresh
+   * after all.  The cut asks for this; a tidy leaves confirmed borders as they are.
+   */
+  reopenRough?: boolean;
 }
 
 /** Below this, the edges walked around a point (their directions summed, over their length) turn back on themselves. */
@@ -59,6 +65,14 @@ const FOLD = 0.35;
  * angle, but one of them faces the same way.
  */
 export const THIN_WALL = 0.3;
+
+/**
+ * With `reopenRough`: a settled point the settled line alone would move by more
+ * than this many edge lengths (its own window, its own pull against the pulls
+ * around it) is rough — a tooth a cut once left — and drawn afresh.  Along a
+ * settled line as a cut leaves it the move is next to nothing.
+ */
+export const ROUGH = 0.35;
 
 /** The line drawn along the borders (steps 1 and 2), for the faces to be measured against. */
 export interface BorderLineTrace {
@@ -84,6 +98,8 @@ export interface BorderLineTrace {
   along: Float64Array;
   /** 1 where the line stays on the border itself (and `across` is not set). */
   stays: Uint8Array;
+  /** 1 for a settled point drawn afresh after all (`reopenRough`: the settled line is rough there). */
+  opened: Uint8Array;
   /** 1 for faces with a side on a border. */
   borderFace: Uint8Array;
 }
@@ -206,8 +222,9 @@ export function traceBorderLine(
     return true;
   };
   // A point moves when its border edges are all of one unprotected pair and as many come in as go out
-  // (and they are not settled).
+  // (and they are not settled — unless the settled line is rough there, below).
   const moves = new Uint8Array(count);
+  const settledPoint = new Uint8Array(count);
   for (let s = 0; s < count; s++) {
     let balance = 0;
     const p0 = pair[edgeList[edgeStart[s]]];
@@ -217,13 +234,18 @@ export function traceBorderLine(
       balance += slotA[e] === s ? 1 : -1;
       if (pair[e] !== p0) one = false;
     }
-    if (balance === 0 && one && !isProtected(Math.floor(p0 / 65536)) && !isProtected(p0 % 65536) && !settledAt(s)) moves[s] = 1;
+    if (balance === 0 && one && !isProtected(Math.floor(p0 / 65536)) && !isProtected(p0 % 65536)) {
+      if (settledAt(s)) settledPoint[s] = 1;
+      else moves[s] = 1;
+    }
   }
   const pos = new Float64Array(count * 3);
   for (let s = 0; s < count; s++) for (let c = 0; c < 3; c++) pos[s * 3 + c] = positions[at[s] * 3 + c];
   // A border shorter than two windows all round (a small island, a short stretch between
   // corners where three groups meet) cannot tell an even bend from a jagged one: it stays,
-  // left to the teeth trim and the island cleanup.
+  // left to the teeth trim and the island cleanup.  Its settled stretches count to its length:
+  // a stretch drawn since between two settled ones is part of a long border, not an island
+  // (it used to stay, teeth and all).
   {
     const seen = new Uint8Array(count);
     const stack: number[] = [];
@@ -243,7 +265,7 @@ export function traceBorderLine(
           if (pair[e] !== p0) continue;
           if (slotA[e] === a) length += lengthOf[e]; // each edge once, from its start
           const b = slotA[e] === a ? slotB[e] : slotA[e];
-          if (!moves[b] || seen[b]) continue;
+          if (!(moves[b] || settledPoint[b]) || seen[b]) continue;
           seen[b] = 1;
           stack.push(b);
         }
@@ -253,7 +275,7 @@ export function traceBorderLine(
   }
 
   // 2) The walk around a point: the border points of its pair within half a window
-  // (not through a point that stays), and how much the edges walked point one way.
+  // (on through the points `through` marks), and how much the edges walked point one way.
   const walkCap = 10 * Math.ceil(span) + 8;
   const dist = new Float64Array(count).fill(Infinity);
   const edgeSeen = new Int32Array(edgeCount);
@@ -261,7 +283,7 @@ export function traceBorderLine(
   const reached: number[] = [];
   let straightness = 0;
   const heading = [0, 0, 0]; // the edges walked, their directions summed
-  const walk = (s: number) => {
+  const walk = (s: number, through: Uint8Array = moves) => {
     reached.length = 0;
     walkStamp++;
     const p0 = pair[edgeList[edgeStart[s]]];
@@ -270,7 +292,7 @@ export function traceBorderLine(
     let vx = 0, vy = 0, vz = 0, walked = 0;
     for (let k = 0; k < reached.length && reached.length < walkCap; k++) {
       const a = reached[k];
-      if (dist[a] >= half || !moves[a]) continue;
+      if (dist[a] >= half || !through[a]) continue;
       for (let i = edgeStart[a]; i < edgeStart[a + 1]; i++) {
         const e = edgeList[i];
         if (pair[e] !== p0) continue;
@@ -311,6 +333,89 @@ export function traceBorderLine(
       normalAt[s * 3 + 2] += n[2];
     }
   }
+  // Across the way the border runs over the window at s, in the surface: null where it
+  // turns back on itself within the window (or there is too little of it to tell).
+  const acrossAt = (s: number): [number, number, number] | null => {
+    const n0 = normalAt[s * 3], n1 = normalAt[s * 3 + 1], n2 = normalAt[s * 3 + 2];
+    const cx = n1 * heading[2] - n2 * heading[1];
+    const cy = n2 * heading[0] - n0 * heading[2];
+    const cz = n0 * heading[1] - n1 * heading[0];
+    const length = Math.hypot(cx, cy, cz);
+    if (straightness < FOLD || reached.length < 3 || length === 0) return null;
+    return [cx / length, cy / length, cz / length];
+  };
+  /** How far the points walked lie, on average, across the border from s. */
+  const pullAlong = (s: number, a: [number, number, number]) => {
+    let sx = 0, sy = 0, sz = 0;
+    for (const b of reached) {
+      sx += pos[b * 3];
+      sy += pos[b * 3 + 1];
+      sz += pos[b * 3 + 2];
+    }
+    const n = reached.length;
+    return (sx / n - pos[s * 3]) * a[0] + (sy / n - pos[s * 3 + 1]) * a[1] + (sz / n - pos[s * 3 + 2]) * a[2];
+  };
+  // A settled point stays on its line — unless (reopenRough) that line is rough there:
+  // teeth a cut once left.  Told from the settled line alone, walked through its own
+  // points: a border drawn since beside it (colours changed) must not open it.  Only
+  // along a settled stretch at least two windows long: a small round spot or a short
+  // arc cannot tell its curve from teeth (opened, a spot's rim threw crumbs).
+  const opened = new Uint8Array(count);
+  if (options.reopenRough && settled) {
+    const longEnough = new Uint8Array(count);
+    {
+      const seen = new Uint8Array(count);
+      const stack: number[] = [];
+      const members: number[] = [];
+      for (let s0 = 0; s0 < count; s0++) {
+        if (!settledPoint[s0] || seen[s0]) continue;
+        const p0 = pair[edgeList[edgeStart[s0]]];
+        seen[s0] = 1;
+        stack.push(s0);
+        members.length = 0;
+        let length = 0;
+        while (stack.length > 0) {
+          const a = stack.pop() as number;
+          members.push(a);
+          for (let i = edgeStart[a]; i < edgeStart[a + 1]; i++) {
+            const e = edgeList[i];
+            if (pair[e] !== p0) continue;
+            if (slotA[e] === a) length += lengthOf[e];
+            const b = slotA[e] === a ? slotB[e] : slotA[e];
+            if (!settledPoint[b] || seen[b]) continue;
+            seen[b] = 1;
+            stack.push(b);
+          }
+        }
+        if (length >= 2 * span * edgeLength) for (const a of members) longEnough[a] = 1;
+      }
+    }
+    const settledPull = new Float64Array(count);
+    const told = new Uint8Array(count);
+    for (let s = 0; s < count; s++) {
+      if (!longEnough[s]) continue;
+      walk(s, settledPoint);
+      const a = acrossAt(s);
+      if (a) {
+        settledPull[s] = pullAlong(s, a);
+        told[s] = 1;
+      }
+      clearWalk();
+    }
+    for (let s = 0; s < count; s++) {
+      if (!told[s]) continue;
+      walk(s, settledPoint);
+      let around = 0, n = 0;
+      for (const b of reached) {
+        if (!told[b]) continue;
+        around += settledPull[b];
+        n++;
+      }
+      clearWalk();
+      if (Math.abs(settledPull[s] - (n > 0 ? around / n : 0)) > ROUGH * edgeLength) opened[s] = 1;
+    }
+    for (let s = 0; s < count; s++) if (opened[s]) moves[s] = 1;
+  }
   // Across the border at each point, in the surface, towards the lower group: the
   // normal × the way the border runs over the whole window (not just the edges at the
   // point — at the corner of a tooth those point every way).
@@ -327,31 +432,18 @@ export function traceBorderLine(
       continue;
     }
     walk(s);
-    const n0 = normalAt[s * 3], n1 = normalAt[s * 3 + 1], n2 = normalAt[s * 3 + 2];
-    const cx = n1 * heading[2] - n2 * heading[1];
-    const cy = n2 * heading[0] - n0 * heading[2];
-    const cz = n0 * heading[1] - n1 * heading[0];
-    const length = Math.hypot(cx, cy, cz);
-    if (straightness < FOLD || reached.length < 3 || length === 0) {
+    const a = acrossAt(s);
+    if (!a) {
       stays[s] = 1;
       clearWalk();
       continue;
     }
-    across[s * 3] = cx / length;
-    across[s * 3 + 1] = cy / length;
-    across[s * 3 + 2] = cz / length;
+    across.set(a, s * 3);
     const way = Math.hypot(heading[0], heading[1], heading[2]);
     along[s * 3] = heading[0] / way;
     along[s * 3 + 1] = heading[1] / way;
     along[s * 3 + 2] = heading[2] / way;
-    let sx = 0, sy = 0, sz = 0;
-    for (const b of reached) {
-      sx += pos[b * 3];
-      sy += pos[b * 3 + 1];
-      sz += pos[b * 3 + 2];
-    }
-    const n = reached.length;
-    pull[s] = (sx / n - pos[s * 3]) * across[s * 3] + (sy / n - pos[s * 3 + 1]) * across[s * 3 + 1] + (sz / n - pos[s * 3 + 2]) * across[s * 3 + 2];
+    pull[s] = pullAlong(s, a);
     clearWalk();
   }
   // Each point moves across the border by how far its pull differs from the pull around
@@ -373,7 +465,7 @@ export function traceBorderLine(
     line[s * 3 + 1] = pos[s * 3 + 1] + move * across[s * 3 + 1];
     line[s * 3 + 2] = pos[s * 3 + 2] + move * across[s * 3 + 2];
   }
-  return { edgeLength, maxMove, eu, ev, eLeft, eRight, eFace, eAcross, slotA, slotB, line, across, along, stays, borderFace };
+  return { edgeLength, maxMove, eu, ev, eLeft, eRight, eFace, eAcross, slotA, slotB, line, across, along, stays, opened, borderFace };
 }
 
 export function smoothBorderLines(

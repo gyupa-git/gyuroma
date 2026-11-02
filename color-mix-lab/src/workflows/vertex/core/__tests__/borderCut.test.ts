@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { buildEdgeAdjacency, buildFaceAdjacency } from "../meshAdjacency";
 import { flatCorners } from "../borderLines";
 import { cutAlongBorderLines, meshWithCut, type BorderCut } from "../borderCut";
-import { foldedGrid, gridMesh } from "./fixtures";
+import { foldedGrid, gridMesh, paintedGrid } from "./fixtures";
 import type { Tri, Vec3 } from "../types";
 
 // Two triangles per cell: face (i, j, k) = (j·nx + i)·2 + k.
@@ -62,6 +62,32 @@ const openLength = (points: Vec3[], tris: Tri[]) => {
   }
   return length;
 };
+/** The patches of a colour made only of pieces that went to it: joined to nothing that was that colour. */
+function crumbs(vertices: Vec3[], triangles: Tri[], groups: Int32Array, cut: BorderCut) {
+  const made = meshWithCut(vertices, triangles, cut);
+  const group = Int32Array.from(made.originalFace, (f, i) => (made.piece[i] >= 0 ? cut.pieceGroups[made.piece[i]] : groups[f]));
+  const parent = Int32Array.from(group, (_, i) => i);
+  const find = (x: number) => {
+    while (parent[x] !== x) x = parent[x] = parent[parent[x]];
+    return x;
+  };
+  const firstOnSide = new Map<string, number>();
+  made.triangles.forEach((t, i) => {
+    for (let k = 0; k < 3; k++) {
+      const a = t[k], b = t[(k + 1) % 3];
+      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      const j = firstOnSide.get(key);
+      if (j === undefined) firstOnSide.set(key, i);
+      else if (group[j] === group[i]) parent[find(i)] = find(j);
+    }
+  });
+  const onlyChanged = new Map<number, boolean>();
+  for (let i = 0; i < group.length; i++) {
+    const changed = made.piece[i] >= 0 && group[i] !== groups[made.originalFace[i]];
+    onlyChanged.set(find(i), (onlyChanged.get(find(i)) ?? true) && changed);
+  }
+  return [...onlyChanged.values()].filter(Boolean).length;
+}
 const run = (nx: number, ny: number, groups: Int32Array, span: number, protectedGroups: number[] = [], sides = false) => {
   const { triangles, vertices, adjacency } = mesh(nx, ny, sides);
   const protectedGroup = new Uint8Array(3);
@@ -274,6 +300,34 @@ describe("cutAlongBorderLines", () => {
         for (const j of sides.get(a < b ? `${a},${b}` : `${b},${a}`) ?? []) if (j !== i && out[j] === out[i]) touches = true;
       }
       expect(touches).toBe(true);
+    }
+  });
+});
+
+describe("cutAlongBorderLines — ragged paint (see paintedGrid)", () => {
+  it("leaves no crumb, cut afresh or again after a repaint", () => {
+    // A crumb: a patch of a colour made only of pieces that went to it, apart from all that
+    // was that colour.  Off a line that hardly moved, the side a point lies on turns on the
+    // line's ends and corners: points whole edges inside a part went across — and pieces
+    // side by side passed for joined to their colour by touching each other.
+    const options = { span: 16, protectedGroup: new Uint8Array(3) };
+    for (let seed = 1; seed <= 30; seed++) {
+      const painted = paintedGrid(seed);
+      const sides = buildEdgeAdjacency(flatCorners(painted.triangles), painted.vertices.length);
+      const cut = cutAlongBorderLines(sides, painted.triangles, painted.vertices, painted.groups, options);
+      expect(crumbs(painted.vertices, painted.triangles, painted.groups, cut)).toBe(0);
+      // Confirmed; then the dots painted over a little larger (raggedly) and cut again.
+      const after = meshWithCut(painted.vertices, painted.triangles, cut);
+      const settled = Int32Array.from(after.originalFace, (f, i) => (after.piece[i] >= 0 ? cut.pieceGroups[after.piece[i]] : painted.groups[f]));
+      const repainted = settled.slice();
+      after.triangles.forEach((t, i) => {
+        const x = (after.vertices[t[0]][0] + after.vertices[t[1]][0] + after.vertices[t[2]][0]) / 3;
+        const y = (after.vertices[t[0]][1] + after.vertices[t[1]][1] + after.vertices[t[2]][1]) / 3;
+        for (const [cx, cy, r] of painted.dots) if ((x - cx) ** 2 + (y - cy) ** 2 <= (r + 1) ** 2 && painted.rand() < 0.7) repainted[i] = 1;
+      });
+      const sides2 = buildEdgeAdjacency(flatCorners(after.triangles), after.vertices.length);
+      const again = cutAlongBorderLines(sides2, after.triangles, after.vertices, repainted, { ...options, settled });
+      expect(crumbs(after.vertices, after.triangles, repainted, again)).toBe(0);
     }
   });
 });
