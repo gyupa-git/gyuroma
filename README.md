@@ -2,28 +2,63 @@
 
 **From chaos to chroma.** 이름은 **규**파의 크**로마** — *GYU*pa's ch*ROMA*.
 
-색칠된 3D 모델을 **실 몇 가지를 섞어 뽑는 멀티컬러 3D 프린트 파일**로 바꿔 주는 무료 웹 앱이에요.
-Rodin "Face Color" 3MF나 정점색 OBJ를 넣으면, 색을 정리하고 가진 실로 섞는 비율을 정해서
-PrusaSlicer(Full Spectrum) 또는 Bambu Studio(혼합 필라멘트)에서 바로 여는 3MF로 내보내요.
+색칠된 3D 모델의 어지러운 색을 **몇 가지 깔끔한 색**으로 정리해 주는 무료 웹 앱이에요.
+정리한 색으로 **FDM 멀티컬러 프린트 파일**을 만들고, **풀컬러 · UV 프린터용 색 파일**로 내보내고,
+레진으로 뽑는다면 **칠할 색 계획**으로 쓰면 돼요.
 
 **바로 쓰기 (설치 없이): https://gyupa-git.github.io/gyuroma/**
-모든 계산은 브라우저 안에서 끝나고, 넣은 파일은 어디로도 올라가지 않아요.
+처음이라면 위쪽 **앱 가이드**를 눌러 보세요. 규파가 화면을 돌아다니며 쓰는 법을 알려 줘요.
+
+모든 계산은 브라우저 안에서 끝나고, 넣은 파일은 내 컴퓨터에만 있어요.
 이 웹 주소의 규로마는 방문 수와 불러오기·내보내기 횟수만 익명으로 세요([GoatCounter](https://www.goatcounter.com) · 쿠키 없음 · 모델이나 색 정보는 보내지 않아요).
 
-*A free web app that turns a coloured 3D model into a multi-colour print file that mixes a few filaments:
-load a Rodin "Face Color" 3MF or a vertex-colour OBJ, tidy the colours, pick how your spools mix, and export a 3MF
-that opens in PrusaSlicer (Full Spectrum) or Bambu Studio (mixed filaments). Everything runs in your browser; the hosted
-copy only counts visits, loads and exports anonymously (GoatCounter, no cookies, nothing about your model).*
+*GYUROMA is a free web app that tidies a coloured 3D model's messy colours into **a few clean ones** — and turns them
+into a multi-colour FDM print file, a colour file for full-colour and UV printers, or a paint plan for resin.
+New here? Press **App guide** at the top and Gyupa walks you round the screen. Everything runs in your browser and your
+files stay on your computer; the hosted copy only counts visits, loads and exports anonymously (GoatCounter, no cookies,
+nothing about your model).*
 
-## 할 수 있는 것 / What it does
+## 작업 순서 / How it works
 
-1. **불러오기** — Rodin Face Color 3MF, 정점색 OBJ.
-2. **색 정리** — 색 띠에서 그룹을 나누고 합치기, 그룹 색 조절, 조각만 떼어 내기·되돌리기, 자동 정돈.
-3. **실·섞기** — 가진 실로 색마다 섞는 비율(층 번갈아 쌓기) 정하기, 실 추천.
-4. **내보내기** — 프린터별 3MF: Prusa XL·CORE One·MK4S(MMU3), Bambu Lab P2S·X1·P1·A1·H2D·H2C·H2S, Orca 계열 포크, 풀컬러 프린터.
-5. **모아 뽑기** — 완성한 3MF 여러 개를 한 판에: 같은 섞는 비율은 하나로 합치고, 실 칸을 맞추고, 판 위에 겹치지 않게 놓아요.
+| 단계 / step | 하는 일 / what happens |
+| --- | --- |
+| **01 불러오기** · Load | Rodin 3D Print "Face Color" 3MF, 정점색 OBJ(노마드 · 블렌더), 저장해 둔 `.gyuroma` 작업 파일 |
+| **02 색 정리** · Colours | 규로마의 중심. 색 띠에서 그룹 나누기 · 합치기, 자동 정돈 프리셋, 브러시 · 채우기 · 스포이드 · 틈새 정리, 색지도, **선 따라 자르기**로 매끈한 경계 |
+| **03 필라멘트 · 혼합** · Filament & mix | FDM일 때. 가진 필라멘트로 슬롯 정하기와 추천, 꽂지 않은 색은 층을 번갈아 쌓아 섞기 |
+| **04 내보내기** · Export | 프린터를 고르면 그 프린터에 맞는 파일로 |
 
-화면 오른쪽 위 **English / 한국어** 버튼으로 언어를 바꿀 수 있어요. *The UI is in Korean and English.*
+*01 Load → 02 Colours (the heart of it) → 03 Filament & mix (for FDM) → 04 Export.*
+
+## 프린터 방식별로 / By printer type
+
+- **FDM 멀티컬러**
+  - 프루사 XL · CORE One · MK4S(MMU3) · INDX — PrusaSlicer 2.9.6 이상(Full Spectrum)에서 섞은 색까지 그대로 뽑아요.
+  - 밤부랩 P2S · X1 · P1 · A1 · H2D · H2C · H2S — Bambu Studio 2.8 이상에서 프로젝트로 열려요. 섞은 색은 혼합 필라멘트로 들어가요.
+  - 크리얼리티 · 엘레구 · 애니큐빅 · QIDI · 스냅메이커 · 플래시포지 — 꽂은 색 그대로 뽑는 3MF로 맞춰 줘요.
+  - 완성한 3MF 여러 개를 한 판에 뽑을 땐 **모아 뽑기** — 같은 섞는 비율은 하나로 합치고, 실 칸을 맞추고, 판 위에 겹치지 않게 놓아요.
+- **풀컬러 · UV** — 스트라타시스 폴리젯(J55 · J850), 미마키 UV 잉크젯(3DUJ-2207 · 553), HP 젯퓨전 580 Color, 3D Systems ProJet CJP.
+  02에서 정리한 색이 면마다 든 색 파일(3MF · OBJ · VRML · PLY)로 내보내요. 목록에 없는 프린터는 **범용 색 파일**로.
+- **레진** — 02 색 정리까지로 칠할 색과 순서가 정해져요. 조각을 골라 솔로 · 엑스레이로 부위마다 보고,
+  범용 색 파일로 내보내 칠할 때 옆에 띄워 둘 수도 있어요.
+
+*FDM — Prusa (PrusaSlicer 2.9.6+, Full Spectrum), Bambu Lab (opens in Bambu Studio 2.8+ as a project, mixes as mixed
+filaments), Creality, Elegoo, Anycubic, QIDI, Snapmaker and Flashforge (the loaded colours); **Gather** puts several
+finished 3MFs on one plate. Full-colour & UV — Stratasys PolyJet, Mimaki UV inkjet, HP Jet Fusion 580 Color,
+3D Systems ProJet CJP: a colour file (3MF, OBJ, VRML or PLY), or a **general colour file** for any other printer.
+Resin — tidy the colours in 02 to plan the paint job, and keep a general colour file open beside you while you paint.*
+
+## 저장 / Saving
+
+- 작업은 **자동 저장**돼요. 공개 사이트에서는 그 브라우저 안에, 내 컴퓨터에서 실행 파일로 켜면 `rodin-pipeline/user-data/` 폴더에.
+- **파일로 저장**을 누르면 모델 · 색 · 자르기 · 설정이 `.gyuroma` 파일 하나에 담겨요.
+  어느 컴퓨터, 어느 브라우저에서든 01 불러오기 칸에 넣으면 그대로 열려요.
+- 설정만 따로 남길 땐 ⚙ 설정 › **설정 저장**(JSON).
+
+*Work saves automatically — in the browser on the public site, in `rodin-pipeline/user-data/` when run locally.
+**Save to file** keeps model, colours, cuts and settings in one `.gyuroma` file: drop it into 01 Load on any computer, in
+any browser. Settings alone: ⚙ Settings › Save settings (JSON).*
+
+오른쪽 위 ⚙ 설정에서 **English / 한국어**를 바꿀 수 있어요. *Switch between English and Korean in ⚙ Settings, top right.*
 
 ## 내 컴퓨터에서 실행 / Run it locally
 
