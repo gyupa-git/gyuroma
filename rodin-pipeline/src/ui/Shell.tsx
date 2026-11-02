@@ -211,7 +211,7 @@ function welcomeTiming(tagline: string, about: string, written = false) {
  * already written in rainbow, standing still while `held`; then the snap,
  * the white and the burst play.
  */
-export function Welcome({ hint, still = false, written = false, held = false, action }: { hint?: string; still?: boolean; written?: boolean; held?: boolean; action?: ReactNode }) {
+export function Welcome({ hint, what, still = false, written = false, held = false, action }: { hint?: string; what?: string; still?: boolean; written?: boolean; held?: boolean; action?: ReactNode }) {
   const t = useT();
   const tagline = t("brand.tagline");
   const about = t("brand.about");
@@ -225,6 +225,11 @@ export function Welcome({ hint, still = false, written = false, held = false, ac
       </div>
       <Writing className="welcome-tagline" text={tagline} start={taglineStart} step={taglineStep} snap={snap} beat={beat} settle={settle} sparks={3} seed={7} />
       <Writing className="welcome-about" text={about} start={aboutStart} step={aboutStep} snap={snap} beat={beat} settle={settle} sparks={1} seed={11} />
+      {what && (
+        <div className="welcome-hint welcome-what" style={{ "--rise": `${settle + 400}ms` } as CSSProperties}>
+          {what}
+        </div>
+      )}
       {hint && (
         <div className="welcome-hint" style={{ "--rise": `${settle + 500}ms` } as CSSProperties}>
           {hint}

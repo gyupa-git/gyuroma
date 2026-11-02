@@ -142,7 +142,8 @@ import { Brand, Glossary, Icon, Intro, Menu, Segmented, StepNav, Welcome, suppor
 import { ColourSelect } from "./ui/ColourSelect";
 import { ColourPicker } from "./ui/ColourPicker";
 import { GatherDialog } from "./ui/GatherDialog";
-import { GuideTour } from "./ui/GuideTour";
+import { GuideTour, type GuideMode } from "./ui/GuideTour";
+import { dueHint, markHintsSeen } from "./guide";
 import { GyupaFaceIcon } from "./ui/GuideGyupa";
 import { countAction } from "./engine/counter";
 import { LangContext, loadStoredLang, storeLang, translate, type Lang, type Params, type Key } from "./i18n";
@@ -833,8 +834,8 @@ export default function App() {
   });
   /** 모아 뽑기 is open (it keeps its files while closed). */
   const [gatherOpen, setGatherOpen] = useState(false);
-  /** The app guide: Gyupa walking the screen (ui/GuideTour, the lines in guide.ts). */
-  const [guideOpen, setGuideOpen] = useState(false);
+  /** The app guide: Gyupa walking the screen (ui/GuideTour, the lines in guide.ts), or one first-time hint. */
+  const [guideMode, setGuideMode] = useState<GuideMode | null>(null);
   /** Which of the four steps is on screen (load · colours · filaments · export). */
   const [step, setStepState] = useState<number>(() => {
     try {
@@ -5591,6 +5592,19 @@ export default function App() {
   }
 
   const isBusy = busy !== null;
+  // First-time hints, each once in this browser: the order of the steps on the first visit, then a step's job
+  // the first time 02–04 opens.  Never over the intro, a dialog or work in progress; after that only the guide button.
+  useEffect(() => {
+    if (guideMode || intro || about || gatherOpen || isBusy) return;
+    const hint = dueHint(step);
+    if (hint === null) return;
+    const timer = window.setTimeout(() => {
+      // The step on screen at the welcome is not one being entered: its own hint is not owed.
+      markHintsSeen(hint === "welcome" ? ["welcome", step] : [hint]);
+      setGuideMode({ kind: "hint", hint });
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [step, guideMode, intro, about, gatherOpen, isBusy]);
   // While the app works the pointer is "working", not "not allowed" over the buttons it waits with.
   useEffect(() => {
     document.body.classList.toggle("is-busy", isBusy);
@@ -5654,9 +5668,10 @@ export default function App() {
           : (
             <Welcome
               hint={t("view.empty")}
+              what={t("brand.what")}
               still
               action={
-                <button type="button" className="guide-welcome" onClick={() => setGuideOpen(true)}>
+                <button type="button" className="guide-welcome" onClick={() => setGuideMode({ kind: "guide" })}>
                   <GyupaFaceIcon size={20} />
                   {t("guide.welcome")}
                 </button>
@@ -5893,7 +5908,7 @@ export default function App() {
             {future.length > 0 && <span className="step-count mono">{future.length}</span>}
           </button>
           <span className="top-sep" aria-hidden="true" />
-          <button type="button" className="guide-btn" data-guide="guide" title={t("guide.openHint")} onClick={() => setGuideOpen(true)}>
+          <button type="button" className="guide-btn" data-guide="guide" title={t("guide.openHint")} onClick={() => setGuideMode({ kind: "guide" })}>
             <GyupaFaceIcon size={18} />
             <span>{t("guide.open")}</span>
           </button>
@@ -6960,7 +6975,7 @@ export default function App() {
         </button>
       </footer>
       <GatherDialog open={gatherOpen} onClose={() => setGatherOpen(false)} />
-      <GuideTour open={guideOpen} onClose={() => setGuideOpen(false)} step={step} onStep={changeStep} />
+      <GuideTour mode={guideMode} onMode={setGuideMode} step={step} onStep={changeStep} />
       {intro && <Intro onDone={endIntro} hold={startupLoading} />}
       {about && <Intro onDone={endAbout} about={{ note: `${t("app.subtitle")} · ${t("top.version", { v: APP_VERSION })} · ${t("license.short")}` }} />}
     </div>

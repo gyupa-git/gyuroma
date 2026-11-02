@@ -1,7 +1,10 @@
 /**
  * The app guide: Gyupa walks the screen and explains it, chapter by chapter.
- * Each line says only what the app does (checked against its screens) — what
- * it does not do is said too, plainly.  Gyupa's voice is the channel's
+ * Each line says what the app does (checked against its screens) and only
+ * that: where a way is closed, the way that works is told instead (the
+ * owner: "되는 것만 말하면 되지").  The app is a colour tidier first (02),
+ * good for every kind of printer; the FDM steps (03, the slicer 3MF) come on
+ * top.  Gyupa's voice is the channel's
  * (AI공장/규파/목소리/persona.json): ~습니다 / ~죠 / ~네요, never ~잖아요.
  *
  * `at` lists where Gyupa walks to, first found wins: a CSS selector, or
@@ -35,6 +38,45 @@ const GUIDE_BUTTON = ["[data-guide=guide]"];
 const PRINTER = [".printer-select@.pane-section", ".sidebar"];
 
 export const GUIDE: GuideChapter[] = [
+  {
+    id: "about",
+    icon: "help",
+    ko: "규로마가 하는 일",
+    en: "What GYUROMA does",
+    steps: [
+      {
+        pose: "salute",
+        ko: "규로마(GYUROMA)는 **[규]파의 크[로마]**, 규파의 색이라는 뜻이에요.",
+        en: "GYUROMA means **GYUpa's chROMA** — Gyupa's colours.",
+      },
+      {
+        at: [".stage"],
+        ko: "색칠된 3D 모델은 색이 아주 많고 경계도 들쭉날쭉하죠. 규로마는 그걸 **몇 가지 깔끔한 색**으로 정리하고 경계를 매끈하게 다듬어 줍니다.",
+        en: "A coloured 3D model comes with a great many colours and ragged borders. GYUROMA tidies them into **a few clean colours** with smooth borders.",
+      },
+      {
+        at: [".steps"],
+        ko: "그 중심이 **02 색 정리**예요. 정리한 색으로 **FDM 멀티컬러 파일**도, 풀컬러 · UV 프린터용 **색 파일**도 만들고, 레진이면 **칠할 색 계획**으로 쓰면 되죠.",
+        en: "Its heart is **02 Colours**. The tidied colours make an **FDM multi-colour file**, a **colour file** for full-colour and UV printers, or a **paint plan** for resin.",
+      },
+      {
+        at: [".steps"],
+        ko: "FDM이면 여기에 더해 꽂을 필라멘트와 섞는 비율을 정하고(03), 슬라이서에서 바로 여는 파일로 내보냅니다(04).",
+        en: "For FDM it goes further: which filaments to load and how to mix them (03), and a file that opens straight in your slicer (04).",
+      },
+      {
+        pose: "cheer",
+        ko: "모든 계산은 이 브라우저 안에서 끝나요. 넣은 파일은 내 컴퓨터에만 있고, 무료로 쓰고 고칠 수 있습니다.",
+        en: "Everything runs right here in your browser; your files stay on your computer. It's free to use and to modify.",
+      },
+      {
+        at: GUIDE_BUTTON,
+        pose: "wave",
+        ko: "자, 이제 직접 해 볼 차례예요. 막히면 언제든 **앱 가이드**로 불러 주세요.",
+        en: "Now it's your turn. If you get stuck, call me with **App guide** anytime.",
+      },
+    ],
+  },
   {
     id: "tour",
     icon: "select",
@@ -102,7 +144,7 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 3,
         at: [".matrix", ".stage"],
-        ko: "꽂은 색으로 바로 안 되는 색은 필라멘트를 **층마다 번갈아 쌓아서** 만들어요. 표에서 줄을 누르면 오른쪽에서 그 색의 레시피를 고칠 수 있습니다.",
+        ko: "꽂지 않은 색은 필라멘트를 **층마다 번갈아 쌓아서** 만들어요. 표에서 줄을 누르면 오른쪽에서 그 색의 레시피를 고칠 수 있습니다.",
         en: "Colours you haven't loaded are made by **alternating filaments layer by layer**. Click a row in this table to adjust that colour's recipe on the right.",
       },
       {
@@ -157,8 +199,8 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 4,
         at: PRINTER,
-        ko: "**크리얼리티 · 엘레구 · 애니큐빅 · QIDI · 스냅메이커 · 플래시포지**의 오르카 계열 슬라이서는 층 섞기가 없어요. 이 프린터를 고르면 앱이 알아서 **실물 색만** 쓰도록 맞춰 줍니다.",
-        en: "**Creality, Elegoo, Anycubic, QIDI, Snapmaker and Flashforge** use OrcaSlicer-family slicers with no layer mixing. Pick one of them and the app switches to **loaded colours only** for you.",
+        ko: "**크리얼리티 · 엘레구 · 애니큐빅 · QIDI · 스냅메이커 · 플래시포지**는 고르기만 하면, 꽂은 색 그대로(**실물 색만**) 뽑도록 앱이 알아서 맞춰 줍니다.",
+        en: "**Creality, Elegoo, Anycubic, QIDI, Snapmaker and Flashforge**: just pick yours and the app sets itself to print the loaded colours as they are (**loaded colours only**).",
       },
       {
         step: 4,
@@ -169,14 +211,14 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 2,
         at: [".view-tools", ".stage"],
-        pose: "think",
-        ko: "**한 가지 색으로 뽑는 레진 프린터**용 출력 파일은 규로마가 따로 만들지 않아요. 대신 칠할 계획 세우기에 좋습니다. 02에서 색 수를 줄이고, 조각을 골라 **솔로 · 엑스레이**로 보면 칠할 색과 순서가 정해지죠.",
-        en: "For **single-colour resin printers** GYUROMA doesn't write a print file. It's handy for planning the paint job, though: cut the colours down in 02, pick a part and look at it with **Solo and X-ray** to settle your paint colours and order.",
+        ko: "**레진**이면 02 색 정리까지만 해도 충분해요. 어지러운 색이 몇 가지 깔끔한 색으로 정리되니 칠할 색과 순서를 정하기 좋고, 조각을 골라 **솔로 · 엑스레이**로 부위마다 볼 수 있죠.",
+        en: "Printing in **resin**? 02 Colours is all you need. With the colours tidied into a few clean ones, choosing paints and their order is easy — pick a part and look at it with **Solo and X-ray**.",
       },
       {
-        pose: "think",
-        ko: "물건 겉에 그림을 찍는 **UV 평판 프린터**용 그림 파일도 아직은 없어요. 지금 규로마의 UV는 미마키처럼 3D로 쌓는 UV 잉크젯 프린터 쪽입니다.",
-        en: "Printing pictures onto objects with a **flatbed UV printer** isn't supported yet. The UV in GYUROMA today is UV-inkjet 3D printing, like Mimaki's.",
+        step: 4,
+        at: PRINTER,
+        ko: "정리한 색을 파일로 갖고 싶으면 04에서 **다른 풀컬러 프린터 · 범용 색 파일**을 골라 주세요. 3MF · OBJ · VRML · PLY로 나가니, 칠할 때 옆에 띄워 두거나 색이 든 3D 파일을 받는 **UV 프린터**에 넣으면 되죠.",
+        en: "Want the tidied colours as a file? In 04 choose **Other full-colour printer · general colour file**. It comes out as 3MF, OBJ, VRML or PLY — keep it open beside you while you paint, or load it into a **UV printer** that takes coloured 3D files.",
       },
       {
         step: 1,
@@ -211,8 +253,8 @@ export const GUIDE: GuideChapter[] = [
       {
         at: [".file-chip .save-file", ".save-work", ".dropzone", ".sidebar"],
         step: 1,
-        ko: "다만 브라우저 저장은 사이트 데이터를 지우거나 다른 브라우저에서 열면 없어요. 그래서 **파일로 저장**을 눌러 **.gyuroma 작업 파일**로 남겨 두세요. 모델 · 색 · 자르기 · 설정이 파일 하나에 다 들어갑니다.",
-        en: "Browser storage is gone if you clear the site's data or open another browser. So press **Save to file** and keep a **.gyuroma work file** — model, colours, cuts and settings, all in one file.",
+        ko: "브라우저 저장은 그 브라우저 안에 있어요. **파일로 저장**을 눌러 **.gyuroma 작업 파일**로 남겨 두면 어디서든 열 수 있죠. 모델 · 색 · 자르기 · 설정이 파일 하나에 다 들어갑니다.",
+        en: "Browser storage lives in that browser. Press **Save to file** and keep a **.gyuroma work file** to open it anywhere — model, colours, cuts and settings, all in one file.",
       },
       {
         step: 1,
@@ -250,38 +292,65 @@ export const GUIDE: GuideChapter[] = [
       },
     ],
   },
-  {
-    id: "about",
-    icon: "help",
-    ko: "규로마가 하는 일",
-    en: "What GYUROMA does",
-    steps: [
-      {
-        pose: "salute",
-        ko: "규로마(GYUROMA)는 **[규]파의 크[로마]**, 규파의 색이라는 뜻이에요.",
-        en: "GYUROMA means **GYUpa's chROMA** — Gyupa's colours.",
-      },
-      {
-        at: [".stage"],
-        ko: "AI로 만든 3D 모델은 색이 너무 많아서 그대로는 프린터로 못 뽑죠. 규로마는 그걸 **프린터가 낼 수 있는 몇 가지 색**으로 정리해 줍니다.",
-        en: "AI-made 3D models come with far too many colours to print as they are. GYUROMA sorts them into **the few colours your printer can make**.",
-      },
-      {
-        at: [".steps"],
-        ko: "색을 합치고 경계를 매끈하게 다듬고(02), 꽂을 필라멘트와 섞는 비율을 정해서(03), 슬라이서에서 바로 열리는 파일로 내보내죠(04).",
-        en: "It merges colours and smooths borders (02), works out which filaments to load and how to mix them (03), and exports a file that opens straight in your slicer (04).",
-      },
-      {
-        pose: "cheer",
-        ko: "모든 계산은 이 브라우저 안에서 끝나고, 넣은 파일은 어디로도 올라가지 않아요. 무료로 쓰고 고칠 수 있습니다.",
-        en: "Everything runs right here in your browser — your files are never uploaded anywhere. It's free to use and to modify.",
-      },
-      {
-        at: GUIDE_BUTTON,
-        pose: "wave",
-        ko: "자, 이제 직접 해 볼 차례예요. 막히면 언제든 **앱 가이드**로 불러 주세요.",
-        en: "Now it's your turn. If you get stuck, call me with **App guide** anytime.",
-      },
-    ],
-  },
 ];
+
+/**
+ * First-time hints, each shown once in this browser (remembered in
+ * localStorage), never again after — then only the guide button opens the
+ * guide: the order of the steps on the first visit, and what a step is for
+ * (and which comes next) the first time 02, 03 or 04 opens.  Taking the tour
+ * counts as having seen the step hints.
+ */
+export type GuideHintKey = "welcome" | 2 | 3 | 4;
+
+export const HINTS: Record<GuideHintKey, GuideStep> = {
+  welcome: {
+    at: [".steps"],
+    ko: "어서와요! 규로마는 색칠된 3D 모델의 어지러운 색을 **몇 가지 깔끔한 색**으로 정리해 주는 앱이에요. 작업은 **01 불러오기 → 02 색 정리 → 03 필라멘트·혼합 → 04 내보내기** 순서로 가고, 03은 FDM일 때 쓰죠. 처음이면 한 바퀴 둘러보기부터 보셔도 좋습니다.",
+    en: "Welcome! GYUROMA tidies a coloured 3D model's messy colours into **a few clean ones**. Work goes **01 Load → 02 Colours → 03 Filament & mix → 04 Export**; 03 is for FDM. First time? The tour shows you round.",
+  },
+  2: {
+    at: [".inspector", ".sidebar"],
+    ko: "02 색 정리예요. 오른쪽 **색 띠**나 왼쪽 **자동 정돈**으로 색을 정리하고, 마음에 들면 **정리 실행**을 눌러 주세요. 다 됐으면 FDM은 **03 필라멘트·혼합**으로, 다른 프린터는 **04 내보내기**로 가요.",
+    en: "This is 02 Colours. Tidy the colours with the **colour strip** on the right or an **auto tidy** preset on the left, then press **Clean up**. Then go on to **03 Filament & mix** for FDM, or straight to **04 Export** for other printers.",
+  },
+  3: {
+    at: [".sidebar"],
+    ko: "03에서는 프린터에 꽂을 **필라멘트**를 정합니다. 꽂지 않은 색은 층을 섞어서 만들어 주죠. 정해졌으면 **04 내보내기**로 가요.",
+    en: "In 03 you choose the **filaments** to load; colours you haven't loaded are mixed layer by layer. Once that's settled, go on to **04 Export**.",
+  },
+  4: {
+    at: PRINTER,
+    ko: "마지막 04예요. **프린터**를 고르고, 검사가 다 통과하면 내보내기를 눌러 주세요. 설명이 다시 필요하면 위의 **앱 가이드**를 누르시면 됩니다.",
+    en: "Last, 04. Choose your **printer**, and when every check passes, export. Need the explanations again? Press **App guide** up top.",
+  },
+};
+
+const SEEN_KEY = "rodin-pipeline-guide-seen";
+
+function seenHints(): Array<GuideHintKey> {
+  try {
+    const value: unknown = JSON.parse(window.localStorage.getItem(SEEN_KEY) ?? "[]");
+    return Array.isArray(value) ? (value as Array<GuideHintKey>) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function markHintsSeen(keys: Array<GuideHintKey | number>): void {
+  const seen = new Set<GuideHintKey | number>(seenHints());
+  for (const key of keys) seen.add(key);
+  try {
+    window.localStorage.setItem(SEEN_KEY, JSON.stringify([...seen]));
+  } catch {
+    // ignore: without storage a hint may come again
+  }
+}
+
+/** The hint due now, if any: the welcome first, then the open step's (02–04) first visit. */
+export function dueHint(step: number): GuideHintKey | null {
+  const seen = seenHints();
+  if (!seen.includes("welcome")) return "welcome";
+  if ((step === 2 || step === 3 || step === 4) && !seen.includes(step)) return step;
+  return null;
+}

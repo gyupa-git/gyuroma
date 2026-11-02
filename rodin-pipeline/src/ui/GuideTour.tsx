@@ -1,5 +1,5 @@
 import { Fragment, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { GUIDE, type GuidePose, type GuideStep } from "../guide";
+import { GUIDE, HINTS, markHintsSeen, type GuideHintKey, type GuidePose, type GuideStep } from "../guide";
 import { LangContext } from "../i18n";
 import { GuideGyupa, VIEW } from "./GuideGyupa";
 import { Icon } from "./Shell";
@@ -9,8 +9,11 @@ import { Icon } from "./Shell";
  * Gyupa walks over to it, points with the pen and says what it is.  Chapters
  * come from guide.ts; a chapter can open an app step (01–04) before Gyupa
  * walks.  While the guide is open the app underneath takes no clicks or keys;
- * closing it brings back the step that was open before.
+ * closing it brings back the step that was open before.  A first-time hint
+ * (guide.ts HINTS) is one bubble of the same, and can hand over to the guide.
  */
+
+export type GuideMode = { kind: "guide"; chapter?: number } | { kind: "hint"; hint: GuideHintKey };
 
 interface Box {
   x: number;
@@ -19,7 +22,7 @@ interface Box {
   h: number;
 }
 
-type Phase = { kind: "menu" } | { kind: "chapter"; chapter: number; index: number } | { kind: "end"; chapter: number };
+type Phase = { kind: "menu" } | { kind: "chapter"; chapter: number; index: number } | { kind: "end"; chapter: number } | { kind: "hint"; hint: GuideHintKey };
 
 interface Placement {
   gyupa: { x: number; y: number };
@@ -33,6 +36,8 @@ interface Placement {
 }
 
 const MARGIN = 10;
+/** The tour's place in the guide's contents (the welcome hint offers it). */
+const TOUR = GUIDE.findIndex((chapter) => chapter.id === "tour");
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 const reducedMotion = () => typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
@@ -138,7 +143,8 @@ function rich(text: string): ReactNode {
   return text.split(/(\*\*[^*]+\*\*)/).map((part, i) => (part.startsWith("**") ? <b key={i}>{part.slice(2, -2)}</b> : <Fragment key={i}>{part}</Fragment>));
 }
 
-export function GuideTour({ open, onClose, step, onStep }: { open: boolean; onClose: () => void; step: number; onStep: (step: number) => void }) {
+export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | null; onMode: (mode: GuideMode | null) => void; step: number; onStep: (step: number) => void }) {
+  const open = mode !== null;
   const { lang, t } = useContext(LangContext);
   const [phase, setPhase] = useState<Phase>({ kind: "menu" });
   const [shown, setShown] = useState<Placement | null>(null);
@@ -159,13 +165,22 @@ export function GuideTour({ open, onClose, step, onStep }: { open: boolean; onCl
   const gw = Math.round((gh * VIEW.w) / VIEW.h);
   const bw = Math.min(360, size.w - 2 * MARGIN);
 
-  const current: GuideStep | null = phase.kind === "chapter" ? GUIDE[phase.chapter].steps[phase.index] : null;
+  const current: GuideStep | null = phase.kind === "chapter" ? GUIDE[phase.chapter].steps[phase.index] : phase.kind === "hint" ? HINTS[phase.hint] : null;
   const pose: GuidePose = phase.kind === "menu" ? "salute" : phase.kind === "end" ? "cheer" : current?.pose ?? (current?.at ? "point" : "idle");
 
+  const modeRef = useRef<GuideMode | null>(null);
   useEffect(() => {
-    if (!open) return;
-    startStepRef.current = stepRef.current;
-    setPhase({ kind: "menu" });
+    const before = modeRef.current;
+    modeRef.current = mode;
+    if (!mode) return;
+    // The step to come back to: the one open when the guide (not a hint) began.  Whoever opens
+    // the guide has found it: the welcome hint (and the hint for the step on screen) is not owed.
+    if (mode.kind === "guide" && before?.kind !== "guide") {
+      startStepRef.current = stepRef.current;
+      markHintsSeen(["welcome", stepRef.current]);
+    }
+    setPhase(mode.kind === "hint" ? { kind: "hint", hint: mode.hint } : mode.chapter !== undefined ? { kind: "chapter", chapter: mode.chapter, index: 0 } : { kind: "menu" });
+    if (before) return;
     setShown(null);
     setTalking(false);
     // Gyupa walks in from the right, over the floor of the window.
@@ -173,7 +188,12 @@ export function GuideTour({ open, onClose, step, onStep }: { open: boolean; onCl
     gyupaRef.current = start;
     setGyupaAt({ ...start, ms: 0 });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [mode]);
+
+  // The tour shows every step: their first-time hints have nothing more to say.
+  useEffect(() => {
+    if (phase.kind === "chapter" && GUIDE[phase.chapter].id === "tour") markHintsSeen([2, 3, 4]);
+  }, [phase]);
 
   useEffect(() => {
     if (!open) return;
@@ -184,8 +204,8 @@ export function GuideTour({ open, onClose, step, onStep }: { open: boolean; onCl
 
   const close = () => {
     runRef.current++;
-    if (stepRef.current !== startStepRef.current) onStep(startStepRef.current);
-    onClose();
+    if (mode?.kind === "guide" && stepRef.current !== startStepRef.current) onStep(startStepRef.current);
+    onMode(null);
   };
 
   // Each new line (or menu): open its app step, find the part, place, walk, then talk.
@@ -285,7 +305,35 @@ export function GuideTour({ open, onClose, step, onStep }: { open: boolean; onCl
   );
 
   let body: ReactNode;
-  if (phase.kind === "menu" || phase.kind === "end") {
+  if (phase.kind === "hint") {
+    const line = HINTS[phase.hint];
+    body = (
+      <>
+        <p className="guide-text">{rich(say(line.ko, line.en))}</p>
+        <div className="guide-actions">
+          {phase.hint === "welcome" ? (
+            <>
+              <button type="button" className="btn small" onClick={close}>
+                {t("guide.hintSelf")}
+              </button>
+              <button type="button" className="btn small primary" ref={primaryRef} onClick={() => onMode({ kind: "guide", chapter: TOUR })}>
+                {say(GUIDE[TOUR].ko, GUIDE[TOUR].en)}
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" className="btn small" onClick={() => onMode({ kind: "guide" })}>
+                {t("guide.hintAll")}
+              </button>
+              <button type="button" className="btn small primary" ref={primaryRef} onClick={close}>
+                {t("guide.hintOk")}
+              </button>
+            </>
+          )}
+        </div>
+      </>
+    );
+  } else if (phase.kind === "menu" || phase.kind === "end") {
     body = (
       <>
         <p className="guide-text">{phase.kind === "menu" ? t("guide.hello") : t("guide.more")}</p>
