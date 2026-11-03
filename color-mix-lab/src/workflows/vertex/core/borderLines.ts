@@ -53,6 +53,15 @@ export interface BorderLineOptions {
    * after all.  The cut asks for this; a tidy leaves confirmed borders as they are.
    */
   reopenRough?: boolean;
+  /**
+   * With `reopenRough`: 1 for faces a cut made (pieces).  A settled point on
+   * an edge beside one is on the cut line itself: it is never drawn afresh —
+   * only a stretch the cut left as it was (teeth held back) is.  Without it
+   * every rough settled stretch is reopened, and a line once cut, measured
+   * again against its own now-shorter edges, came out "rough" every time
+   * (11-03: confirm after confirm found more to cut, never nothing).
+   */
+  cutFaces?: ArrayLike<number>;
 }
 
 /** Below this, the edges walked around a point (their directions summed, over their length) turn back on themselves. */
@@ -362,6 +371,15 @@ export function traceBorderLine(
   // arc cannot tell its curve from teeth (opened, a spot's rim threw crumbs).
   const opened = new Uint8Array(count);
   if (options.reopenRough && settled) {
+    // On the cut line itself (a border edge with a piece a cut made on either side): final.
+    const cutFaces = options.cutFaces;
+    const onCut = new Uint8Array(count);
+    if (cutFaces)
+      for (let e = 0; e < edgeCount; e++)
+        if (cutFaces[eFace[e]] || cutFaces[eAcross[e]]) {
+          onCut[slotA[e]] = 1;
+          onCut[slotB[e]] = 1;
+        }
     const longEnough = new Uint8Array(count);
     {
       const seen = new Uint8Array(count);
@@ -393,7 +411,7 @@ export function traceBorderLine(
     const settledPull = new Float64Array(count);
     const told = new Uint8Array(count);
     for (let s = 0; s < count; s++) {
-      if (!longEnough[s]) continue;
+      if (!longEnough[s] || onCut[s]) continue;
       walk(s, settledPoint);
       const a = acrossAt(s);
       if (a) {

@@ -495,14 +495,20 @@ table.grid td .colour-select-trigger { min-width: 140px; }
 .colour-picker-trigger:hover, .colour-picker-trigger.open { border-color: var(--border-strong); background: var(--raised); }
 .colour-picker-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
 .colour-picker-trigger.slot-colour { padding: 1px; }
+.colour-picker-popover:focus { outline: none; }
 .colour-picker-popover { position: fixed; z-index: 1000; width: 250px; background: var(--chrome); border: 1px solid var(--border-strong); border-radius: 9px; box-shadow: var(--shadow); padding: 8px; display: grid; gap: 8px; color: var(--text); }
 .cp-sv { position: relative; height: 140px; border-radius: 6px; cursor: crosshair; touch-action: none; background-image: linear-gradient(to top, #000, rgba(0, 0, 0, 0)), linear-gradient(to right, #fff, rgba(255, 255, 255, 0)); }
 .cp-sv-marker { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6); pointer-events: none; }
-.cp-hue { -webkit-appearance: none; appearance: none; width: 100%; height: 12px; border-radius: 6px; background: linear-gradient(to right, #f00 0%, #ff0 17%, #0f0 33%, #0ff 50%, #00f 67%, #f0f 83%, #f00 100%); outline: none; margin: 0; }
-.cp-hue::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #fff; border: 2px solid #141415; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3); cursor: pointer; }
-.cp-hue::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 2px solid #141415; cursor: pointer; }
+/* The hue bar: its own rainbow, whatever the bars around it give their inputs (`.stage input` painted it plain, 11-03). */
+.colour-picker-popover input.cp-hue { -webkit-appearance: none; appearance: none; width: 100%; height: 12px; padding: 0; border: 0; border-radius: 6px; background: linear-gradient(to right, #f00 0%, #ff0 17%, #0f0 33%, #0ff 50%, #00f 67%, #f0f 83%, #f00 100%); outline: none; margin: 0; }
+.colour-picker-popover input.cp-hue::-webkit-slider-runnable-track { height: 12px; background: transparent; border: 0; }
+.colour-picker-popover input.cp-hue::-moz-range-track { height: 12px; background: transparent; border: 0; }
+.colour-picker-popover input.cp-hue::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; margin-top: -2px; border-radius: 50%; background: #fff; border: 2px solid #141415; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3); cursor: pointer; }
+.colour-picker-popover input.cp-hue::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 2px solid #141415; cursor: pointer; }
 .cp-row { display: flex; align-items: center; gap: 6px; }
-.cp-preview { display: inline-flex; }
+/* The colour as it is (left) and the colour being chosen (right), one swatch in two halves. */
+.cp-split { display: inline-grid; grid-template-columns: 1fr 1fr; width: 48px; height: 24px; border-radius: 5px; overflow: hidden; border: 1px solid var(--border-strong); flex: none; }
+.cp-split span { display: block; }
 .cp-hex { display: flex; align-items: center; gap: 4px; flex: 1; }
 .cp-hex span, .cp-rgb span { color: var(--muted); font-size: 11px; }
 .cp-hex input { width: 100%; min-width: 0; text-transform: uppercase; }

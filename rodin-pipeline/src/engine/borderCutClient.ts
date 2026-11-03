@@ -9,7 +9,7 @@ import type { MeshModel } from "@core/types";
  */
 export type CutRequest =
   | { type: "model"; modelId: number; positions: Float64Array; corners: Int32Array }
-  | { type: "cut"; id: number; modelId: number; groups: Int32Array; protectedGroup: Uint8Array; span: number; settled?: Int32Array };
+  | { type: "cut"; id: number; modelId: number; groups: Int32Array; protectedGroup: Uint8Array; span: number; settled?: Int32Array; cutFaces?: Uint8Array };
 
 export type CutReply = { id: number; cut: BorderCut } | { id: number; error: string };
 
@@ -60,9 +60,19 @@ function sendNext(): void {
 /**
  * The faces of `model` cut along the borders between `groups` (one per face).
  * `settled`: each face's group when the model was last cut (confirmed) — a
- * border then is the line already and is not cut again.
+ * border then is the line already and is not cut again.  `cutFaces`: 1 for
+ * the faces the confirmed cuts made — the cut line itself, final (only teeth
+ * a cut left as they were are drawn afresh).
  */
-export function cutBorders(model: MeshModel, groups: Int32Array, protectedGroup: Uint8Array, span: number, settled?: Int32Array, asker: CutAsker = "preview"): Promise<BorderCut> {
+export function cutBorders(
+  model: MeshModel,
+  groups: Int32Array,
+  protectedGroup: Uint8Array,
+  span: number,
+  settled?: Int32Array,
+  asker: CutAsker = "preview",
+  cutFaces?: Uint8Array,
+): Promise<BorderCut> {
   const w = ensureWorker();
   if (!sentModel || sentModel.triangles !== model.triangles) {
     const positions = new Float64Array(model.vertices.length * 3);
@@ -72,7 +82,7 @@ export function cutBorders(model: MeshModel, groups: Int32Array, protectedGroup:
     sentModel = { triangles: model.triangles, id: nextModelId++ };
     w.postMessage({ type: "model", modelId: sentModel.id, positions, corners } satisfies CutRequest, [positions.buffer, corners.buffer]);
   }
-  const request: Pending["request"] = { type: "cut", id: nextId++, modelId: sentModel.id, groups: groups.slice(), protectedGroup: protectedGroup.slice(), span, settled };
+  const request: Pending["request"] = { type: "cut", id: nextId++, modelId: sentModel.id, groups: groups.slice(), protectedGroup: protectedGroup.slice(), span, settled, cutFaces };
   return new Promise<BorderCut>((resolve, reject) => {
     waiting.get(asker)?.reject(new CutSuperseded());
     waiting.set(asker, { request, resolve, reject });

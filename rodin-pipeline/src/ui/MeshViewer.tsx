@@ -2366,6 +2366,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     trimOverlayShapes(state, SPARE_OVERLAY_BYTES);
     requestRender(state);
     if (added && state.overlays.some((o) => o.pulse)) startPulse(state);
+    // What is drawn, for a headless check (as dataset.pointerMark is).
+    state.renderer.domElement.dataset.overlays = state.overlays.map((o) => `${o.source.id}:${o.fillMaterial.opacity.toFixed(2)}`).join(" ");
   }, [overlays]);
 
   // View changes.

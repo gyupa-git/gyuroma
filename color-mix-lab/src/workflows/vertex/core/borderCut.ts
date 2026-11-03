@@ -41,6 +41,12 @@ export interface BorderCut {
   pieceFaces: Int32Array;
   /** The original faces the pieces replace, ascending. */
   replaced: Int32Array;
+  /**
+   * Set when every border was settled already (nothing repainted since the
+   * last confirm): what is cut is only teeth a confirmed cut left, trimmed —
+   * the confirmed line itself stays (see borderLines `cutFaces`).
+   */
+  trim?: boolean;
 }
 
 const EMPTY: BorderCut = {
@@ -318,11 +324,14 @@ export function cutAlongBorderLines(
   const todo: number[] = [];
   // From the border faces — only those on a border that is not settled, when some are.
   const seed = settled ? new Uint8Array(faceCount) : borderFace;
+  /** Border edges that were no border when the mesh was last cut (repainted since). */
+  let fresh = 0;
   if (settled)
     for (let e = 0; e < edgeCount; e++)
       if (!edgeSettled(e)) {
         seed[eFace[e]] = 1;
         seed[eAcross[e]] = 1;
+        if (settled[eFace[e]] === settled[eAcross[e]]) fresh++;
       }
   for (let f = 0; f < faceCount; f++)
     if (seed[f]) {
@@ -539,6 +548,7 @@ export function cutAlongBorderLines(
     pieceGroups: Int32Array.from(pieceGroups),
     pieceFaces: Int32Array.from(pieceFaces),
     replaced: Int32Array.from(order.map((i) => replaced[i])),
+    ...(settled && fresh === 0 && replaced.length > 0 ? { trim: true } : {}),
   };
 }
 

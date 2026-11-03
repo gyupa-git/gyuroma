@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { Swatch } from "./common";
 
@@ -75,6 +75,16 @@ export interface ColourPickerProps {
    * second.
    */
   settle?: boolean;
+  /**
+   * The colour this one would replace (a picked piece's own colour), shown on the
+   * left half of the split swatch next to the colour being chosen; `value` when omitted.
+   */
+  before?: string;
+  /**
+   * Commit mode: the colour as it is being chosen (every change), and null when the
+   * popover closes — for a live look at it on the model that goes back on cancel.
+   */
+  onDraft?: (hex: string | null) => void;
   disabled?: boolean;
   title?: string;
   /** Trigger content; defaults to a swatch plus the hex code. */
@@ -83,7 +93,7 @@ export interface ColourPickerProps {
   className?: string;
 }
 
-export function ColourPicker({ value, onChange, commit = false, settle = false, disabled, title, children, size = 18, className }: ColourPickerProps) {
+export function ColourPicker({ value, onChange, commit = false, settle = false, before, onDraft, disabled, title, children, size = 18, className }: ColourPickerProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -110,11 +120,14 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
       setDraft(hex);
       setHexText(hex);
       setHsv(nextHsv ?? hexToHsv(hex));
-      if (commit) return;
+      if (commit) {
+        onDraft?.(hex);
+        return;
+      }
       if (settle && draggingRef.current) heldRef.current = hex;
       else onChange(hex);
     },
-    [commit, settle, onChange],
+    [commit, settle, onChange, onDraft],
   );
 
   // A pointer released outside the control still ends the drag.
@@ -142,7 +155,9 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
   const close = useCallback(() => {
     if (heldRef.current !== null) flushHeld();
     setOpen(false);
-  }, [flushHeld]);
+    // Closed without Apply (or after it): the model shows its own colours again.
+    if (commit) onDraft?.(null);
+  }, [flushHeld, commit, onDraft]);
 
   const updatePlacement = useCallback(() => {
     const trigger = triggerRef.current;
@@ -160,7 +175,10 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
   }, []);
 
   useLayoutEffect(() => {
-    if (open) updatePlacement();
+    if (!open) return;
+    updatePlacement();
+    // The popover holds the focus while it is open, so Enter applies here (not the bar's own Enter behind it).
+    popoverRef.current?.focus({ preventScroll: true });
   }, [open, updatePlacement]);
 
   useEffect(() => {
@@ -229,6 +247,15 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
     onChange(draft);
     close();
   };
+  /** Nothing would change: the colour chosen is the one it would replace. */
+  const unchanged = draft === (before ?? value);
+  // Enter anywhere in the popover applies (the HEX field commits its text first, below).
+  const onPopoverKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!commit || event.key !== "Enter" || event.isDefaultPrevented()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    apply();
+  };
 
   const hueColour = hsvToHex(hsv[0], 1, 1);
   const marker: CSSProperties = { left: `${hsv[1] * 100}%`, top: `${(1 - hsv[2]) * 100}%` };
@@ -251,7 +278,7 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
         )}
       </button>
       {open && (
-        <div ref={popoverRef} className="colour-picker-popover" style={style} role="dialog">
+        <div ref={popoverRef} className="colour-picker-popover" style={style} role="dialog" tabIndex={-1} onKeyDown={onPopoverKeyDown}>
           <div
             ref={svRef}
             className="cp-sv"
@@ -274,11 +301,10 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
             aria-label="hue"
           />
           <div className="cp-row">
-            <span className="cp-preview" title={t("picker.before")}>
-              <Swatch hex={value} size={22} />
-            </span>
-            <span className="cp-preview" title={t("picker.after")}>
-              <Swatch hex={draft} size={22} />
+            {/* One swatch in two halves: the colour as it is on the left, the colour being chosen on the right. */}
+            <span className="cp-split" title={`${t("picker.before")} ${before ?? value} → ${t("picker.after")} ${draft}`}>
+              <span style={{ background: before ?? value }} />
+              <span style={{ background: draft }} />
             </span>
             <label className="cp-hex">
               <span>{t("picker.hex")}</span>
@@ -291,13 +317,16 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
                 onKeyDown={(e) => {
                   if (e.key === "Enter") {
                     e.preventDefault();
+                    e.stopPropagation();
                     const hex = normaliseHex(hexText);
-                    if (hex) {
-                      setColour(hex);
-                      if (commit) {
-                        onChange(hex);
-                        close();
-                      }
+                    if (!hex) {
+                      setHexText(draft);
+                      return;
+                    }
+                    setColour(hex);
+                    if (commit) {
+                      onChange(hex);
+                      close();
                     }
                   }
                 }}
@@ -329,7 +358,7 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
               <button type="button" className="btn small" onClick={close}>
                 {t("picker.cancel")}
               </button>
-              <button type="button" className="btn primary small" disabled={draft === value} onClick={apply}>
+              <button type="button" className="btn primary small" disabled={unchanged} title={t("picker.applyHint")} onClick={apply}>
                 {t("picker.apply")}
               </button>
             </div>

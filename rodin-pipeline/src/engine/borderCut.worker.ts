@@ -34,6 +34,7 @@ self.onmessage = (event: MessageEvent<CutRequest>) => {
       span: request.span,
       protectedGroup: request.protectedGroup,
       settled: request.settled,
+      cutFaces: request.cutFaces,
     });
     reply({ id: request.id, cut }, [cut.addedVertices.buffer, cut.pieces.buffer, cut.pieceGroups.buffer, cut.pieceFaces.buffer, cut.replaced.buffer]);
   } catch (err) {

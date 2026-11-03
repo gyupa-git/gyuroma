@@ -841,6 +841,8 @@ export default function App() {
   shownHexRef.current = shownHex;
   const [pickTarget, setPickTarget] = useState("");
   const [pickCustom, setPickCustom] = useState("#FF0000");
+  /** The colour being chosen in the picker, laid over the selection meanwhile (null: the picker is closed). */
+  const [pickPreviewHex, setPickPreviewHex] = useState<string | null>(null);
   const hoverTimerRef = useRef<number | null>(null);
   const templateRestoredRef = useRef(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -909,6 +911,8 @@ export default function App() {
   const cutLogRef = useRef(new WeakMap<MeshModel["triangles"], StoredCut[]>());
   /** Each face's group colour right after its mesh was last cut (3 bytes a face, by the faces array). */
   const settledRef = useRef(new WeakMap<MeshModel["triangles"], Uint8Array>());
+  /** 1 for the faces the confirmed cuts made (pieces): the cut line itself, never drawn afresh (borderLines `cutFaces`). */
+  const cutFacesRef = useRef(new WeakMap<MeshModel["triangles"], Uint8Array>());
   const lastSavedCutsRef = useRef<StoredCut[] | null>(null);
   /** Autosaves go one after another (saveLineRef); only the newest waiting one runs (saveTicketRef). */
   const saveLineRef = useRef<Promise<void>>(Promise.resolve());
@@ -1844,9 +1848,10 @@ export default function App() {
     let alive = true;
     const shielded = protectedPositions();
     const settled = settledFaces(model);
+    const cutFaces = cutFacesRef.current.get(model.triangles);
     const colours = model.triangleColors;
     const timer = window.setTimeout(() => {
-      cutBorders(model, labels, shielded, cutSpan, settled)
+      cutBorders(model, labels, shielded, cutSpan, settled, "preview", cutFaces)
         .then((cut) => {
           const layer: CutLayer = { triangles: model.triangles, paletteKey, paletteHex: hexByPosition, labels, cut };
           cutByColours.current.set(colours, { layer, triangles: model.triangles, span: cutSpan, protectedKey });
@@ -2283,6 +2288,18 @@ export default function App() {
     return overlayFor("hoverPatch", hoverPatchMask, look);
   }, [hoverPatchMask, fillMode, brushHex, pickedMask, pickedOverlay, overlayFor]);
 
+  // The colour being chosen in the picker, laid over the selection as it would look
+  // (the shading shows through, as the fill tool's hover does); gone when the picker closes.
+  const pickPreviewOverlay = useMemo<HighlightOverlay | null>(() => {
+    if (!pickPreviewHex || !pickedMask) return null;
+    const look = { colour: pickPreviewHex, line: "#ffffff", rim: "#0d0d0e", opacity: 0.85, lineOpacity: 0.95, pulse: false };
+    if (pickedOverlay) {
+      const { fill, fillNormals, edges, edgeNormals, edgeInside } = pickedOverlay;
+      return { id: "pickPreview", ...look, fill, fillNormals, edges, edgeNormals, edgeInside };
+    }
+    return overlayFor("pickPreview", pickedMask, look);
+  }, [pickPreviewHex, pickedMask, pickedOverlay, overlayFor]);
+
   const pickedFaceCount = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.faces.length, 0), [pickedPatches]);
   const pickedFraction = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.fraction, 0), [pickedPatches]);
   const pickedHexes = useMemo(() => [...new Set(pickedPatches.map((patch) => patch.hex))], [pickedPatches]);
@@ -2299,8 +2316,8 @@ export default function App() {
   }, [pickedPatches, extruderInfoByIndex]);
 
   const overlays = useMemo(
-    () => [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay].filter((o): o is HighlightOverlay => o !== null),
-    [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay],
+    () => [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay].filter((o): o is HighlightOverlay => o !== null),
+    [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay],
   );
 
   function handleHover(hex: string | null): void {
@@ -3182,10 +3199,30 @@ export default function App() {
     return position !== undefined && palette[position] ? palette[position].rgb : hexToRgb(targetHex);
   }
 
-  function applyPickColour(): void {
+  /**
+   * How a colour the model does not have yet, put down by a fill or the brush,
+   * joins the palette: as a band of its own (pinned at its family's end under a
+   * group name of its own, as a piece split off is), so the model shows the colour
+   * chosen — not the band its lightness happens to fall in (11-03: a new tan went in
+   * as VE8).  Undefined for a colour the model has: it stays in its group.
+   */
+  function groupingForNew(hex: string): { also: Map<number, string>; pinned: { pins: number[][]; from: Record<string, number> | undefined } } | undefined {
+    const key = stripColourKey(hexToRgb(hex));
+    for (const group of committedGroups) if (group.colours.some((colour) => colour.key === key)) return undefined;
+    const pins = storedStrip?.pins ?? [];
+    if (pins.some((keys) => keys.includes(key))) return undefined;
+    return { also: new Map([[key, `new:${key}`]]), pinned: { pins: [...pins, [key]], from: storedStrip?.from } };
+  }
+
+  /** Fills the picked patches with the "change to" colour — or with `chosen` (the picker's Apply). */
+  function applyPickColour(chosen?: string): void {
     if (!model || pickedPatches.length === 0) return;
-    const targetHex = (pickTarget === "__new__" ? pickCustom : pickTarget).toUpperCase();
+    const targetHex = (chosen ?? (pickTarget === "__new__" ? pickCustom : pickTarget)).toUpperCase();
     if (!/^#[0-9A-F]{6}$/.test(targetHex)) return;
+    if (chosen !== undefined && pickedHexes.length === 1 && pickedHexes[0] === targetHex) {
+      setStatus(t("status.fillSame", { hex: targetHex }));
+      return;
+    }
     const rgb = fillRgb(model, targetHex);
     const next = model.triangleColors.slice();
     let count = 0;
@@ -3193,9 +3230,21 @@ export default function App() {
       for (let i = 0; i < patch.faces.length; i++) next[patch.faces[i]] = rgb;
       count += patch.faces.length;
     }
-    keepGroupsFor(model.triangleColors, next);
+    const grouping = groupingForNew(targetHex);
+    keepGroupsFor(model.triangleColors, next, grouping?.also, grouping?.pinned);
     applyColours(model, next);
     setStatus(t("status.recoloured", { n: count.toLocaleString(), hex: targetHex, patches: pickedPatches.length }));
+  }
+
+  /** The picker's Apply: the colour chosen becomes the "change to" colour (and, with a selection, fills it). */
+  function takePickedColour(hex: string, fill: boolean): void {
+    const chosen = hex.toUpperCase();
+    if (positionByHex.has(chosen)) setPickTarget(chosen);
+    else {
+      setPickCustom(chosen);
+      setPickTarget("__new__");
+    }
+    if (fill && pickedPatches.length > 0) applyPickColour(chosen);
   }
 
   /**
@@ -3430,7 +3479,8 @@ export default function App() {
       setStatus(t("status.fillSame", { hex: brushHex }));
       return;
     }
-    keepGroupsFor(model.triangleColors, next);
+    const grouping = groupingForNew(brushHex);
+    keepGroupsFor(model.triangleColors, next, grouping?.also, grouping?.pinned);
     applyColours(model, next, { keepSelection: !inSelection });
     setStatus(
       inSelection
@@ -3877,6 +3927,19 @@ export default function App() {
     const lastCut = log[log.length - 1];
     const settledBack = lastCut?.settled ? unpackRuns(lastCut.settled, base.triangles.length) : null;
     if (settledBack) settledRef.current.set(base.triangles, settledBack);
+    // Which faces the cuts made, replayed from the log (meshWithCut: a replaced face's
+    // number goes to its first piece, the other pieces follow at the end).
+    if (log.length > 0) {
+      let was: Uint8Array | null = null;
+      for (const entry of log) {
+        const next = new Uint8Array(entry.faces + entry.pieceGroups.length - entry.replaced.length);
+        if (was && was.length === entry.faces) next.set(was);
+        for (let i = 0; i < entry.replaced.length; i++) next[entry.replaced[i]] = 1;
+        next.fill(1, entry.faces);
+        was = next;
+      }
+      if (was && was.length === base.triangles.length) cutFacesRef.current.set(base.triangles, was);
+    }
     const colours =
       isStoredWorkColours(storedColours) && storedColours.faceCount === base.triangles.length
         ? unpackColours(storedColours.colours, storedColours.faceCount)
@@ -4248,7 +4311,8 @@ export default function App() {
       setStatus(t("status.brushNothing"));
       return;
     }
-    keepGroupsFor(current.triangleColors, stroke.working);
+    const grouping = groupingForNew(stroke.hex);
+    keepGroupsFor(current.triangleColors, stroke.working, grouping?.also, grouping?.pinned);
     // Only the painted faces changed: buffers, labels and map are patched for them (strokePatchRef).
     strokePatchRef.current = { from: current.triangleColors, to: stroke.working, faces: Int32Array.from(stroke.changed), rgb: stroke.rgb, exact: false };
     applyColours(current, stroke.working, { keepSelection: true, uniqueFaceColors: stripFor(stroke.working).colourCount });
@@ -5367,7 +5431,7 @@ export default function App() {
     let cut: BorderCut | null = null;
     for (let attempt = 0; attempt < 3 && !cut; attempt++) {
       try {
-        cut = await cutBorders(current, labels, protectedPositions(), cutSpan, settledFaces(current), "export");
+        cut = await cutBorders(current, labels, protectedPositions(), cutSpan, settledFaces(current), "export", cutFacesRef.current.get(current.triangles));
       } catch (err) {
         if (!(err instanceof CutSuperseded)) throw err;
       }
@@ -5387,6 +5451,8 @@ export default function App() {
     (cutNotice === "off" ? cutSpan <= 0 : cutNotice === "load" ? cutSpan > 0 && cutReady : cutSpan > 0 && !(cutFresh && !cutReady));
   /** A model just opened says what turning the cut on says (and only once there is something to confirm). */
   const cutNoticeText = cutNotice === "load" ? "on" : cutNotice;
+  /** After a confirm with nothing repainted, what is left is only teeth trimmed off the confirmed line: said so. */
+  const cutNoticeKey = cutNoticeText === "on" && cutFresh?.cut.trim ? "trim" : cutNoticeText;
   useEffect(() => {
     // Once up, it is the "on" notice: it stays while a recolour's cut is worked out again.
     if (cutNotice === "load" && cutReady) setCutNotice("on");
@@ -5417,13 +5483,18 @@ export default function App() {
       const { cut } = layer;
       const { model: after, mesh } = cutModelOf(before, cut, labels);
       // What the faces' groups are right after: these are not cut again until they change.
+      // And which faces a cut made (this one or an earlier one): the cut line itself, final.
       const settled = new Uint8Array(after.triangles.length * 3);
+      const wasCut = cutFacesRef.current.get(before.triangles);
+      const cutFaces = new Uint8Array(after.triangles.length);
       for (let i = 0; i < after.triangles.length; i++) {
         const p = mesh.piece[i];
         const rgb = palette[p >= 0 ? cut.pieceGroups[p] : labels[mesh.originalFace[i]]]?.rgb;
         if (rgb) settled.set(rgb, i * 3);
+        cutFaces[i] = p >= 0 ? 1 : (wasCut?.[mesh.originalFace[i]] ?? 0);
       }
       settledRef.current.set(after.triangles, settled);
+      cutFacesRef.current.set(after.triangles, cutFaces);
       cutLogRef.current.set(after.triangles, [
         ...(cutLogRef.current.get(before.triangles) ?? []),
         {
@@ -6669,7 +6740,7 @@ export default function App() {
                       { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
                     ]}
                   />
-                  <ColourPicker value={brushHex} title={t("brush.pickHint")} onChange={(hex) => { setPickCustom(hex.toUpperCase()); setPickTarget("__new__"); }} />
+                  <ColourPicker value={brushHex} commit title={t("brush.pickHint")} onDraft={setPickPreviewHex} onChange={(hex) => takePickedColour(hex, false)} />
                   <button
                     type="button"
                     className={`btn small eyedropper-toggle${eyedropper ? " active" : ""}`}
@@ -6863,7 +6934,14 @@ export default function App() {
                           { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
                         ]}
                       />
-                      <ColourPicker value={brushHex} title={t("brush.pickHint")} onChange={(hex) => { setPickCustom(hex.toUpperCase()); setPickTarget("__new__"); }} />
+                      <ColourPicker
+                        value={brushHex}
+                        before={pickedHexes[0]}
+                        commit
+                        title={t("brush.pickHint")}
+                        onDraft={setPickPreviewHex}
+                        onChange={(hex) => takePickedColour(hex, true)}
+                      />
                       {!brushMode && (
                         <button
                           type="button"
@@ -6882,7 +6960,7 @@ export default function App() {
                         className="btn primary small"
                         disabled={!canFillPick}
                         title={t("pick.applyHint")}
-                        onClick={applyPickColour}
+                        onClick={() => applyPickColour()}
                       >
                         {t("pick.apply")}
                       </button>
@@ -7002,8 +7080,8 @@ export default function App() {
                   <Icon name="cutLine" size={13} stroke={1.5} />
                 </span>
                 <span className="cut-notice-body">
-                  <span className="cut-notice-title">{t(`cutNotice.${cutNoticeText}.title` as Key)}</span>
-                  <span className="cut-notice-detail">{t(`cutNotice.${cutNoticeText}.detail` as Key)}</span>
+                  <span className="cut-notice-title">{t(`cutNotice.${cutNoticeKey}.title` as Key)}</span>
+                  <span className="cut-notice-detail">{t(`cutNotice.${cutNoticeKey}.detail` as Key)}</span>
                   {cutNotice === "off" ? (
                     <span className="cut-notice-actions">
                       <button type="button" className="cut-confirm" onClick={() => toggleCut(true)}>
