@@ -1,6 +1,6 @@
 import type { MeshModel, RGB } from "@core/types";
 import type { FaceAdjacency } from "@core/meshAdjacency";
-import type { FaceGeometry } from "./mesh";
+import { facesInSphere, type FaceGeometry } from "./mesh";
 
 /**
  * A 2D "colour map" of a face-coloured mesh: every face gets a place in a
@@ -23,6 +23,8 @@ export interface FaceAtlas {
   chartCount: number;
   /** Chart id of each face. */
   chartOf: Int32Array;
+  /** Unit direction each chart faces (its area-weighted normal, 3 floats per chart): the map looks at a chart along it. */
+  chartDir: Float32Array;
   /** Fraction of atlas pixels covered by faces, and the layout's extent in pixels (diagnostics). */
   filledRatio: number;
   extent: [number, number];
@@ -200,10 +202,12 @@ export function buildFaceAtlas(
     weight[c] += a;
   }
   const bases: Array<{ right: [number, number, number]; up: [number, number, number] }> = new Array(chartCount);
+  const chartDir = new Float32Array(chartCount * 3);
   for (let c = 0; c < chartCount; c++) {
     const len = Math.hypot(dirX[c], dirY[c], dirZ[c]);
     const d: [number, number, number] = len > 0 ? [dirX[c] / len, dirY[c] / len, dirZ[c] / len] : [0, 0, 1];
     bases[c] = chartBasis(d);
+    chartDir.set(d, c * 3);
     centreZ[c] /= weight[c] || 1;
   }
   const minU = new Float64Array(chartCount).fill(Infinity);
@@ -372,6 +376,7 @@ export function buildFaceAtlas(
     scale,
     chartCount,
     chartOf,
+    chartDir,
     filledRatio: pixelOffsets[n] / (size * size),
     extent: [extentX, extentY],
     marks: new Uint8Array(n),
@@ -593,4 +598,73 @@ export function faceAtAtlasPixel(atlas: FaceAtlas, x: number, y: number): number
 export function faceAtlasCentre(atlas: FaceAtlas, face: number): [number, number] {
   const o = face * 6;
   return [(atlas.faceUv[o] + atlas.faceUv[o + 2] + atlas.faceUv[o + 4]) / 3, (atlas.faceUv[o + 1] + atlas.faceUv[o + 3] + atlas.faceUv[o + 5]) / 3];
+}
+
+/** Atlas-pixel position of a point on a face, from its barycentric weights (in the face's corner order). */
+export function faceAtlasPoint(atlas: FaceAtlas, face: number, bary: [number, number, number]): [number, number] {
+  const uv = atlas.faceUv;
+  const o = face * 6;
+  return [uv[o] * bary[0] + uv[o + 2] * bary[1] + uv[o + 4] * bary[2], uv[o + 1] * bary[0] + uv[o + 3] * bary[1] + uv[o + 5] * bary[2]];
+}
+
+/**
+ * The faces a brush on the map paints at (cx, cy) with `radius` in model units: the faces
+ * whose pixels lie under its circle, and the faces of the surface there within the radius
+ * in 3D.  A chart is a projection: faces at an angle to it are squeezed thinner than a
+ * pixel, and bumps fold faces over one another, so many faces own no pixel and a circle
+ * of pixels alone leaves them out — an area painted on the map then shows in 3D as
+ * stipple.  The ball takes them in, as the 3D brush does; faces turned away from the
+ * chart's direction are left out, as the 3D brush leaves out faces turned from the camera.
+ */
+export function facesUnderMapBrush(atlas: FaceAtlas, model: MeshModel, geometry: FaceGeometry, cx: number, cy: number, radius: number): Int32Array {
+  const flat = facesInAtlasCircle(atlas, cx, cy, radius * atlas.scale);
+  const centre = faceAtAtlasPixel(atlas, cx, cy);
+  if (centre < 0) return flat;
+  const c = atlas.chartOf[centre] * 3;
+  const viewDir: [number, number, number] = [-atlas.chartDir[c], -atlas.chartDir[c + 1], -atlas.chartDir[c + 2]];
+  const ball = facesInSphere(geometry, atlasPointOnFace(atlas, model, centre, cx, cy), radius, viewDir);
+  if (ball.length === 0) return flat;
+  const { marks } = atlas;
+  const out: number[] = [];
+  for (let i = 0; i < flat.length; i++) {
+    marks[flat[i]] = 1;
+    out.push(flat[i]);
+  }
+  for (let i = 0; i < ball.length; i++) {
+    const f = ball[i];
+    if (marks[f]) continue;
+    marks[f] = 1;
+    out.push(f);
+  }
+  for (const f of out) marks[f] = 0;
+  return Int32Array.from(out);
+}
+
+/**
+ * The 3D point at an atlas position on a face: the position's barycentric weights in the
+ * face's atlas triangle are its weights in 3D (a chart is an affine projection).  A face
+ * squeezed too thin to tell gives its centroid.
+ */
+function atlasPointOnFace(atlas: FaceAtlas, model: MeshModel, face: number, x: number, y: number): [number, number, number] {
+  const uv = atlas.faceUv;
+  const o = face * 6;
+  const x0 = uv[o], y0 = uv[o + 1], x1 = uv[o + 2], y1 = uv[o + 3], x2 = uv[o + 4], y2 = uv[o + 5];
+  const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+  let w0 = 1 / 3, w1 = 1 / 3, w2 = 1 / 3;
+  if (Math.abs(area) > 1e-6) {
+    w1 = ((x - x0) * (y2 - y0) - (x2 - x0) * (y - y0)) / area;
+    w2 = ((x1 - x0) * (y - y0) - (x - x0) * (y1 - y0)) / area;
+    w0 = 1 - w1 - w2;
+    // A pixel centre just outside the triangle: clamped onto it.
+    w0 = Math.max(0, w0);
+    w1 = Math.max(0, w1);
+    w2 = Math.max(0, w2);
+    const sum = w0 + w1 + w2 || 1;
+    w0 /= sum;
+    w1 /= sum;
+    w2 /= sum;
+  }
+  const tri = model.triangles[face];
+  const a = model.vertices[tri[0]], b = model.vertices[tri[1]], c = model.vertices[tri[2]];
+  return [a[0] * w0 + b[0] * w1 + c[0] * w2, a[1] * w0 + b[1] * w1 + c[1] * w2, a[2] * w0 + b[2] * w1 + c[2] * w2];
 }

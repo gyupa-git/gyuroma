@@ -42,6 +42,7 @@ import {
 import {
   areaFractionByPosition,
   buildColourBuffer,
+  patchColourBuffer,
   buildPositions,
   colourKey,
   countUniqueColours,
@@ -94,7 +95,7 @@ import { CleanupPanel } from "./ui/CleanupPanel";
 import { ColourMap, type ColourMapHandle } from "./ui/ColourMap";
 import { loadStoredBackground, storeBackground, type ViewBackground } from "./ui/background";
 import { blendRecipeText } from "./engine/plan";
-import { buildFaceAtlas, faceAtlasCentre, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
+import { buildFaceAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
 import { HelpTip } from "./ui/HelpTip";
 import { GyupaLoader } from "./ui/GyupaLoader";
 import { LoadSection, type SourceInfo } from "./ui/LoadSection";
@@ -209,6 +210,10 @@ const CLOSE_UP_ZOOM = 1.6;
 
 const NO_OVERLAYS: HighlightOverlay[] = [];
 const NO_CALLOUTS: Callout[] = [];
+/** A face's centroid, as barycentric weights. */
+const EVEN_THIRDS: [number, number, number] = [1 / 3, 1 / 3, 1 / 3];
+/** From here a model is big enough that the tab's memory may run short in a long session: the app says so. */
+const BIG_MODEL_FACES = 2_000_000;
 /**
  * Whether keys go into a field being typed in (its own ⌘Z, Esc, [ ]); a
  * slider or a checkbox with the focus does not count, so ⌘Z still undoes
@@ -674,7 +679,21 @@ export default function App() {
   /** A picked place at least this wide on the print (mm) is asked about first. */
   const [gapBigMm, setGapBigMm] = useState(GAP_BIG_DIAMETER_MM);
   const [coloursVersion, setColoursVersion] = useState(0);
-  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string } | null>(null);
+  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[] } | null>(null);
+  /**
+   * A brush stroke just committed: which faces it painted, from which colours to
+   * which.  A stroke changes only those faces, so the colour buffers, the labels and
+   * the map are patched for them instead of being built again for every face of the
+   * model — on a model of a million faces that was a second of work after every stroke.
+   * `exact`: the painted faces show the brush colour itself in the palette view too
+   * (the brush colour is a palette colour), so the live painting already looks right.
+   */
+  const strokePatchRef = useRef<{ from: RGB[]; to: RGB[]; faces: Int32Array; rgb: RGB; exact: boolean } | null>(null);
+  /** The committed stroke, when it is exactly the step from the colours a buffer was built for to the colours now. */
+  const strokePatchFor = (from: RGB[] | null | undefined, to: RGB[]) => {
+    const patch = strokePatchRef.current;
+    return patch && patch.to === to && patch.from === from ? patch : null;
+  };
   const viewerRef0 = useRef<MeshViewerHandle>(null);
   const viewerRef1 = useRef<MeshViewerHandle>(null);
   const viewerRef2 = useRef<MeshViewerHandle>(null);
@@ -1176,10 +1195,36 @@ export default function App() {
     () => (stripData && previewCuts ? groupsFromCuts(stripData, previewCuts) : committedGroups),
     [stripData, previewCuts, committedGroups],
   );
+  /** The labels last worked out, so a brush stroke only relabels the faces it painted. */
+  const labelsRef = useRef<{ colours: RGB[]; paletteKey: string; labels: Int32Array; palette: PaletteEntry[] } | null>(null);
   const { palette, labels, positionOfKey } = useMemo(() => {
     if (!model || !stripData) return { palette: [] as PaletteEntry[], labels: new Int32Array(0), positionOfKey: new Map<number, number>() };
     const built = stripPalette(committedGroups);
-    const faceLabels = stripLabels(model.triangleColors, built.groupOfKey, built.palette);
+    const paletteKey = built.palette.map((entry) => rgbToHex(entry.rgb)).join(",");
+    const prev = labelsRef.current;
+    const patch = strokePatchFor(prev?.colours, model.triangleColors);
+    let faceLabels: Int32Array;
+    if (patch && prev && prev.paletteKey === paletteKey && prev.labels.length === model.triangles.length) {
+      // The same palette: only the painted faces change group, and the groups' counts with them.
+      // A new array all the same, so what was worked out from the old labels is not taken for these.
+      faceLabels = prev.labels.slice();
+      const position = built.groupOfKey.get(stripColourKey(patch.rgb)) ?? 0;
+      const counts = prev.palette.map((entry) => entry.count ?? 0);
+      for (let i = 0; i < patch.faces.length; i++) {
+        const f = patch.faces[i];
+        counts[faceLabels[f]]--;
+        faceLabels[f] = position;
+        counts[position]++;
+      }
+      built.palette.forEach((entry, p) => {
+        entry.count = counts[p];
+      });
+      const shown = built.palette[position]?.rgb;
+      patch.exact = Boolean(shown && shown[0] === patch.rgb[0] && shown[1] === patch.rgb[1] && shown[2] === patch.rgb[2]);
+    } else {
+      faceLabels = stripLabels(model.triangleColors, built.groupOfKey, built.palette);
+    }
+    labelsRef.current = { colours: model.triangleColors, paletteKey, labels: faceLabels, palette: built.palette };
     return { palette: built.palette, labels: faceLabels, positionOfKey: built.groupOfKey };
   }, [model, stripData, committedGroups]);
   const areaByPosition = useMemo(() => areaFractionByPosition(labels, palette.length, areaWeights), [labels, palette.length, areaWeights]);
@@ -1546,21 +1591,54 @@ export default function App() {
     return info ? (info.recipe ? `${info.label} (${info.recipe})` : info.label) : "-";
   };
 
-  const sourceColours = useMemo(() => (model ? buildColourBuffer(model.triangles.length, (i) => model.triangleColors[i]) : null), [model]);
-  const paletteColours = useMemo(
-    () => (model && palette.length > 0 ? buildColourBuffer(model.triangles.length, (i) => palette[labels[i]]?.rgb ?? model.triangleColors[i]) : sourceColours),
-    [model, palette, labels, sourceColours],
-  );
-  const printColours = useMemo(
-    () =>
-      model && palette.length > 0 && effectiveByIndex.size > 0
-        ? buildColourBuffer(model.triangles.length, (i) => {
-            const entry = palette[labels[i]];
-            return (entry && effectiveByIndex.get(entry.index)) ?? entry?.rgb ?? model.triangleColors[i];
-          })
-        : paletteColours,
-    [model, palette, labels, effectiveByIndex, paletteColours],
-  );
+  // The colour buffers the views draw (one colour per corner, linear).  A committed
+  // brush stroke patches the buffer it was built on for the painted faces and keeps
+  // the same object: the views painted those faces as the stroke went, so nothing is
+  // uploaded again.
+  const sourceBufferRef = useRef<{ colours: RGB[]; buffer: Float32Array } | null>(null);
+  const sourceColours = useMemo(() => {
+    if (!model) return null;
+    const prev = sourceBufferRef.current;
+    const patch = strokePatchFor(prev?.colours, model.triangleColors);
+    const buffer =
+      patch && prev && prev.buffer.length === model.triangles.length * 9
+        ? patchColourBuffer(prev.buffer, patch.faces, patch.rgb)
+        : buildColourBuffer(model.triangles.length, (i) => model.triangleColors[i]);
+    sourceBufferRef.current = { colours: model.triangleColors, buffer };
+    return buffer;
+  }, [model]);
+  const paletteHexKey = useMemo(() => palette.map((entry) => rgbToHex(entry.rgb)).join(","), [palette]);
+  const paletteBufferRef = useRef<{ colours: RGB[]; paletteKey: string; buffer: Float32Array } | null>(null);
+  const paletteColours = useMemo(() => {
+    if (!model || palette.length === 0) return sourceColours;
+    const prev = paletteBufferRef.current;
+    const patch = strokePatchFor(prev?.colours, model.triangleColors);
+    const buffer =
+      patch && patch.exact && prev && prev.paletteKey === paletteHexKey && prev.buffer.length === model.triangles.length * 9
+        ? patchColourBuffer(prev.buffer, patch.faces, patch.rgb)
+        : buildColourBuffer(model.triangles.length, (i) => palette[labels[i]]?.rgb ?? model.triangleColors[i]);
+    paletteBufferRef.current = { colours: model.triangleColors, paletteKey: paletteHexKey, buffer };
+    return buffer;
+  }, [model, palette, labels, sourceColours, paletteHexKey]);
+  const printBufferRef = useRef<{ colours: RGB[]; paletteKey: string; effective: Map<number, RGB>; buffer: Float32Array } | null>(null);
+  const printColours = useMemo(() => {
+    if (!model || palette.length === 0 || effectiveByIndex.size === 0) return paletteColours;
+    const prev = printBufferRef.current;
+    const patch = strokePatchFor(prev?.colours, model.triangleColors);
+    const printed = (i: number): RGB => {
+      const entry = palette[labels[i]];
+      return (entry && effectiveByIndex.get(entry.index)) ?? entry?.rgb ?? model.triangleColors[i];
+    };
+    let buffer: Float32Array;
+    if (patch && patch.exact && prev && prev.paletteKey === paletteHexKey && prev.effective === effectiveByIndex && prev.buffer.length === model.triangles.length * 9) {
+      // The painted faces all print alike: one colour for all of them.
+      buffer = patchColourBuffer(prev.buffer, patch.faces, printed(patch.faces[0]));
+    } else {
+      buffer = buildColourBuffer(model.triangles.length, printed);
+    }
+    printBufferRef.current = { colours: model.triangleColors, paletteKey: paletteHexKey, effective: effectiveByIndex, buffer };
+    return buffer;
+  }, [model, palette, labels, effectiveByIndex, paletteColours, paletteHexKey]);
   // While a cut is dragged the result shows the groups as they would be —
   // one colour buffer, nothing in the plan recomputed until the drag ends.
   // Each face's original colour as an index, worked out once per model, so a
@@ -1756,7 +1834,8 @@ export default function App() {
         .catch((err) => {
           if (!(err instanceof CutSuperseded)) console.warn("Border cut failed", err);
         });
-    }, 150);
+      // Strokes come one after another: the cut waits until the brush rests a moment.
+    }, strokePatchRef.current?.to === model.triangleColors ? 1000 : 150);
     return () => {
       alive = false;
       window.clearTimeout(timer);
@@ -3999,14 +4078,14 @@ export default function App() {
     return adjacency;
   }
 
-  function applyColours(current: MeshModel, next: RGB[], options?: { keepSelection?: boolean }): void {
+  function applyColours(current: MeshModel, next: RGB[], options?: { keepSelection?: boolean; uniqueFaceColors?: number }): void {
     if (history.length >= 20) forgetOldestUndo("colours");
     setHistory((prev) => [...prev.slice(-19), current.triangleColors]);
     pushUndo("colours");
     setFuture([]);
     meshRedoRef.current = [];
     redoOrderRef.current = [];
-    setModel({ ...current, triangleColors: next, stats: { ...current.stats, uniqueFaceColors: countUniqueColours(next) } });
+    setModel({ ...current, triangleColors: next, stats: { ...current.stats, uniqueFaceColors: options?.uniqueFaceColors ?? countUniqueColours(next) } });
     // The palette may be numbered anew: the recipe panel's undo steps no longer line
     // up.  The hand-set choices themselves follow their colours (choicesPaletteRef).
     forgetRecipeUndo();
@@ -4035,8 +4114,11 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometryTriangles]);
 
-  // Full repaint of the map whenever the committed colours change.
+  // Full repaint of the map whenever the committed colours change — except for a brush
+  // stroke whose faces the map painted as it went, in the colour they keep.
   useEffect(() => {
+    const patch = strokePatchRef.current;
+    if (model && patch && patch.to === model.triangleColors && patch.exact) return;
     setColoursVersion((v) => v + 1);
   }, [model?.triangleColors]);
 
@@ -4100,7 +4182,7 @@ export default function App() {
       setStatus(t("status.brushNeedsSelection"));
       return false;
     }
-    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex };
+    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex, changed: [] };
     return true;
   }
 
@@ -4119,6 +4201,7 @@ export default function App() {
     }
     if (changed.length === 0) return;
     stroke.count += changed.length;
+    for (let i = 0; i < changed.length; i++) stroke.changed.push(changed[i]);
     for (const handle of viewerHandles()) handle.setFaceColours(changed, rgb);
     mapRef.current?.repaintFaces(changed);
   }
@@ -4134,7 +4217,9 @@ export default function App() {
       return;
     }
     keepGroupsFor(current.triangleColors, stroke.working);
-    applyColours(current, stroke.working, { keepSelection: true });
+    // Only the painted faces changed: buffers, labels and map are patched for them (strokePatchRef).
+    strokePatchRef.current = { from: current.triangleColors, to: stroke.working, faces: Int32Array.from(stroke.changed), rgb: stroke.rgb, exact: false };
+    applyColours(current, stroke.working, { keepSelection: true, uniqueFaceColors: stripFor(stroke.working).colourCount });
     setStatus(t("status.brushed", { n: stroke.count.toLocaleString(), hex: stroke.hex }));
   }
 
@@ -4147,7 +4232,27 @@ export default function App() {
   function brushHover3D(hit: ViewerHit | null): void {
     showBrushCursorAt(hit);
     const current = atlasRef.current?.atlas ?? null;
-    mapRef.current?.setRemoteCursor(hit && current ? faceAtlasCentre(current, hit.faceIndex) : null);
+    mapRef.current?.setRemoteCursor(hit && current ? faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS) : null);
+  }
+
+  /**
+   * The spot under the pointer on the 3D model, marked on the colour map so it can be
+   * found there to paint.  The mark stays where the pointer last touched the model (the
+   * pointer goes to the map next), and the map follows it when it is out of view.
+   */
+  function hoverHit3D(hit: ViewerHit | null): void {
+    if (!hit) return;
+    const current = atlasRef.current?.atlas ?? null;
+    if (!current) return;
+    mapRef.current?.setPointer(faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS), true);
+  }
+
+  /** The map's brush: the surface under the circle, as the 3D brush paints it (faces the map shows thin or not at all included). */
+  function paintAtMap(x: number, y: number): void {
+    const current = modelRef.current;
+    const built = atlasRef.current?.atlas ?? null;
+    if (!current || !built || !strokeRef.current) return;
+    paintFaces(facesUnderMapBrush(built, current, faceGeometryFor(current), x, y, brushRadius));
   }
 
   function paintAtHit(hit: ViewerHit | null, slot: number): void {
@@ -5385,6 +5490,11 @@ export default function App() {
         printPresetSupportWord: t("exp.supportPresetSuffix"),
         includePrinterConfig: prusa && e.includePrinterConfig && templateFitsPrinter(printer, template?.info.printerModel),
         effectiveRgbByPaletteIndex: effectiveByIndex,
+        // A big model takes a while to write: the busy line counts it up, and the screen gets a turn between pieces.
+        onProgress: async (fraction) => {
+          setBusy(t("busy.exportingPct", { pct: Math.round(fraction * 100) }));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        },
       });
       setLastExport({ fileName: result.fileName, blob: result.blob, at: Date.now() });
       downloadBlob(result.fileName, result.blob);
@@ -5681,6 +5791,7 @@ export default function App() {
         : t("view.empty"),
     onPick: (face: number | null, info: PickInfo) => void handlePick(face, info),
     onHoverFace: hoverFace,
+    onHoverHit: hoverHit3D,
     onBrushHover: brushHover3D,
     onBrushStart: (hit: ViewerHit | null) => brushStart3D(hit, slot),
     onBrushDrag: (hit: ViewerHit | null) => brushDrag3D(hit, slot),
@@ -6693,7 +6804,7 @@ export default function App() {
                 onPick={(face, info) => void handlePick(face, info)}
                 onHover={mapHover}
                 onBrushStart={() => void beginStroke()}
-                onBrushPaint={paintFaces}
+                onBrushPaintAt={paintAtMap}
                 onBrushEnd={endStroke}
                 label={t("map.label")}
                 hint={t("map.hint")}
@@ -6705,6 +6816,11 @@ export default function App() {
               // shown again whenever the layer height or the soft/sharp look changes
               <span key={`${shownLayerHeight}|${paneLook.soft[1]}`} className="view-chip passing" style={chipStyle}>
                 {t("layers.note", { mm: printHeightMm.toFixed(0), n: Math.ceil(printHeightMm / shownLayerHeight - 1e-6).toLocaleString() })}
+              </span>
+            )}
+            {model && model.triangles.length >= BIG_MODEL_FACES && step <= 2 && (
+              <span className="view-chip" style={chipStyle}>
+                {t("load.bigModel", { faces: model.triangles.length.toLocaleString() })}
               </span>
             )}
             {step === 3 && mixRow && (

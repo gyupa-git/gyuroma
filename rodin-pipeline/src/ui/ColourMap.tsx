@@ -1,6 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
 import type { RGB } from "@core/types";
-import { faceAtAtlasPixel, facesInAtlasCircle, paintAtlasImage, paintAtlasOutline, paintAtlasOverlay, type AtlasMasks, type FaceAtlas } from "../engine/atlas";
+import { faceAtAtlasPixel, paintAtlasImage, paintAtlasOutline, paintAtlasOverlay, type AtlasMasks, type FaceAtlas } from "../engine/atlas";
 import type { PickInfo } from "./MeshViewer";
 import { DEFAULT_BACKGROUND, fillBackground, type ViewBackground } from "./background";
 
@@ -9,6 +9,12 @@ export interface ColourMapHandle {
   repaintFaces(faces: ArrayLike<number>): void;
   /** Brush circle mirrored from the 3D view (atlas pixels), or null to hide. */
   setRemoteCursor(position: [number, number] | null): void;
+  /**
+   * Where the pointer rests on the 3D model (atlas pixels), marked with a crosshair so the
+   * spot can be found on the map; null hides it.  With `follow`, a spot out of view (the map
+   * zoomed in elsewhere) pans the map just far enough to show it.
+   */
+  setPointer(position: [number, number] | null, follow?: boolean): void;
   /** Centre the view on an atlas-pixel box [x0, y0, x1, y1], zooming only when it is too small or too large to see. */
   focusOn(box: [number, number, number, number]): void;
 }
@@ -30,7 +36,8 @@ export interface ColourMapProps {
   onPick?: (face: number | null, info: PickInfo) => void;
   onHover?: (face: number | null) => void;
   onBrushStart?: () => void;
-  onBrushPaint?: (faces: Int32Array) => void;
+  /** Paint around an atlas position: the caller knows the brush radius and the faces the surface has there. */
+  onBrushPaintAt?: (x: number, y: number) => void;
   onBrushEnd?: () => void;
   label: string;
   hint: string;
@@ -64,7 +71,7 @@ function outlineWidthFor(scale: number): number {
 }
 
 export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function ColourMap(
-  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaint, onBrushEnd, label, hint, emptyLabel, buildingLabel },
+  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, label, hint, emptyLabel, buildingLabel },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -83,9 +90,11 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
   const userAdjustedRef = useRef(false);
   const cursorRef = useRef<[number, number] | null>(null);
   const remoteCursorRef = useRef<[number, number] | null>(null);
+  /** The spot the pointer last touched on the 3D model (atlas pixels). */
+  const pointerRef = useRef<[number, number] | null>(null);
   const rafRef = useRef<number | null>(null);
-  const callbacksRef = useRef({ onPick, onHover, onBrushStart, onBrushPaint, onBrushEnd, colourOf });
-  callbacksRef.current = { onPick, onHover, onBrushStart, onBrushPaint, onBrushEnd, colourOf };
+  const callbacksRef = useRef({ onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, colourOf });
+  callbacksRef.current = { onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, colourOf };
   const brushRef = useRef(brush);
   brushRef.current = brush;
   const eyedropperRef = useRef(eyedropper);
@@ -162,6 +171,33 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
       };
       if (brushRef.current.active && !handRef.current && cursorRef.current) drawCursor(cursorRef.current, false);
       if (remoteCursorRef.current) drawCursor(remoteCursorRef.current, true);
+      const pointer = pointerRef.current;
+      canvas.dataset.pointer = pointer ? `${pointer[0].toFixed(1)},${pointer[1].toFixed(1)}` : "";
+      if (pointer) {
+        // The spot under the pointer on the 3D model: a ring with ticks, dark under light, so it reads on any colour.
+        const px = pointer[0] * view.scale + view.tx;
+        const py = pointer[1] * view.scale + view.ty;
+        const ring = 7;
+        for (const [width, colour] of [
+          [4, "rgba(0, 0, 0, 0.7)"],
+          [1.6, "#ffffff"],
+        ] as const) {
+          ctx.lineWidth = width;
+          ctx.strokeStyle = colour;
+          ctx.beginPath();
+          ctx.arc(px, py, ring, 0, Math.PI * 2);
+          for (const [dx, dy] of [
+            [1, 0],
+            [-1, 0],
+            [0, 1],
+            [0, -1],
+          ] as const) {
+            ctx.moveTo(px + dx * (ring + 1), py + dy * (ring + 1));
+            ctx.lineTo(px + dx * (ring + 6), py + dy * (ring + 6));
+          }
+          ctx.stroke();
+        }
+      }
     }
   }, []);
 
@@ -221,6 +257,29 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         remoteCursorRef.current = position;
         requestDraw();
       },
+      setPointer(position, follow = false) {
+        pointerRef.current = position;
+        const canvas = canvasRef.current;
+        if (position && follow && canvas && atlasRef.current) {
+          const dpr = window.devicePixelRatio || 1;
+          const width = canvas.width / dpr;
+          const height = canvas.height / dpr;
+          const view = viewRef.current;
+          const margin = 28;
+          if (width > margin * 2 && height > margin * 2) {
+            // Out of view: pan just far enough to bring the spot in, with room for its mark.
+            const sx = position[0] * view.scale + view.tx;
+            const sy = position[1] * view.scale + view.ty;
+            const dx = sx < margin ? margin - sx : sx > width - margin ? width - margin - sx : 0;
+            const dy = sy < margin ? margin - sy : sy > height - margin ? height - margin - sy : 0;
+            if (dx !== 0 || dy !== 0) {
+              viewRef.current = { ...view, tx: view.tx + dx, ty: view.ty + dy };
+              userAdjustedRef.current = true;
+            }
+          }
+        }
+        requestDraw();
+      },
       focusOn(box) {
         const canvas = canvasRef.current;
         const current = atlasRef.current;
@@ -243,6 +302,12 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     }),
     [requestDraw],
   );
+
+  // Another atlas (another mesh): the marks of the old one mean nothing on it.
+  useEffect(() => {
+    pointerRef.current = null;
+    remoteCursorRef.current = null;
+  }, [atlas]);
 
   // Offscreen buffers follow the atlas; full repaint on colour version changes.
   useEffect(() => {
@@ -336,10 +401,8 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     let down: { x: number; y: number; button: number; moved: boolean; painting: boolean; hand: boolean } | null = null;
     let lastClick: { face: number; time: number } | null = null;
     const paintAt = (position: [number, number]) => {
-      const current = atlasRef.current;
-      if (!current) return;
-      const faces = facesInAtlasCircle(current, position[0], position[1], brushRef.current.radiusPx);
-      if (faces.length > 0) callbacksRef.current.onBrushPaint?.(faces);
+      if (!atlasRef.current) return;
+      callbacksRef.current.onBrushPaintAt?.(position[0], position[1]);
     };
     const onPointerDown = (event: PointerEvent) => {
       canvas.setPointerCapture(event.pointerId);

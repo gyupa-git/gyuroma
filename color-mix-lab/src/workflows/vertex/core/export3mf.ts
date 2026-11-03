@@ -22,7 +22,8 @@ import {
 } from "./paintCodes";
 import { splitMeshComponents, type MeshComponent } from "./splitComponents";
 // Type only: the Bambu Studio module (and its printer data) is loaded when a Bambu project is written.
-import type { BambuMixedSlot, BambuProjectObject } from "./bambuProject";
+import type { BambuMixedSlot } from "./bambuProject";
+import { ZipOut, type ZipEntryStream } from "./zipOut";
 import { applyPrintPresetToConfig, findPrintPreset, type PrintPresetId } from "./printPresets";
 import {
   rasterToPngBytes,
@@ -119,6 +120,12 @@ export interface Export3mfOptions {
   effectiveRgbByPaletteIndex?: Map<number, RGB>;
   /** Test hook: replaces the canvas based PNG encoder. */
   thumbnailEncoder?: (raster: ThumbnailRaster) => Promise<Uint8Array>;
+  /**
+   * How far the mesh writing has come (0..1), now and then: a big model takes a
+   * while, and the app can say so.  Awaited, so the app may let the screen draw
+   * between pieces.
+   */
+  onProgress?: (fraction: number) => void | Promise<void>;
 }
 
 export interface ExportVirtualDefinition {
@@ -551,52 +558,106 @@ function trianglePaletteIndices(
   );
 }
 
-interface ModelXmlResult {
-  /** The whole 3D/3dmodel.model; empty for a Bambu Studio project, which keeps each mesh in its own file. */
-  xml: string;
-  /** Per object: its name and `<mesh>` lines (Bambu Studio project only). */
-  meshes: BambuProjectObject[];
-  /** Palette index used for every triangle. */
-  paletteIndices: number[];
-  /** Decoded extruder states written into the mesh. */
-  usedPaintStates: Set<number>;
-  /** Number of 3MF objects written (one per shell when splitting). */
-  objectCount: number;
+/** A shell written as one 3MF object: its name, its faces (null = the whole mesh) and how many. */
+interface MeshShell {
+  name: string;
+  faces: Int32Array | null;
+  faceCount: number;
 }
 
-function buildModelXml(
-  options: Export3mfOptions,
-  paletteToPaintCode: Map<number, string>,
-  transform: string,
-  precomputedPaletteIndices?: number[],
-  components?: MeshComponent[] | null,
-): ModelXmlResult {
+/** One object per connected shell, or the whole mesh as a single object. */
+function meshShells(options: Export3mfOptions, components: MeshComponent[] | null): MeshShell[] {
   const title = titleFromFilename(options.fileName);
+  const shells: Array<Int32Array | null> =
+    components && components.length > 1 ? components.map((component) => component.triangles) : [null];
+  return shells.map((faces, index) => ({
+    name: shells.length > 1 ? `${title} ${index + 1}` : title,
+    faces,
+    faceCount: faces ? faces.length : options.model.triangles.length,
+  }));
+}
+
+interface PaintLeaves {
+  /** The paint code written for each palette colour the triangles use. */
+  leafByPaletteIndex: Map<number, string>;
+  /** The extruder states those codes decode to (what the validation checks). */
+  usedPaintStates: Set<number>;
+}
+
+/**
+ * The paint code of every palette colour the triangles use.  A used colour
+ * without an assignment — not expected, every palette entry gets one — takes
+ * the first assignment, and its triangles are relabelled to it, so the
+ * thumbnail shows what is written.  Worked out before anything is written:
+ * the validation happens up front, not after a mesh of millions of faces.
+ */
+function resolvePaintLeaves(palette: PaletteEntry[], paletteToPaintCode: Map<number, string>, paletteIndices: number[]): PaintLeaves {
+  const used = new Set<number>(paletteIndices);
+  const leafByPaletteIndex = new Map<number, string>();
+  for (const paletteIndex of palette.map((p) => p.index)) {
+    if (!used.has(paletteIndex)) continue;
+    const paintCode = paletteToPaintCode.get(paletteIndex);
+    if (!paintCode) throw new Error(`No extruder assignment for palette colour #${paletteIndex}.`);
+    leafByPaletteIndex.set(paletteIndex, paintCode);
+  }
+  const unassigned = new Set([...used].filter((index) => !leafByPaletteIndex.has(index)));
+  if (unassigned.size > 0) {
+    const first = leafByPaletteIndex.entries().next().value;
+    if (!first) throw new Error("No extruder assignments were generated.");
+    for (let i = 0; i < paletteIndices.length; i++) if (unassigned.has(paletteIndices[i])) paletteIndices[i] = first[0];
+  }
+  const usedPaintStates = new Set<number>();
+  for (const leaf of leafByPaletteIndex.values()) usedPaintStates.add(decodePaintCode(leaf));
+  return { leafByPaletteIndex, usedPaintStates };
+}
+
+/** Lines per piece handed to the zip (a few megabytes of XML). */
+const PIECE_LINES = 50_000;
+
+/** Gathers lines into pieces and hands each on; nothing holds the whole file. */
+class LineWriter {
+  private lines: string[] = [];
+  constructor(private readonly sink: (text: string) => void) {}
+  push(line: string): void {
+    this.lines.push(line);
+    if (this.lines.length >= PIECE_LINES) this.flush();
+  }
+  flush(): void {
+    if (this.lines.length === 0) return;
+    this.sink(this.lines.join("\n") + "\n");
+    this.lines = [];
+  }
+}
+
+/** How far the mesh writing has come, told to the caller now and then (and the screen gets a turn). */
+class WriteProgress {
+  private done = 0;
+  constructor(
+    private readonly total: number,
+    private readonly onProgress: Export3mfOptions["onProgress"],
+  ) {}
+  async step(lines: number): Promise<void> {
+    this.done += lines;
+    if (this.onProgress) await this.onProgress(Math.min(1, this.done / Math.max(1, this.total)));
+  }
+}
+
+/**
+ * One shell's `<mesh>` — its vertices and painted triangles — line by line.  A
+ * shell shares no vertex with any other shell, so each carries its own
+ * compacted vertex list and the triangles are renumbered into it.
+ */
+async function writeMesh(
+  options: Export3mfOptions,
+  shell: MeshShell,
+  leaves: PaintLeaves,
+  paletteIndices: number[],
+  out: LineWriter,
+  progress: WriteProgress,
+): Promise<void> {
   const model = options.model;
   const bambu = options.slicer === "bambu";
   const project = bambu && Boolean(options.bambuPrinter);
-  const paletteIndices =
-    precomputedPaletteIndices ??
-    trianglePaletteIndices(
-      options.adjustedColors,
-      options.palette,
-      options.accentProtection ?? "balanced",
-    );
-  const leafByPaletteIndex = new Map<number, string>();
-  const stateByPaletteIndex = new Map<number, number>();
-  // Only palette colours that a triangle actually uses need an assignment.
-  const usedPaletteIndices = new Set<number>(paletteIndices);
-  for (const paletteIndex of options.palette.map((p) => p.index)) {
-    if (!usedPaletteIndices.has(paletteIndex)) continue;
-    const paintCode = paletteToPaintCode.get(paletteIndex);
-    if (!paintCode)
-      throw new Error(
-        `No extruder assignment for palette colour #${paletteIndex}.`,
-      );
-    leafByPaletteIndex.set(paletteIndex, paintCode);
-    stateByPaletteIndex.set(paletteIndex, decodePaintCode(paintCode));
-  }
-  const usedPaintStates = new Set<number>();
   // Bambu Studio reads states past 16 its own way (see paintCodes.ts).
   const bambuLeafOf = new Map<string, string>();
   const bambuLeaf = (leaf: string): string => {
@@ -607,8 +668,67 @@ function buildModelXml(
     }
     return code;
   };
+  const firstLeaf = leaves.leafByPaletteIndex.values().next().value as string;
+  out.push("   <mesh>");
+  out.push("    <vertices>");
+  const localOfVertex = shell.faces ? new Map<number, number>() : null;
+  if (shell.faces && localOfVertex) {
+    for (let k = 0; k < shell.faces.length; k++) {
+      const [v1, v2, v3] = model.triangles[shell.faces[k]] as Tri;
+      for (const v of [v1, v2, v3]) {
+        if (localOfVertex.has(v)) continue;
+        localOfVertex.set(v, localOfVertex.size);
+        const [x, y, z] = model.vertices[v];
+        out.push(`     <vertex x="${fmt(x)}" y="${fmt(y)}" z="${fmt(z)}"/>`);
+      }
+      if (k % PIECE_LINES === PIECE_LINES - 1) await progress.step(PIECE_LINES);
+    }
+  } else {
+    const vertices = model.vertices;
+    for (let v = 0; v < vertices.length; v++) {
+      const [x, y, z] = vertices[v];
+      out.push(`     <vertex x="${fmt(x)}" y="${fmt(y)}" z="${fmt(z)}"/>`);
+      if (v % PIECE_LINES === PIECE_LINES - 1) await progress.step(PIECE_LINES);
+    }
+  }
+  out.push("    </vertices>");
+  out.push("    <triangles>");
+  for (let k = 0; k < shell.faceCount; k++) {
+    const i = shell.faces ? shell.faces[k] : k;
+    const [v1, v2, v3] = model.triangles[i] as Tri;
+    const leaf = leaves.leafByPaletteIndex.get(paletteIndices[i] ?? 1) ?? firstLeaf;
+    const a = localOfVertex ? (localOfVertex.get(v1) as number) : v1;
+    const b = localOfVertex ? (localOfVertex.get(v2) as number) : v2;
+    const c = localOfVertex ? (localOfVertex.get(v3) as number) : v3;
+    out.push(
+      project
+        ? `     <triangle v1="${a}" v2="${b}" v3="${c}" paint_color="${bambuLeaf(leaf)}"/>`
+        : bambu
+          ? `     <triangle v1="${a}" v2="${b}" v3="${c}" paint_color="${bambuLeaf(leaf)}" slic3rpe:mmu_segmentation="${leaf}"/>`
+          : `     <triangle v1="${a}" v2="${b}" v3="${c}" slic3rpe:mmu_segmentation="${leaf}"/>`,
+    );
+    if (k % PIECE_LINES === PIECE_LINES - 1) await progress.step(PIECE_LINES);
+  }
+  out.push("    </triangles>");
+  out.push("   </mesh>");
+}
 
-  const out: string[] = [];
+/**
+ * The whole 3D/3dmodel.model, written into a zip entry a piece at a time: one
+ * object per shell, every object placed with the one shared build transform,
+ * so a split model lands on the bed exactly as the whole model would have.
+ */
+async function writeModelFile(
+  options: Export3mfOptions,
+  shells: MeshShell[],
+  leaves: PaintLeaves,
+  paletteIndices: number[],
+  transform: string,
+  entry: ZipEntryStream,
+  progress: WriteProgress,
+): Promise<void> {
+  const title = titleFromFilename(options.fileName);
+  const out = new LineWriter((text) => entry.push(text));
   out.push('<?xml version="1.0" encoding="UTF-8"?>');
   out.push(
     '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06">',
@@ -621,101 +741,22 @@ function buildModelXml(
     ' <metadata name="Description">Converted from OBJ vertex colours by VertexColor2ColorMix. Reduced palette colours are mapped to PrusaSlicer Full Spectrum virtual extruders.</metadata>',
   );
   out.push(' <metadata name="Application">VertexColor2ColorMix</metadata>');
-  // The paint code of one triangle, in the original triangle order.  Palette
-  // indices are patched in place when an assignment is missing, so the caller
-  // (thumbnail) keeps seeing what was actually written.
-  const paintCodeOfTriangle = (i: number): string => {
-    const paletteIndex = paletteIndices[i] ?? 1;
-    let leaf = leafByPaletteIndex.get(paletteIndex);
-    if (leaf === undefined) {
-      // Should not happen (every palette entry has an assignment); fall back to
-      // the first assignment so that no triangle is left unpainted.
-      const first = leafByPaletteIndex.entries().next().value;
-      if (!first) throw new Error("No extruder assignments were generated.");
-      leaf = first[1];
-      paletteIndices[i] = first[0];
-    }
-    usedPaintStates.add(
-      stateByPaletteIndex.get(paletteIndices[i]) ?? decodePaintCode(leaf),
-    );
-    return leaf;
-  };
-
-  // One object per connected shell, or the whole mesh as a single object.
-  const shells: Array<Int32Array | null> =
-    components && components.length > 1
-      ? components.map((component) => component.triangles)
-      : [null];
-
-  const meshes: BambuProjectObject[] = [];
   out.push(" <resources>");
-  shells.forEach((shell, shellIndex) => {
+  for (const [index, shell] of shells.entries()) {
     // Bambu-family slicers name objects from this attribute (PrusaSlicer from Slic3r_PE_model.config).
-    const objectName = shells.length > 1 ? `${title} ${shellIndex + 1}` : title;
-    // A Bambu Studio project keeps each mesh in its own file; the lines are collected per object.
-    const lines: string[] = project ? [] : out;
-    if (!project) out.push(`  <object id="${shellIndex + 1}" name="${xmlEscape(objectName)}" type="model">`);
-    lines.push("   <mesh>");
-    lines.push("    <vertices>");
-    // A shell shares no vertex with any other shell, so each object carries its
-    // own compacted vertex list and the triangles are renumbered into it.
-    const localOfVertex = shell ? new Map<number, number>() : null;
-    if (shell && localOfVertex) {
-      for (let k = 0; k < shell.length; k++) {
-        const [v1, v2, v3] = model.triangles[shell[k]] as Tri;
-        for (const v of [v1, v2, v3]) {
-          if (localOfVertex.has(v)) continue;
-          localOfVertex.set(v, localOfVertex.size);
-          const [x, y, z] = model.vertices[v];
-          lines.push(`     <vertex x="${fmt(x)}" y="${fmt(y)}" z="${fmt(z)}"/>`);
-        }
-      }
-    } else {
-      for (const [x, y, z] of model.vertices) {
-        lines.push(`     <vertex x="${fmt(x)}" y="${fmt(y)}" z="${fmt(z)}"/>`);
-      }
-    }
-    lines.push("    </vertices>");
-    lines.push("    <triangles>");
-    const faceCount = shell ? shell.length : model.triangles.length;
-    for (let k = 0; k < faceCount; k++) {
-      const i = shell ? shell[k] : k;
-      const [v1, v2, v3] = model.triangles[i] as Tri;
-      const leaf = paintCodeOfTriangle(i);
-      const a = localOfVertex ? (localOfVertex.get(v1) as number) : v1;
-      const b = localOfVertex ? (localOfVertex.get(v2) as number) : v2;
-      const c = localOfVertex ? (localOfVertex.get(v3) as number) : v3;
-      lines.push(
-        project
-          ? `     <triangle v1="${a}" v2="${b}" v3="${c}" paint_color="${bambuLeaf(leaf)}"/>`
-          : bambu
-            ? `     <triangle v1="${a}" v2="${b}" v3="${c}" paint_color="${bambuLeaf(leaf)}" slic3rpe:mmu_segmentation="${leaf}"/>`
-            : `     <triangle v1="${a}" v2="${b}" v3="${c}" slic3rpe:mmu_segmentation="${leaf}"/>`,
-      );
-    }
-    lines.push("    </triangles>");
-    lines.push("   </mesh>");
-    if (project) meshes.push({ name: objectName, meshLines: lines, faceCount });
-    else out.push("  </object>");
-  });
+    out.push(`  <object id="${index + 1}" name="${xmlEscape(shell.name)}" type="model">`);
+    await writeMesh(options, shell, leaves, paletteIndices, out, progress);
+    out.push("  </object>");
+  }
   out.push(" </resources>");
   out.push(" <build>");
-  // Every piece keeps the one shared transform, so the split model lands on the
-  // bed exactly as the whole model would have.
-  shells.forEach((_shell, shellIndex) => {
-    out.push(
-      `  <item objectid="${shellIndex + 1}" transform="${transform}" printable="1"/>`,
-    );
-  });
+  for (let index = 0; index < shells.length; index++) {
+    out.push(`  <item objectid="${index + 1}" transform="${transform}" printable="1"/>`);
+  }
   out.push(" </build>");
   out.push("</model>");
-  return {
-    xml: project ? "" : out.join("\n") + "\n",
-    meshes,
-    paletteIndices,
-    usedPaintStates,
-    objectCount: shells.length,
-  };
+  out.flush();
+  entry.end();
 }
 
 function buildModelConfig(
@@ -1376,13 +1417,8 @@ export async function buildPrusa3mfBlob(
     components && components.length > 1 && components.length <= MAX_SPLIT_OBJECTS
       ? components
       : null;
-  const modelResult = buildModelXml(
-    options,
-    paletteToPaintCode,
-    transformResult.transform,
-    paletteIndices,
-    splitComponents,
-  );
+  const shells = meshShells(options, splitComponents);
+  const leaves = resolvePaintLeaves(options.palette, paletteToPaintCode, paletteIndices);
 
   // D-3: never write an inconsistent project.
   const bambu = options.slicer === "bambu";
@@ -1399,7 +1435,7 @@ export async function buildPrusa3mfBlob(
     ...validateExportAssignments({
       physicalExtruderCount,
       virtuals,
-      usedPaintStates: modelResult.usedPaintStates,
+      usedPaintStates: leaves.usedPaintStates,
       layerMixing: !bambu || Boolean(bambuProject),
     }),
     ...(bambuProject ? bambuProject.validateBambuMixedSlots(physicalExtruderCount, mixedSlots) : []),
@@ -1427,7 +1463,7 @@ export async function buildPrusa3mfBlob(
   const generatedThumbnailBytes = await createExportThumbnailPng(
     options,
     transformResult.resolvedMode as FixedCoordinateMode,
-    modelResult.paletteIndices,
+    paletteIndices,
   );
 
   const renumberedVirtuals = [...virtualIdRemap.entries()]
@@ -1444,8 +1480,13 @@ export async function buildPrusa3mfBlob(
     coordinateMode: transformResult.resolvedMode,
     scale: transformResult.resolvedScale,
     bedSize: transformResult.bedSize,
-    objectCount: modelResult.objectCount,
+    objectCount: shells.length,
   };
+  // The mesh goes out a piece at a time, compressed as it is written: a model of
+  // millions of faces is never held as one string (the browser caps a string at
+  // some hundred million characters) nor as one buffer.
+  const progress = new WriteProgress(options.model.vertices.length + options.model.triangles.length, options.onProgress);
+  const zip = new ZipOut("model/3mf");
 
   if (bambuProject && options.bambuPrinter) {
     const physicalColours = physicalSlotColours(options.physicalSlots);
@@ -1458,26 +1499,34 @@ export async function buildPrusa3mfBlob(
     const files = bambuProject.bambuProjectFiles({
       title: titleFromFilename(fileName),
       sourceFile: options.model.name || `${modelBaseName(fileName)}.obj`,
-      objects: modelResult.meshes,
+      objects: shells.map((shell) => ({ name: shell.name, faceCount: shell.faceCount })),
       transform: transformResult.transform,
       settings,
       hasThumbnail: true,
     });
-    const projectZip = new JSZip();
-    for (const [path, text] of files) projectZip.file(path, text);
-    projectZip.file("Metadata/plate_1.png", generatedThumbnailBytes);
-    const projectBytes = await projectZip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
+    for (const [path, text] of files) zip.text(path, text);
+    zip.bytes("Metadata/plate_1.png", generatedThumbnailBytes);
+    // A Bambu Studio project keeps each mesh in its own file.
+    for (const [index, shell] of shells.entries()) {
+      const frame = bambuProject.bambuObjectModelFrame(index);
+      const entry = zip.stream(`3D/Objects/object_${index + 1}.model`);
+      const out = new LineWriter((text) => entry.push(text));
+      for (const line of frame.head) out.push(line);
+      await writeMesh(options, shell, leaves, paletteIndices, out, progress);
+      for (const line of frame.tail) out.push(line);
+      out.flush();
+      entry.end();
+    }
     return {
-      blob: new Blob([projectBytes as Uint8Array<ArrayBuffer>], { type: "model/3mf" }),
+      blob: await zip.close(),
       fileName,
       summary: { ...summaryBase, printerConfigIncluded: true, bambuMixedFilaments: mixedSlots.length },
     };
   }
 
-  const zip = new JSZip();
-  zip.file("[Content_Types].xml", writeContentTypes(true));
-  zip.file("_rels/.rels", writeRels(true));
-  zip.file("3D/3dmodel.model", modelResult.xml);
+  zip.text("[Content_Types].xml", writeContentTypes(true));
+  zip.text("_rels/.rels", writeRels(true));
+  await writeModelFile(options, shells, leaves, paletteIndices, transformResult.transform, zip.stream("3D/3dmodel.model"), progress);
   // D-2: Slic3r_PE.config is only written when explicitly requested and a
   // template provides it.  A generated config would override the printer
   // profile the user selected in PrusaSlicer (e.g. XL wipe tower settings).
@@ -1489,7 +1538,7 @@ export async function buildPrusa3mfBlob(
       options.physicalSlots,
       options.updateExtruderColour ?? true,
     );
-    zip.file(
+    zip.text(
       "Metadata/Slic3r_PE.config",
       preset
         ? applyPrintPresetToConfig(withSlots, preset).replace(
@@ -1499,23 +1548,14 @@ export async function buildPrusa3mfBlob(
         : withSlots,
     );
   }
-  zip.file("Metadata/Slic3r_PE_model.config", modelConfig);
+  zip.text("Metadata/Slic3r_PE_model.config", modelConfig);
   if (!bambu) {
-    zip.file("Metadata/Prusa_Slicer_full_spectrum.json", fsJson);
-    zip.file(
-      "Metadata/Prusa_Slicer_wipe_tower_information.xml",
-      wipeTowerBytes ??
-        '<?xml version="1.0" encoding="UTF-8"?>\n<wipe_tower_information/>\n',
-    );
+    zip.text("Metadata/Prusa_Slicer_full_spectrum.json", fsJson);
+    if (wipeTowerBytes) zip.bytes("Metadata/Prusa_Slicer_wipe_tower_information.xml", wipeTowerBytes);
+    else zip.text("Metadata/Prusa_Slicer_wipe_tower_information.xml", '<?xml version="1.0" encoding="UTF-8"?>\n<wipe_tower_information/>\n');
   }
-  zip.file("Metadata/thumbnail.png", generatedThumbnailBytes);
-
-  const bytes = await zip.generateAsync({
-    type: "uint8array",
-    compression: "DEFLATE",
-    compressionOptions: { level: 6 },
-  });
-  const blob = new Blob([bytes as Uint8Array<ArrayBuffer>], { type: "model/3mf" });
+  zip.bytes("Metadata/thumbnail.png", generatedThumbnailBytes);
+  const blob = await zip.close();
 
   return {
     blob,

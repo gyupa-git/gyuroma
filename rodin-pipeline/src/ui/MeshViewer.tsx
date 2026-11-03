@@ -54,6 +54,23 @@ export interface ViewerHit {
   normal: [number, number, number];
   /** The cut piece under the pointer (an index into the view's `cut`), when the face is shown cut. */
   piece?: number;
+  /** Where on the face the point is: its barycentric weights, in the face's corner order. */
+  bary?: [number, number, number];
+}
+
+/** Barycentric weights of a point on a triangle (clamped onto it); even thirds for a degenerate one. */
+function barycentric(p: THREE.Vector3, a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3): [number, number, number] {
+  const v0 = new THREE.Vector3().subVectors(b, a);
+  const v1 = new THREE.Vector3().subVectors(c, a);
+  const v2 = new THREE.Vector3().subVectors(p, a);
+  const d00 = v0.dot(v0), d01 = v0.dot(v1), d11 = v1.dot(v1), d20 = v2.dot(v0), d21 = v2.dot(v1);
+  const denom = d00 * d11 - d01 * d01;
+  if (!(Math.abs(denom) > 1e-18)) return [1 / 3, 1 / 3, 1 / 3];
+  const v = Math.max(0, (d11 * d20 - d01 * d21) / denom);
+  const w = Math.max(0, (d00 * d21 - d01 * d20) / denom);
+  const u = Math.max(0, 1 - v - w);
+  const sum = u + v + w || 1;
+  return [u / sum, v / sum, w / sum];
 }
 
 export interface BrushCursor {
@@ -120,6 +137,12 @@ export interface MeshViewerProps {
    * before clicking; with the cut piece under it when the face is shown cut.
    */
   onHoverFace?: (faceIndex: number | null, piece?: number) => void;
+  /**
+   * Where the pointer rests on the surface outside the brush (the brush has onBrushHover):
+   * every move, with the point on the face, so the spot can be shown on the colour map;
+   * null when it leaves the model or starts a drag.
+   */
+  onHoverHit?: (hit: ViewerHit | null) => void;
   onBrushHover?: (hit: ViewerHit | null) => void;
   onBrushStart?: (hit: ViewerHit | null) => void;
   onBrushDrag?: (hit: ViewerHit | null) => void;
@@ -1500,7 +1523,7 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   const run = cutShown ? state.cut?.runs.get(id) : undefined;
   const pieceColours = state.cut ? ((state.cut.mesh.geometry.getAttribute("color") as THREE.BufferAttribute).array as Float32Array) : null;
   const piece = run && state.cut && pieceColours && pieceColours[run[0] * 9] >= 0 ? pieceAt(state.cut.positions, run[0], run[1], [point.x, point.y, point.z]) : undefined;
-  return { faceIndex: id, point: [point.x, point.y, point.z], normal: [normal.x, normal.y, normal.z], piece };
+  return { faceIndex: id, point: [point.x, point.y, point.z], normal: [normal.x, normal.y, normal.z], piece, bary: barycentric(point, a, b, c) };
 }
 
 function makeCursorLine(): THREE.LineLoop {
@@ -1523,14 +1546,14 @@ function makeCursorLine(): THREE.LineLoop {
 }
 
 export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function MeshViewer(
-  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
+  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
   ref,
 ) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const calloutLayerRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<ViewerState | null>(null);
-  const callbacksRef = useRef({ onPick, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd });
-  callbacksRef.current = { onPick, onHoverFace, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd };
+  const callbacksRef = useRef({ onPick, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd });
+  callbacksRef.current = { onPick, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd };
   const flatRef = useRef(flat);
   flatRef.current = flat;
   const softEdgesRef = useRef(softEdges);
@@ -1765,11 +1788,13 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       // The hand only moves the view: no patch to show, no brush circle.
       if (handRef.current) {
         reportHover(null);
+        callbacksRef.current.onHoverHit?.(null);
         return;
       }
       const hit = gpuPick(state, move.x, move.y);
       if (!brushRef.current) {
         reportHover(hit ? hit.faceIndex : null, hit?.piece);
+        callbacksRef.current.onHoverHit?.(hit);
         return;
       }
       hoverFace = null;
@@ -1798,6 +1823,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         if (event.buttons !== 0) {
           pendingMove = null;
           reportHover(null);
+          callbacksRef.current.onHoverHit?.(null);
           return;
         }
       }
@@ -1833,6 +1859,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const onPointerLeave = () => {
       pendingMove = null;
       reportHover(null);
+      callbacksRef.current.onHoverHit?.(null);
       if (brushRef.current) {
         callbacksRef.current.onBrushHover?.(null);
         if (!eyedropperRef.current && !handRef.current) renderer.domElement.style.cursor = "crosshair";

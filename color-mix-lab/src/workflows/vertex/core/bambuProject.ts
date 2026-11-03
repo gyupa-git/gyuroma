@@ -231,8 +231,8 @@ export function bambuPlate(printerKey: string, physicalCount: number, footprint?
 
 export interface BambuProjectObject {
   name: string;
-  /** The object's `<mesh>…</mesh>` lines, triangles painted with `paint_color`. */
-  meshLines: string[];
+  /** The object's `<mesh>…</mesh>` lines, triangles painted with `paint_color`; left out when the caller writes the object file itself. */
+  meshLines?: string[];
   faceCount: number;
 }
 
@@ -246,6 +246,20 @@ function hex8(value: number): string {
 
 export const BAMBU_MODEL_HEADER =
   '<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">';
+
+/** The object file around one object's `<mesh>` lines: the lines before them, and after. */
+export function bambuObjectModelFrame(k: number): { head: string[]; tail: string[] } {
+  return {
+    head: [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      BAMBU_MODEL_HEADER,
+      ' <metadata name="BambuStudio:3mfVersion">1</metadata>',
+      " <resources>",
+      `  <object id="${k + 1}" p:UUID="${hex8(0x10000 + k)}-81cb-4c03-9d28-80fed5dfa1dc" type="model">`,
+    ],
+    tail: ["  </object>", " </resources>", " <build/>", "</model>"],
+  };
+}
 
 /**
  * Every file of a Bambu Studio project except the thumbnail: the model with
@@ -292,21 +306,9 @@ export function bambuProjectFiles(input: {
   files.set("3D/3dmodel.model", main.join("\n") + "\n");
 
   input.objects.forEach((object, k) => {
-    files.set(
-      `3D/Objects/object_${k + 1}.model`,
-      [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        BAMBU_MODEL_HEADER,
-        ' <metadata name="BambuStudio:3mfVersion">1</metadata>',
-        " <resources>",
-        `  <object id="${k + 1}" p:UUID="${hex8(0x10000 + k)}-81cb-4c03-9d28-80fed5dfa1dc" type="model">`,
-        ...object.meshLines,
-        "  </object>",
-        " </resources>",
-        " <build/>",
-        "</model>",
-      ].join("\n") + "\n",
-    );
+    if (!object.meshLines) return;
+    const frame = bambuObjectModelFrame(k);
+    files.set(`3D/Objects/object_${k + 1}.model`, [...frame.head, ...object.meshLines, ...frame.tail].join("\n") + "\n");
   });
 
   files.set(

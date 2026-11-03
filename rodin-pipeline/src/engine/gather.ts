@@ -1,4 +1,5 @@
-import { Inflate, Zip, ZipDeflate } from "fflate";
+import { Inflate } from "fflate";
+import { ZipOut } from "@core/zipOut";
 import { MAX_PAINTABLE_EXTRUDER_ID, paintCodeStates, remapPaintCode, type PaintFlavour } from "@core/paintCodes";
 import {
   BAMBU_MAX_SLOTS,
@@ -1237,46 +1238,6 @@ function hex8(value: number): string {
   return value.toString(16).padStart(8, "0");
 }
 
-/** The new file, compressed as it is written. */
-class ZipOut {
-  private parts: Uint8Array[] = [];
-  private failure: unknown = null;
-  private finished!: () => void;
-  private done = new Promise<void>((resolve) => (this.finished = resolve));
-  private zip = new Zip((error, chunk, final) => {
-    if (error) this.failure = error;
-    else this.parts.push(chunk);
-    if (final || error) this.finished();
-  });
-  private encoder = new TextEncoder();
-  text(path: string, text: string) {
-    const entry = new ZipDeflate(path, { level: 6 });
-    this.zip.add(entry);
-    entry.push(this.encoder.encode(text), true);
-  }
-  bytes(path: string, bytes: Uint8Array) {
-    const entry = new ZipDeflate(path, { level: 6 });
-    this.zip.add(entry);
-    entry.push(bytes, true);
-  }
-  /** An entry written in pieces: push text, then end. */
-  stream(path: string): { push: (text: string) => void; end: (text?: string) => void } {
-    const entry = new ZipDeflate(path, { level: 6 });
-    this.zip.add(entry);
-    return {
-      push: (text) => {
-        if (text) entry.push(this.encoder.encode(text), false);
-      },
-      end: (text = "") => entry.push(this.encoder.encode(text), true),
-    };
-  }
-  async close(): Promise<Blob> {
-    this.zip.end();
-    await this.done;
-    if (this.failure) throw this.failure;
-    return new Blob(this.parts as Uint8Array<ArrayBuffer>[], { type: "model/3mf" });
-  }
-}
 
 /**
  * Copies what is inside `<resources>` of one model file, a piece at a time,
@@ -1452,7 +1413,7 @@ export async function writeGather(files: Blob[], sources: GatherSource[], plan: 
 }
 
 async function writePrusa(files: Blob[], sources: GatherSource[], plan: GatherPlan, options: GatherWriteOptions): Promise<Blob> {
-  const zip = new ZipOut();
+  const zip = new ZipOut("model/3mf");
   const base = sources[plan.used[0]];
   const thumbnail = options.thumbnail ?? base.thumbnail;
   zip.text(
@@ -1628,7 +1589,7 @@ async function writeBambu(files: Blob[], sources: GatherSource[], plan: GatherPl
   let assemblies = 0;
   for (const index of plan.used) for (const object of sources[index].objects) assemblyId.set(`${index}|${object.id}`, meshCount + ++assemblies);
 
-  const zip = new ZipOut();
+  const zip = new ZipOut("model/3mf");
   const thumbnail = options.thumbnail ?? base.thumbnail;
   const date = new Date().toISOString().slice(0, 10);
   const main: string[] = ['<?xml version="1.0" encoding="UTF-8"?>', BAMBU_MODEL_HEADER];

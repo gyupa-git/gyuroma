@@ -132,8 +132,8 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 2,
         at: ["[data-guide=cut]", ".view-tools", ".stage"],
-        ko: "경계를 더 매끈하게 하고 싶으면 **선 따라 자르기**를 켜 주세요. 계단진 경계를 선 따라 잘라 보여 주고, **✂ 자르기 확정**을 누르면 모델에 들어갑니다.",
-        en: "For smoother borders, switch on **Cut along lines**. It cuts the stair-stepped borders along a smooth line, and **✂ Confirm cut** puts that into the model.",
+        ko: "경계는 두 번에 걸쳐 매끈해져요. 먼저 왼쪽 **경계 매끈하게** 프리셋이 큰 계단을 펴고, 그래도 남는 삼각형 크기의 작은 계단은 여기 **선 따라 자르기**가 선 그대로 잘라 줍니다. **✂ 자르기 확정**을 누르면 잘린 조각까지 모델에 들어가죠.",
+        en: "Borders get smooth in two passes. First the **Smooth borders** preset on the left straightens the big stairs; the small, triangle-sized steps left over are cut along a smooth line by **Cut along the line** here. **✂ Confirm cut** puts the cut pieces into the model.",
       },
       {
         step: 3,

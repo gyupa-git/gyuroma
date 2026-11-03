@@ -36,6 +36,8 @@ interface Placement {
 }
 
 const MARGIN = 10;
+/** The bubble's fade out (styles.css .guide-bubble, opacity 0.18s): a line's words change only once it is gone. */
+const FADE_MS = 200;
 /** The tour's place in the guide's contents (the welcome hint offers it). */
 const TOUR = GUIDE.findIndex((chapter) => chapter.id === "tour");
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -147,6 +149,8 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
   const open = mode !== null;
   const { lang, t } = useContext(LangContext);
   const [phase, setPhase] = useState<Phase>({ kind: "menu" });
+  /** What the bubble says: it turns to the new phase only once the bubble has closed (the run below). */
+  const [said, setSaid] = useState<Phase>({ kind: "menu" });
   const [shown, setShown] = useState<Placement | null>(null);
   const [gyupaAt, setGyupaAt] = useState<{ x: number; y: number; ms: number } | null>(null);
   const [walking, setWalking] = useState(false);
@@ -155,6 +159,8 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const primaryRef = useRef<HTMLButtonElement | null>(null);
   const runRef = useRef(0);
+  /** When the closing bubble is fully gone (performance.now()). */
+  const goneAtRef = useRef(0);
   const startStepRef = useRef(step);
   const stepRef = useRef(step);
   stepRef.current = step;
@@ -190,6 +196,17 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode]);
 
+  // Closed, it opens next time from the contents: a line left open (Esc mid-chapter) must not come
+  // back for a moment and open its app step under a hint or the contents (02's first hint over 04).
+  useEffect(() => {
+    if (open) return;
+    setPhase({ kind: "menu" });
+    setSaid({ kind: "menu" });
+    setTalking(false);
+    setWalking(false);
+    goneAtRef.current = 0;
+  }, [open]);
+
   // The tour shows every step: their first-time hints have nothing more to say.
   useEffect(() => {
     if (phase.kind === "chapter" && GUIDE[phase.chapter].id === "tour") markHintsSeen([2, 3, 4]);
@@ -208,12 +225,20 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
     onMode(null);
   };
 
-  // Each new line (or menu): open its app step, find the part, place, walk, then talk.
+  // Each new line (or menu): the bubble closes on the words it showed, then the line's app step
+  // opens, Gyupa walks to the part, and only then the bubble opens on the new words where he
+  // stands — a press never shows new words in the old place (the owner: they changed under the
+  // finger and blinked, "뭘 잘못눌렀나?").
   useLayoutEffect(() => {
     if (!open) return;
     const run = ++runRef.current;
+    if (talking) goneAtRef.current = performance.now() + FADE_MS;
     setTalking(false);
     void (async () => {
+      const fading = goneAtRef.current - performance.now();
+      if (fading > 0 && !reducedMotion()) await sleep(fading);
+      if (run !== runRef.current) return;
+      setSaid(phase);
       if (current?.step && stepRef.current !== current.step) {
         onStep(current.step);
         await sleep(160);
@@ -305,13 +330,13 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
   );
 
   let body: ReactNode;
-  if (phase.kind === "hint") {
-    const line = HINTS[phase.hint];
+  if (said.kind === "hint") {
+    const line = HINTS[said.hint];
     body = (
       <>
         <p className="guide-text">{rich(say(line.ko, line.en))}</p>
         <div className="guide-actions">
-          {phase.hint === "welcome" ? (
+          {said.hint === "welcome" ? (
             <>
               <button type="button" className="btn small" onClick={close}>
                 {t("guide.hintSelf")}
@@ -333,23 +358,23 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
         </div>
       </>
     );
-  } else if (phase.kind === "menu" || phase.kind === "end") {
+  } else if (said.kind === "menu" || said.kind === "end") {
     body = (
       <>
-        <p className="guide-text">{phase.kind === "menu" ? t("guide.hello") : t("guide.more")}</p>
+        <p className="guide-text">{said.kind === "menu" ? t("guide.hello") : t("guide.more")}</p>
         {chapterButtons}
         <div className="guide-actions">
           <span className="guide-keys">{t("guide.keysMenu")}</span>
           <button type="button" className="btn small" onClick={close}>
-            {phase.kind === "menu" ? t("guide.later") : t("guide.finish")}
+            {said.kind === "menu" ? t("guide.later") : t("guide.finish")}
           </button>
         </div>
       </>
     );
   } else {
-    const chapter = GUIDE[phase.chapter];
-    const line = chapter.steps[phase.index];
-    const last = phase.index === chapter.steps.length - 1;
+    const chapter = GUIDE[said.chapter];
+    const line = chapter.steps[said.index];
+    const last = said.index === chapter.steps.length - 1;
     body = (
       <>
         <div className="guide-head">
@@ -358,14 +383,14 @@ export function GuideTour({ mode, onMode, step, onStep }: { mode: GuideMode | nu
           </span>
           <span>{say(chapter.ko, chapter.en)}</span>
           <span className="guide-count mono">
-            {phase.index + 1} / {chapter.steps.length}
+            {said.index + 1} / {chapter.steps.length}
           </span>
         </div>
         <p className="guide-text">{rich(say(line.ko, line.en))}</p>
         <div className="guide-actions">
           <span className="guide-keys">{t("guide.keys")}</span>
           <button type="button" className="btn small" onClick={prev}>
-            {phase.index === 0 ? t("guide.contents") : t("guide.prev")}
+            {said.index === 0 ? t("guide.contents") : t("guide.prev")}
           </button>
           <button type="button" className="btn small primary" ref={primaryRef} onClick={next}>
             {last ? t("guide.chapterDone") : t("guide.next")}

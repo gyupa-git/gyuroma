@@ -139,6 +139,20 @@ export function representativeColoursByPosition(
   });
 }
 
+/** Writes one colour into a colour buffer for these faces (a brush stroke's faces); the buffer stays the same object. */
+export function patchColourBuffer(buffer: Float32Array, faces: ArrayLike<number>, rgb: RGB): Float32Array {
+  const r = srgbToLinear(rgb[0]), g = srgbToLinear(rgb[1]), b = srgbToLinear(rgb[2]);
+  for (let i = 0; i < faces.length; i++) {
+    let p = faces[i] * 9;
+    for (let k = 0; k < 3; k++) {
+      buffer[p++] = r;
+      buffer[p++] = g;
+      buffer[p++] = b;
+    }
+  }
+  return buffer;
+}
+
 export function countUniqueColours(colours: ArrayLike<RGB>): number {
   const keys = new Set<number>();
   for (let i = 0; i < colours.length; i++) keys.add(colourKey(colours[i]));
