@@ -21,6 +21,8 @@ const ICONS = {
   // Two parts with three small triangles wedged between them, each its own way (the top one
   // tilted, so it is no mirror of the bottom one).
   gap: <><rect x="0.9" y="2" width="2" height="12" rx="1" /><rect x="13.1" y="2" width="2" height="12" rx="1" /><path d="M7.97 1.78 8.95 5.45 5.28 4.47zM6.41 8 9.7 6.1v3.8zM7.4 14.29 5.5 11h3.8z" fill="currentColor" stroke="none" /></>,
+  /* the healing brush: a patch of colour with the specks (the gap icon's three pieces) lying in it */
+  heal: <><rect x="1.2" y="1.2" width="13.6" height="13.6" rx="4.6" fill="currentColor" opacity="0.32" stroke="none" /><path d="M7.98 3.02 8.76 5.96 5.82 5.18zM6.73 8 9.36 6.48v3.04zM7.52 13.03 6 10.4h3.04z" fill="currentColor" stroke="none" /></>,
   // Tip, tube, collar and bulb on one centre line, turned 45° — the same drawing as the eyedropper cursor.
   eyedropper: <g transform="translate(3.333 13.333) rotate(-45)"><path d="M0 0 1.8-1.1H9V1.1H1.8z" /><path d="M9-1.9h.8v3.8H9z" fill="currentColor" /><path d="M9.8-1.5h1.8a1.5 1.5 0 0 1 0 3H9.8z" fill="currentColor" /></g>,
   map: <><path d="M1.5 3.5 5.5 2l5 1.5 4-1.5v10.5l-4 1.5-5-1.5-4 1.5z" /><path d="M5.5 2v10.5M10.5 3.5V14" /></>,

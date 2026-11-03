@@ -7070,7 +7070,7 @@ export default function App() {
                 </span>
               </button>
               <button type="button" aria-pressed={brushMode && healMode} title={t("heal.hint")} onClick={() => { const on = !(brushMode && healMode); setBrushMode(on); setHealMode(on); if (on) healPickRef.current(); }}>
-                <Icon name="gap" size={17} stroke={1.4} />
+                <Icon name="heal" size={17} stroke={1.4} />
                 <span>
                   {t("tool.heal")} <span className="key">H</span>
                 </span>

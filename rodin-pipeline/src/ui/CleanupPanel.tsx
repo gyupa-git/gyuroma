@@ -298,7 +298,7 @@ export function CleanupPanel({
                 <span>{t("clean.cross")}</span>
               </button>
               <button type="button" disabled={busy} title={t("clean.specksHint", { n: mergeSettings.minBlobDefault })} onClick={() => onRemoveSpecks(focusHex)}>
-                <Icon name="gap" />
+                <Icon name="heal" />
                 <span>{t("clean.specks")}</span>
               </button>
             </div>
