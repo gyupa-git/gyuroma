@@ -5607,7 +5607,30 @@ export default function App() {
    * The model as it goes out: with the faces along the borders cut along the
    * line when that is on — what the result view shows.
    */
+  /**
+   * The model as it goes out, and each of its faces' group (palette position) — what the
+   * palette and print views show.  The export prints the group, never a face's own shade
+   * matched again to the nearest palette colour: a shade sits in its group by the colour
+   * strip, not by distance (11-04: the white clothes' grey shades — 5.5 % of the model —
+   * would have printed as the face's tan).
+   */
+  async function exportFaces(current: MeshModel): Promise<{ model: MeshModel; groups: Int32Array }> {
+    const model = await modelForExport(current);
+    if (model === current) return { model, groups: labels };
+    const cut = exportCutRef.current;
+    const groups = new Int32Array(model.triangles.length);
+    if (cut) for (let i = 0; i < groups.length; i++) groups[i] = cut.piece[i] >= 0 ? cut.pieceGroups[cut.piece[i]] : labels[cut.originalFace[i]];
+    return { model, groups };
+  }
+  /** The faces of the last cut export: their pieces and the faces they came from. */
+  const exportCutRef = useRef<{ piece: Int32Array; originalFace: Int32Array; pieceGroups: Int32Array } | null>(null);
+  /** The group colours of `groups`, for an export that maps colours to the palette: exact, so nothing moves. */
+  function groupColours(groups: Int32Array, fallback: RGB[]): RGB[] {
+    return Array.from(groups, (g, i) => palette[g]?.rgb ?? fallback[i]);
+  }
+
   async function modelForExport(current: MeshModel): Promise<MeshModel> {
+    exportCutRef.current = null;
     if (cutSpan <= 0 || palette.length === 0 || labels.length !== current.triangles.length) return current;
     let cut: BorderCut | null = null;
     for (let attempt = 0; attempt < 3 && !cut; attempt++) {
@@ -5618,7 +5641,9 @@ export default function App() {
       }
     }
     if (!cut || cut.replaced.length === 0) return current;
-    return cutModelOf(current, cut, labels).model;
+    const made = cutModelOf(current, cut, labels);
+    exportCutRef.current = { piece: Int32Array.from(made.mesh.piece), originalFace: Int32Array.from(made.mesh.originalFace), pieceGroups: Int32Array.from(cut.pieceGroups) };
+    return made.model;
   }
 
   /** The cut worked out for exactly what is shown now (null while it is being worked out). */
@@ -5792,7 +5817,7 @@ export default function App() {
     try {
       const e = settings.export;
       const format = e.colourFormat && printer.formats.includes(e.colourFormat) ? e.colourFormat : printer.formats[0];
-      const model = await modelForExport(source);
+      const { model, groups } = await exportFaces(source);
       const { transform } = buildTransform(model, null, {
         coordinateMode: e.coordinateMode,
         scale: e.scale,
@@ -5805,7 +5830,7 @@ export default function App() {
         defaultExtruder: 1,
       });
       // Every face gets its palette colour exactly: the cleaned colours, not filament stand-ins.
-      const faceColours = model.triangleColors.map((rgb) => palette[nearestPaletteIndex(rgb, palette, settings.palette.accentProtection)]?.rgb ?? rgb);
+      const faceColours = groupColours(groups, model.triangleColors);
       const result = await buildColourFile(format, {
         model,
         faceColours,
@@ -5840,7 +5865,7 @@ export default function App() {
     try {
       const e = settings.export;
       const prusa = printer.slicer === "prusa";
-      const model = await modelForExport(source);
+      const { model, groups } = await exportFaces(source);
       const fileName = (e.fileName.trim() || defaultFileName).replace(/\.3mf$/i, "") + ".3mf";
       const result = await buildPrusa3mfBlob({
         slicer: printer.slicer,
@@ -5849,7 +5874,8 @@ export default function App() {
         templateArrayBuffer: template?.buffer ?? null,
         templateInfo: template?.info ?? null,
         model,
-        adjustedColors: model.triangleColors,
+        // Each face in its group's colour exactly, matched with no accent rule: the group shown is the group printed.
+        adjustedColors: groupColours(groups, model.triangleColors),
         palette,
         physicalSlots: slots,
         virtualPlan: plan,
@@ -5864,7 +5890,7 @@ export default function App() {
           fallbackBedSize: { x: e.bedX, y: e.bedY },
           defaultExtruder: e.defaultExtruder,
         },
-        accentProtection: settings.palette.accentProtection,
+        accentProtection: "off",
         splitObjects: e.splitObjects,
         // PrusaSlicer's XL profiles and the template's config mean nothing to other slicers.
         printPreset: prusa ? e.printPreset : null,
