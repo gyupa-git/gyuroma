@@ -1627,15 +1627,19 @@ export default function App() {
   // the same object: the views painted those faces as the stroke went, so nothing is
   // uploaded again.
   const sourceBufferRef = useRef<{ colours: RGB[]; buffer: Float32Array } | null>(null);
+  /**
+   * "원본 색": the file's own colours, as it was loaded — what painting, filling and tidying
+   * changed is not in it (11-04: it showed the faces as they are now, painted bits and all,
+   * and read as a bug).  Through confirmed cuts the file's colours follow the pieces.
+   */
   const sourceColours = useMemo(() => {
     if (!model) return null;
+    const own = originalColoursRef.current;
+    const colours = own && own.length === model.triangles.length ? own : model.triangleColors;
     const prev = sourceBufferRef.current;
-    const patch = strokePatchFor(prev?.colours, model.triangleColors);
-    const buffer =
-      patch && prev && prev.buffer.length === model.triangles.length * 9
-        ? patchColourBuffer(prev.buffer, patch.faces, patch.rgb)
-        : buildColourBuffer(model.triangles.length, (i) => model.triangleColors[i]);
-    sourceBufferRef.current = { colours: model.triangleColors, buffer };
+    if (prev && prev.colours === colours && prev.buffer.length === model.triangles.length * 9) return prev.buffer;
+    const buffer = buildColourBuffer(model.triangles.length, (i) => colours[i]);
+    sourceBufferRef.current = { colours, buffer };
     return buffer;
   }, [model]);
   const paletteHexKey = useMemo(() => palette.map((entry) => rgbToHex(entry.rgb)).join(","), [palette]);
@@ -2466,7 +2470,7 @@ export default function App() {
     }
     if (byColour.size > 0) session.touched = true;
     session.shown = plan.colours;
-    for (const { rgb, faces } of byColour.values()) for (const handle of viewerHandles()) handle.setFaceColours(faces, rgb);
+    for (const { rgb, faces } of byColour.values()) for (const handle of editedViewers()) handle.setFaceColours(faces, rgb);
     setEdgeCount({ join: plan.join, leave: plan.leave });
   }
 
@@ -2645,7 +2649,7 @@ export default function App() {
     }
     held.touched = true;
     const rgb = hexToRgb(hex);
-    for (const handle of [viewerRef0.current, viewerRef1.current, viewerRef2.current]) handle?.setFaceColours(held.faces, rgb);
+    for (const handle of editedViewers()) handle.setFaceColours(held.faces, rgb);
   }
 
   /**
@@ -2829,22 +2833,10 @@ export default function App() {
     const colourOf = toneColours(session.colours, next, session.taken, session.walls);
     session.shown = next;
     session.touched = true;
-    const { faces, shade, colours } = session;
-    const each = new Uint8Array(faces.length * 3);
-    for (let i = 0; i < faces.length; i++) {
-      const rgb = colourOf.get(colours[shade[i]].key) as RGB;
-      each[i * 3] = rgb[0];
-      each[i * 3 + 1] = rgb[1];
-      each[i * 3 + 2] = rgb[2];
-    }
+    const { faces, colours } = session;
     const rep = colourOf.get(session.repKey) ?? colours[0].rgb;
-    // The source view shows every shade; the palette and print views the group's one colour.
-    viewerRef0.current?.setFaceColourList(faces, each);
-    for (const handle of [viewerRef1.current, viewerRef2.current]) {
-      if (!handle) continue;
-      if (resultMode === "source") handle.setFaceColourList(faces, each);
-      else handle.setFaceColours(faces, rep);
-    }
+    // The palette and print views show the group's one colour; the source view the file's own, untouched.
+    for (const handle of editedViewers()) handle.setFaceColours(faces, rep);
     setToneHex(rgbToHex(rep));
     // Brightness held back by the next group's lightness: say so, or the slider seems not to work.
     const repL = rgbToLab(rep).L;
@@ -4379,8 +4371,17 @@ export default function App() {
     const look = mapLookRef.current;
     const entry = look && look.mode !== "source" && look.labels.length > face ? look.palette[look.labels[face]] : undefined;
     if (entry) return (look?.mode === "print" && look.effective.get(entry.index)) || entry.rgb;
+    // The source look: the file's own colours, as the source view shows them.
+    const own = originalColoursRef.current;
+    if (look?.mode === "source" && own && own.length > face) return own[face];
     return modelRef.current?.triangleColors[face] ?? [128, 128, 128];
   }, []);
+
+  /** The views that show the colours as edited — not the source view (the file's own colours), nor the result view in its source look. */
+  function editedViewers(): MeshViewerHandle[] {
+    const result = viewerRef2.current;
+    return result && resultMode !== "source" ? [result] : [];
+  }
 
   function viewerHandles(): MeshViewerHandle[] {
     return viewerRefs.map((r) => r.current).filter((h): h is MeshViewerHandle => h !== null);
@@ -4425,7 +4426,7 @@ export default function App() {
     if (changed.length === 0) return;
     stroke.count += changed.length;
     for (let i = 0; i < changed.length; i++) stroke.changed.push(changed[i]);
-    for (const handle of viewerHandles()) handle.setFaceColours(changed, rgb);
+    for (const handle of editedViewers()) handle.setFaceColours(changed, rgb);
     mapRef.current?.repaintFaces(changed);
   }
 
@@ -4534,7 +4535,7 @@ export default function App() {
     stroke.count += changed.length;
     for (let i = 0; i < changed.length; i++) stroke.changed.push(changed[i]);
     const list = Uint8Array.from(each);
-    for (const handle of viewerHandles()) handle.setFaceColourList(changed, list);
+    for (const handle of editedViewers()) handle.setFaceColourList(changed, list);
     mapRef.current?.repaintFaces(changed);
   }
 
@@ -4560,7 +4561,7 @@ export default function App() {
     const rgb = hexToRgb(hex);
     const next = current.triangleColors.slice();
     for (let i = 0; i < faces.length; i++) next[faces[i]] = rgb;
-    for (const handle of viewerHandles()) handle.setFaceColours(faces, rgb);
+    for (const handle of editedViewers()) handle.setFaceColours(faces, rgb);
     mapRef.current?.repaintFaces(faces);
     keepGroupsFor(current.triangleColors, next);
     strokePatchRef.current = { from: current.triangleColors, to: next, faces, rgb, exact: false };
