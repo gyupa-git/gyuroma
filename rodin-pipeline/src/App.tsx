@@ -89,6 +89,7 @@ import {
 } from "./engine/storage";
 import { MeshViewer, type Callout, type FocusMode, type HighlightOverlay, type LayerPreview, type MeshViewerHandle, type PickInfo, type ViewerCut, type ViewerHit } from "./ui/MeshViewer";
 import { meshWithCut, type BorderCut } from "@core/borderCut";
+import { fillSmallHoles } from "@core/meshHoles";
 import { cutBorders, CutSuperseded } from "./engine/borderCutClient";
 import { ColourStrip, type StripOutput } from "./ui/ColourStrip";
 import { CleanupPanel } from "./ui/CleanupPanel";
@@ -5616,13 +5617,40 @@ export default function App() {
    * would have printed as the face's tan).
    */
   async function exportFaces(current: MeshModel): Promise<{ model: MeshModel; groups: Int32Array }> {
-    const model = await modelForExport(current);
-    if (model === current) return { model, groups: labels };
-    const cut = exportCutRef.current;
-    const groups = new Int32Array(model.triangles.length);
-    if (cut) for (let i = 0; i < groups.length; i++) groups[i] = cut.piece[i] >= 0 ? cut.pieceGroups[cut.piece[i]] : labels[cut.originalFace[i]];
+    const cutModel = await modelForExport(current);
+    let model = cutModel;
+    let groups: Int32Array = labels;
+    if (cutModel !== current) {
+      const cut = exportCutRef.current;
+      groups = new Int32Array(cutModel.triangles.length);
+      if (cut) for (let i = 0; i < groups.length; i++) groups[i] = cut.piece[i] >= 0 ? cut.pieceGroups[cut.piece[i]] : labels[cut.originalFace[i]];
+    }
+    // Small holes closed (a shell left open is dropped by the slicer from every layer that crosses
+    // its hole — 11-04: two hair locks cut flat 3 mm short): the new faces take the colour beside them.
+    holesClosedRef.current = 0;
+    if (settings.export.closeHoles) {
+      const fill = fillSmallHoles(model.vertices, model.triangles);
+      if (fill.triangles.length > 0) {
+        const base = model;
+        const more = new Int32Array(groups.length + fill.triangles.length);
+        more.set(groups);
+        for (let i = 0; i < fill.borders.length; i++) more[groups.length + i] = groups[fill.borders[i]];
+        groups = more;
+        const triangleColors = base.triangleColors.concat(Array.from(fill.borders, (f) => base.triangleColors[f]));
+        model = {
+          ...base,
+          vertices: base.vertices.concat(fill.vertices),
+          triangles: base.triangles.concat(fill.triangles),
+          triangleColors,
+          stats: { ...base.stats, vertexCount: base.vertices.length + fill.vertices.length, triangleCount: triangleColors.length },
+        };
+        holesClosedRef.current = fill.filled;
+      }
+    }
     return { model, groups };
   }
+  /** Small holes the last export closed. */
+  const holesClosedRef = useRef(0);
   /** The faces of the last cut export: their pieces and the faces they came from. */
   const exportCutRef = useRef<{ piece: Int32Array; originalFace: Int32Array; pieceGroups: Int32Array } | null>(null);
   /** The group colours of `groups`, for an export that maps colours to the palette: exact, so nothing moves. */
@@ -5845,7 +5873,7 @@ export default function App() {
       countAction(`export/${printer.id}`);
       const size = `${(result.blob.size / (1024 * 1024)).toFixed(1)} MB`;
       setExportOutcome({ kind: "ok", message: t("exp.outcomeOk", { file: result.fileName, size }), at: Date.now() });
-      setStatus(t("status.colourExported", { file: result.fileName, colours: result.colourCount, faces: result.triangleCount.toLocaleString() }));
+      setStatus(t("status.colourExported", { file: result.fileName, colours: result.colourCount, faces: result.triangleCount.toLocaleString() }) + (holesClosedRef.current > 0 ? t("status.holesClosed", { n: holesClosedRef.current }) : ""));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error("Colour export failed", err);
@@ -5927,7 +5955,7 @@ export default function App() {
           virtual: result.summary.virtualCount,
           ids: result.summary.virtualIds.join(", ") || "-",
           renumbered,
-          config: result.summary.printerConfigIncluded ? t("status.configIncluded") : t("status.configOmitted"),
+          config: (result.summary.printerConfigIncluded ? t("status.configIncluded") : t("status.configOmitted")) + (holesClosedRef.current > 0 ? t("status.holesClosed", { n: holesClosedRef.current }) : ""),
           objects: result.summary.partCount > result.summary.objectCount ? t("status.exportedParts", { objects: result.summary.objectCount, parts: result.summary.partCount }) : t("status.exportedObjects", { objects: result.summary.objectCount }),
         }),
       );

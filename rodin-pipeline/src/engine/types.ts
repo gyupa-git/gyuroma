@@ -81,6 +81,8 @@ export interface ExportSettings {
    * no head dropped beside its body, 11-04).  On by default.
    */
   splitAsParts: boolean;
+  /** Close small holes (open shells) on export, so the slicer does not drop those shells from the layers crossing them (11-04). On by default. */
+  closeHoles: boolean;
   putOnBed: boolean;
   centerOnBed: boolean;
   bedX: number;
@@ -225,6 +227,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     targetHeight: DEFAULT_TARGET_HEIGHT,
     splitObjects: true,
     splitAsParts: true,
+    closeHoles: true,
     putOnBed: true,
     centerOnBed: true,
     bedX: 360,

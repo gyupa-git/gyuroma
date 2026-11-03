@@ -402,6 +402,9 @@ export function ExportSection({
           <input type="checkbox" checked={settings.splitObjects} onChange={(e) => set({ splitObjects: e.target.checked })} />
         </Row>
       )}
+      <Row label={t("exp.closeHoles")} hint={t("exp.closeHolesHint")}>
+        <input type="checkbox" checked={settings.closeHoles} onChange={(e) => set({ closeHoles: e.target.checked })} />
+      </Row>
       {fdm && prusa && settings.splitObjects && (
         <Row label={t("exp.splitAsParts")} hint={t("exp.splitAsPartsHint")}>
           <input type="checkbox" checked={settings.splitAsParts} onChange={(e) => set({ splitAsParts: e.target.checked })} />
