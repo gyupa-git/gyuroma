@@ -121,13 +121,19 @@ export const GUIDE: GuideChapter[] = [
         step: 2,
         at: [".sidebar-foot", ".sidebar"],
         ko: "마음에 들면 **정리 실행**으로 면 색을 확정해 줍니다. 경계 톱니와 작은 조각도 이때 같이 정리되고, 되돌릴 수도 있어요.",
-        en: "Happy with it? **Clean up** bakes the colours into the faces and tidies jagged borders and specks. You can undo it.",
+        en: "Happy with it? **Tidy up** bakes the colours into the faces and tidies jagged borders and specks. You can undo it.",
       },
       {
         step: 2,
         at: [".tool-dock", ".stage"],
-        ko: "모델을 열면 여기 아래에 직접 손볼 도구가 나옵니다. **선택 V · 브러시 B · 채우기 G · 스포이드 I · 틈새 정리 C · 색지도 M**. 단축키도 같이 적혀 있죠.",
-        en: "With a model open, the tools for touching it up by hand sit down here: **Select V · Brush B · Fill G · Eyedropper I · Gap clean C · Colour map M**, shortcut keys included.",
+        ko: "모델을 열면 여기 아래에 직접 손볼 도구가 나옵니다. **선택 V · 브러시 B · 힐링 H · 채우기 G · 스포이드 I · 틈새 정리 C · 색지도 M**. 단축키도 같이 적혀 있죠.",
+        en: "With a model open, the tools for touching it up by hand sit down here: **Select V · Brush B · Heal H · Fill G · Eyedropper I · Gap clean C · Map M**, shortcut keys included.",
+      },
+      {
+        step: 2,
+        at: [".tool-dock", ".stage"],
+        ko: "얼굴의 점·얼룩은 **힐링 H**로 지워요. 색을 고르고 문지르면 그 색에 둘러싸인 다른 색만 그 색이 되고, 외곽선 밖은 안 칠해요. 바깥 원은 닿는 범위, 안쪽 원은 지울 조각의 크기. 02 '선택한 그룹'의 **얼룩 없애기**는 모델 전체를 한 번에 해 주죠.",
+        en: "Dots and blotches go with **Heal H**: pick the colour and rub — only the other colours lying in it turn into it, never past its outline. The outer circle is the reach, the inner one the biggest speck. **Remove specks** in 02's selected group does the whole model at once.",
       },
       {
         step: 2,

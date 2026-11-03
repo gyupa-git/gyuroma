@@ -4197,7 +4197,7 @@ export default function App() {
     const current = modelRef.current;
     if (!current) return false;
     if (strokeRef.current) return true;
-    if (brushMaskOnly && !pickedMask) {
+    if (brushMaskOnly && !pickedMask && !healMode) {
       setStatus(t("status.brushNeedsSelection"));
       return false;
     }
@@ -4205,7 +4205,7 @@ export default function App() {
       setStatus(t("status.healPalette"));
       return false;
     }
-    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex, changed: [], healed: healMode ? new Uint8Array(current.triangleColors.length) : null };
+    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly && !healMode ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex, changed: [], healed: healMode ? new Uint8Array(current.triangleColors.length) : null };
     return true;
   }
 
@@ -4247,7 +4247,7 @@ export default function App() {
   }
 
   function showBrushCursorAt(hit: ViewerHit | null): void {
-    const blocked = brushMaskOnly && (!pickedMask || hit === null || !pickedMask[hit.faceIndex]);
+    const blocked = !healMode && brushMaskOnly && (!pickedMask || hit === null || !pickedMask[hit.faceIndex]);
     for (const handle of viewerHandles())
       handle.setBrushCursor(hit ? { point: hit.point, normal: hit.normal, radius: brushRadius, blocked, inner: healMode ? healSize : undefined } : null);
   }
@@ -4465,6 +4465,8 @@ export default function App() {
       const step = meshUndoRef.current[meshUndoRef.current.length - 1];
       if (last === "mesh" && step && model && step.after.triangles === model.triangles) return undoMesh();
       const colours = history[history.length - 1];
+      // A tidy (a preset, the AI's changes) is one step: its settings and the bake it made come back together.
+      if (last === "colours" && model && tidyUndoRef.current.length > 0 && tidyChainRef.current && tidyChainRef.current.result === model.triangleColors) return undoTidy();
       if (last === "colours" && colours && model && colours.length === model.triangles.length) return undoMerge();
       undoOrderRef.current = order.slice(0, -1);
     }
@@ -5020,6 +5022,11 @@ export default function App() {
     setPendingTidy(null);
     setSettings((prev) => ({ ...prev, ...saved.settings }));
     if (model.triangleColors !== saved.colours) applyColours(model, saved.colours, { keepSelection: true });
+    // The bake recorded the colours it started from; back at those, that step would be a no-op — dropped.
+    if (chain && saved.colours === chain.base && history[history.length - 1] === chain.base) {
+      setHistory((prev) => prev.slice(0, -1));
+      dropUndo("colours");
+    }
     tidyChainRef.current = saved.chain;
     tidyUndoRef.current = steps.slice(0, -1);
     setTidyUndoCount(tidyUndoRef.current.length);
@@ -6673,9 +6680,11 @@ export default function App() {
                         </>
                       )}
                       <span className="muted">{t("brush.keys")}</span>
-                      <label className="inline" style={{ gap: 6 }}>
-                        <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
-                      </label>
+                      {!healMode && (
+                        <label className="inline" style={{ gap: 6 }}>
+                          <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
+                        </label>
+                      )}
                       {brushMaskOnly && !pickedMask && <span className="warn">{t("brush.selectFirst")}</span>}
                       <span className="muted">{t("brush.hint")}</span>
                     </>
@@ -6900,9 +6909,11 @@ export default function App() {
                   </>
                 )}
                 <span className="muted">{healMode ? t("brush.healKeys") : t("brush.keys")}</span>
-                <label className={`mask-toggle${brushMaskOnly && !pickedMask ? " warn" : ""}`} title={t("brush.selectFirst")}>
-                  <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
-                </label>
+                {!healMode && (
+                  <label className={`mask-toggle${brushMaskOnly && !pickedMask ? " warn" : ""}`} title={t("brush.selectFirst")}>
+                    <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
+                  </label>
+                )}
               </div>
             )}
             <MeshViewer
