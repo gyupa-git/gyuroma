@@ -4485,7 +4485,9 @@ export default function App() {
     if (!stroke || labels.length !== current.triangles.length) return { faces: new Int32Array(0), targets };
     // No colour to choose (11-03: the "change to" colour was orange, the specks lay in yellow, and nothing went):
     // each speck takes the colour around it.
-    const faces = specksIn(labels, adjacencyFor(current), { into: -1, within: reach, tip, maxFaces: 0, enclosed: 0.8, protectedLabels: protectedPositions(), taken: stroke.healed, relabel: stroke.relabel, targets });
+    // A hand tool, as the plain brush: 🔒 keeps a colour from the automatic tidy-ups, not from where you rub
+    // (11-03: the dots on the ball were bits of the protected orange, and nothing would take them).
+    const faces = specksIn(labels, adjacencyFor(current), { into: -1, within: reach, tip, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken: stroke.healed, relabel: stroke.relabel, targets });
     return { faces, targets };
   }
 
@@ -4525,9 +4527,13 @@ export default function App() {
     const into = positionByHex.get(hex);
     if (!current || into === undefined || labels.length !== current.triangles.length) return;
     const maxFaces = speckFaces;
-    const faces = specksIn(labels, adjacencyFor(current), { into, within: null, maxFaces, enclosed: 0.8, protectedLabels: protectedPositions(), taken: null });
+    const adjacency = adjacencyFor(current);
+    const faces = specksIn(labels, adjacency, { into, within: null, maxFaces, enclosed: 0.8, protectedLabels: protectedPositions(), taken: null });
+    // What 🔒 kept: said so, or the specks seem not to go (11-03).
+    const kept = Math.max(0, specksIn(labels, adjacency, { into, within: null, maxFaces, enclosed: 0.8, protectedLabels: null, taken: null }).length - faces.length);
+    const keptNote = kept > 0 ? t("status.specksKept", { n: kept.toLocaleString() }) : "";
     if (faces.length === 0) {
-      setStatus(t("status.specksNone", { hex, n: maxFaces }));
+      setStatus(t("status.specksNone", { hex, n: maxFaces }) + keptNote);
       return;
     }
     const rgb = hexToRgb(hex);
@@ -4538,7 +4544,7 @@ export default function App() {
     keepGroupsFor(current.triangleColors, next);
     strokePatchRef.current = { from: current.triangleColors, to: next, faces, rgb, exact: false };
     applyColours(current, next, { keepSelection: true, uniqueFaceColors: stripFor(next).colourCount });
-    setStatus(t("status.specksDone", { n: faces.length.toLocaleString(), hex }));
+    setStatus(t("status.specksDone", { n: faces.length.toLocaleString(), hex }) + keptNote);
   }
 
   function paintAtHit(hit: ViewerHit | null, slot: number): void {
