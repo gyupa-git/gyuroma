@@ -96,6 +96,8 @@ export function ExportSection({
   onChoosePrinter,
   printerNotice,
   slotCount,
+  slotColours,
+  slotsAreDefault,
   onOpenGather,
 }: {
   settings: ExportSettings;
@@ -147,6 +149,10 @@ export function ExportSection({
   printerNotice: { changes: string[]; undo: () => void } | null;
   /** Filament slots in use (step 03). */
   slotCount: number;
+  /** The filament slots as 03 has them (E1 …), shown before the export: they must be the printer's tools in order. */
+  slotColours?: Array<{ label: string; hex: string; name: string }>;
+  /** The slots are still the app's defaults (white, black, cyan, magenta, yellow), not set for this printer. */
+  slotsAreDefault?: boolean;
   /** Opens 모아 뽑기 (several finished files on one bed). */
   onOpenGather: () => void;
 }) {
@@ -225,6 +231,20 @@ export function ExportSection({
           </div>
         )}
         {fdm && slotCount > fdm.slots.max &&<div className="warn">{t("exp.printerTooManySlots", { app: slotCount, max: fdm.slots.max, name: printerLabel(fdm, t) })}</div>}
+        {fdm && slotColours && slotColours.length > 0 && (
+          <div className={`slot-check${slotsAreDefault ? " warn" : ""}`} role="note">
+            <span className="slot-check-title">{t("exp.slotCheck")}</span>
+            <span className="slot-check-list">
+              {slotColours.map((slot) => (
+                <span key={slot.label} className="slot-check-item" title={slot.name}>
+                  <i style={{ background: slot.hex }} aria-hidden="true" />
+                  {slot.label}
+                </span>
+              ))}
+            </span>
+            {slotsAreDefault && <span className="slot-check-warn">{t("exp.slotsDefault")}</span>}
+          </div>
+        )}
         {printerNotice && (
           <div className="note printer-notice" role="status">
             <span>

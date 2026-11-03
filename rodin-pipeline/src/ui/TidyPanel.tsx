@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { GyupaWaiting } from "./GyupaLoader";
+import { useState } from "react";
+import { ConsultBox } from "./ConsultBox";
 import { TIDY_CONSULT_PRESETS, TIDY_PRESETS, type ChangeLine, type TidyConsultPreset, type TidyLogEntry, type TidyPreset, type TidyScope } from "../engine/tidy";
 import type { TidyArea } from "../engine/tidyArea";
 import type { AiRoute, KeyUsage } from "../engine/aiClient";
@@ -59,6 +59,15 @@ export function TidyPanel({
   onStop,
   onApplySuggestion,
   onConsultPreset,
+  onApplyPreview,
+  onCancelEntry,
+  canCancel,
+  onAuto,
+  parts,
+  partView,
+  onPartView,
+  onRedoParts,
+  onFocusPart,
   connection,
   disabled,
 }: {
@@ -91,6 +100,19 @@ export function TidyPanel({
   onApplySuggestion: (entryId: string) => void;
   /** A ready-made request, sent to Claude as it is. */
   onConsultPreset: (preset: TidyConsultPreset) => void;
+  /** A preview kept / taken back, and whether ↩ can take an entry back. */
+  onApplyPreview: (entryId: string) => void;
+  onCancelEntry: (entryId: string) => void;
+  canCancel: (entryId: string) => boolean;
+  /** 🤖 the whole job at once: 02 the Gyupa-style tidy, 03 the mixing check. */
+  onAuto: () => void;
+  /** The part map (shape first), when there is one. */
+  parts: { subject: string; list: Array<{ name: string; pct: number; tint: string }> } | null;
+  partView: boolean;
+  onPartView: (on: boolean) => void;
+  onRedoParts: () => void;
+  /** 🎯 one part up close. */
+  onFocusPart: (part: string) => void;
   connection: AiConnection;
   disabled: boolean;
 }) {
@@ -102,13 +124,10 @@ export function TidyPanel({
       return true;
     }
   });
-  const [draft, setDraft] = useState("");
-  const logRef = useRef<HTMLDivElement>(null);
   // The preset under the pointer or focus, previewed before it is pressed.
   const [previewId, setPreviewId] = useState<TidyPreset["id"] | null>(null);
   const preview = previewId ? previewPreset(previewId) : null;
   const pickedNone = area === "picked" && pickedCount === 0;
-  const inputRef = useRef<HTMLTextAreaElement>(null);
   const toggleOpen = () => {
     setOpen((v) => {
       try {
@@ -119,31 +138,8 @@ export function TidyPanel({
       return !v;
     });
   };
-  // The newest message in view.
-  useEffect(() => {
-    const el = logRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [log.length, busy]);
-
-  const send = () => {
-    const text = draft.trim();
-    if (!text || busy) return;
-    onSend(text);
-    setDraft("");
-  };
-  const onKey = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
-    event.preventDefault();
-    // Mid-composition (Korean IME) the last syllable is not in the value yet.
-    if (event.nativeEvent.isComposing) {
-      const target = event.currentTarget;
-      target.addEventListener("compositionend", () => setTimeout(send, 0), { once: true });
-      return;
-    }
-    send();
-  };
-  const examples = [t("tidy.exAnalyse"), t("tidy.exEdges"), t("tidy.exShade"), t("tidy.exSpecks")];
-  const lastApplied = [...log].reverse().find((entry) => entry.role === "ai" && entry.status === "applied");
+  const mixing = scope === "mix";
+  const examples = mixing ? [t("tidy.exAnalyse"), t("tidy.exMix1"), t("tidy.exMix2")] : [t("tidy.exAuto"), t("tidy.exAnalyse"), t("tidy.exEdges"), t("tidy.exShade"), t("tidy.exSpecks")];
 
   return (
     <section className="pane-section tidy" aria-label={t("tidy.title")}>
@@ -283,81 +279,55 @@ export function TidyPanel({
           )}
 
           {consult && (
-          <div className="tidy-consult">
-            <div className="tidy-consult-head">
-              <b>💬 {t("tidy.consult")}</b>
-              <span className="muted">{t("tidy.consultSub")}</span>
-            </div>
-            {ai === false ? (
-              <KeyForm connection={connection} />
-            ) : (
-              <>
-                {(log.length > 0 || busy) && (
-                  <div className="tidy-log" ref={logRef} aria-live="polite">
-                    {log.map((entry) => (
-                      <div key={entry.id} className={`tidy-msg ${entry.role}`}>
-                        {entry.role === "ai" ? (
-                          <>
-                            <p>{entry.text}</p>
-                            {entry.observations && entry.observations.length > 0 && (
-                              <ul className="tidy-obs">
-                                {entry.observations.map((line, i) => (
-                                  <li key={i}>{line}</li>
-                                ))}
-                              </ul>
-                            )}
-                            {entry.lines && entry.lines.length > 0 && (
-                              <div className={`tidy-proposal ${entry.status ?? ""}`}>
-                                <span className="tidy-status">
-                                  {entry.status === "applied"
-                                    ? t("tidy.statusApplied")
-                                    : entry.status === "undone"
-                                      ? t("tidy.statusUndone")
-                                      : t("tidy.statusSuggested")}
-                                </span>
-                                <ul className="tidy-lines">
-                                  {entry.lines.map((line, i) => (
-                                    <li key={`${line.key}-${i}`}>
-                                      <span>{line.label}</span> <span className="mono from">{line.from}</span> → <mark className="hl mono">{line.to}</mark>
-                                    </li>
-                                  ))}
-                                </ul>
-                                {entry.status === "suggested" && (
-                                  <button type="button" className="btn small primary" disabled={disabled || busy !== null} onClick={() => onApplySuggestion(entry.id)}>
-                                    ✅ {t("tidy.applySuggestion")}
-                                  </button>
-                                )}
-                                {entry.status === "applied" && lastApplied?.id === entry.id && result?.entryId === entry.id && !result.undone && undoCount > 0 && (
-                                  <button type="button" className="btn small" disabled={busy !== null} onClick={onUndo}>
-                                    ↩ {t("tidy.undo")} ({undoCount})
-                                  </button>
-                                )}
-                              </div>
-                            )}
-                            {entry.dropped?.map((note) => (
-                              <p key={note} className="muted">
-                                {t("tidy.dropped", { what: note })}
-                              </p>
-                            ))}
-                          </>
-                        ) : (
-                          <p>{entry.text}</p>
-                        )}
-                      </div>
-                    ))}
-                    {busy && (
-                      <div className="tidy-msg working">
-                        <GyupaWaiting />
-                        <span>
-                          {busy} · {t("tidy.seconds", { n: elapsed })}
+            <ConsultBox
+              title={t("tidy.consult")}
+              sub={t("tidy.consultSub")}
+              inputId="tidy-input"
+              ai={ai}
+              log={log}
+              busy={busy}
+              elapsed={elapsed}
+              disabled={disabled}
+              auto={mixing ? { label: t("tidy.mixAuto"), hint: t("tidy.mixAutoHint"), onClick: onAuto } : { label: t("tidy.auto"), hint: t("tidy.autoHint"), onClick: onAuto }}
+              extra={
+                !mixing && (
+                  <div className="tidy-parts">
+                    <span className="tidy-parts-title">{t("tidy.partsTitle")}</span>
+                    {parts ? (
+                      <>
+                        <span className="tidy-parts-subject">{parts.subject}</span>
+                        <span className="muted tidy-parts-hint">🎯 {t("tidy.focusHint")}</span>
+                        <span className="tidy-parts-list">
+                          {parts.list.map((part) => (
+                            <button
+                              key={part.name}
+                              type="button"
+                              className="tidy-part"
+                              disabled={busy !== null || disabled || ai !== true}
+                              title={`${t("tidy.focus", { part: part.name })} — ${t("tidy.focusHint")}`}
+                              onClick={() => onFocusPart(part.name)}
+                            >
+                              <i style={{ background: part.tint }} aria-hidden="true" />
+                              {part.name} <span className="muted">{part.pct.toFixed(0)}%</span>
+                            </button>
+                          ))}
                         </span>
-                        <button type="button" className="btn small" onClick={onStop}>
-                          ⏹ {t("tidy.stop")}
-                        </button>
-                      </div>
+                        <span className="tidy-parts-actions">
+                          <button type="button" className="text-link" aria-pressed={partView} onClick={() => onPartView(!partView)}>
+                            {partView ? t("tidy.partsHide") : t("tidy.partsShow")}
+                          </button>
+                          <button type="button" className="text-link" disabled={busy !== null || disabled} onClick={onRedoParts}>
+                            {t("tidy.partsRedo")}
+                          </button>
+                        </span>
+                      </>
+                    ) : (
+                      <span className="muted">{t("tidy.partsNone")}</span>
                     )}
                   </div>
-                )}
+                )
+              }
+              presets={
                 <div className="tidy-consult-presets">
                   {TIDY_CONSULT_PRESETS.map((preset) => (
                     <button
@@ -377,46 +347,20 @@ export function TidyPanel({
                     </button>
                   ))}
                 </div>
-                <div className="tidy-examples">
-                  {examples.map((example) => (
-                    <button
-                      key={example}
-                      type="button"
-                      className="chip button"
-                      onClick={() => {
-                        setDraft((d) => (d.trim() ? `${d.trim()} ${example}` : example));
-                        inputRef.current?.focus();
-                      }}
-                    >
-                      {example}
-                    </button>
-                  ))}
-                </div>
-                <label className="tidy-input-label" htmlFor="tidy-input">
-                  {t("tidy.inputLabel")} <span className="muted">— {t("tidy.inputSub")}</span>
-                </label>
-                <textarea
-                  id="tidy-input"
-                  ref={inputRef}
-                  className="tidy-input"
-                  rows={3}
-                  value={draft}
-                  placeholder={t("tidy.placeholder")}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={onKey}
-                />
-                <div className="tidy-actions">
-                  <button type="button" className="btn small" disabled={disabled || busy !== null || ai === null} title={t("tidy.analyseHint")} onClick={onAnalyse}>
-                    🔍 {t("tidy.analyse")}
-                  </button>
-                  <button type="button" className="btn small primary" disabled={disabled || busy !== null || ai === null || !draft.trim()} title="⌘/Ctrl + Enter" onClick={send}>
-                    {t("tidy.send")} ↑
-                  </button>
-                </div>
-                <ConnectionLine connection={connection} />
-              </>
-            )}
-          </div>
+              }
+              examples={examples}
+              placeholder={t("tidy.placeholder")}
+              onSend={onSend}
+              onAnalyse={{ label: t("tidy.analyse"), hint: t("tidy.analyseHint"), onClick: onAnalyse }}
+              onStop={onStop}
+              onTry={onApplySuggestion}
+              onApply={onApplyPreview}
+              onCancel={onCancelEntry}
+              canCancel={canCancel}
+              connection={connection}
+              keyForm={<KeyForm connection={connection} />}
+              connectionLine={<ConnectionLine connection={connection} />}
+            />
           )}
         </>
       )}
@@ -425,7 +369,7 @@ export function TidyPanel({
 }
 
 /** Where the consult's Claude comes from, under the consult: this computer's login or the person's own key. */
-function ConnectionLine({ connection }: { connection: AiConnection }) {
+export function ConnectionLine({ connection }: { connection: AiConnection }) {
   const t = useT();
   const [changing, setChanging] = useState(false);
   if (!connection.route) return null;
@@ -451,7 +395,7 @@ function ConnectionLine({ connection }: { connection: AiConnection }) {
 }
 
 /** Puts the person's own Anthropic API key in this browser (sent to Anthropic only). */
-function KeyForm({ connection, onDone }: { connection: AiConnection; onDone?: () => void }) {
+export function KeyForm({ connection, onDone }: { connection: AiConnection; onDone?: () => void }) {
   const t = useT();
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);

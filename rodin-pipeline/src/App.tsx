@@ -26,7 +26,7 @@ import { nearestPaletteIndex } from "@core/quantize";
 import { BAMBU_STUDIO_MAX_FILAMENTS, findPrinter, templateFitsPrinter } from "./engine/printers";
 import { decodePaintCode } from "@core/paintCodes";
 import { applyNomadObjToModel, buildNomadObj, NOMAD_NEW_MODEL_WARNING, NOMAD_OFF_PALETTE_WARNING, nomadRemeshWarning, parseNomadObj } from "@core/nomadRoundTrip";
-import { apparentLayerRgbs, deltaE2000, linearToSrgb, rgbToLab, srgbToLinear } from "@core/prusaFdmMixer";
+import { apparentLayerRgbs, deltaE2000, linearToSrgb, rgbToLab, srgbToLinear, type LAB } from "@core/prusaFdmMixer";
 import { downloadBlob, downloadText } from "@core/exportCsv";
 import {
   CUT_SPAN,
@@ -115,18 +115,31 @@ import { cutsKeepingGroups } from "./engine/stripCuts";
 import { faceOfGroupNear } from "./engine/cutPick";
 import { packWorkFile, readWorkFile, WORK_FILE_EXT, WorkFileError, workFileName } from "./engine/workFile";
 import { WITH_CLAUDE } from "./features";
-import { renderViews } from "./ui/snapshot";
+import { renderNumberedViews, renderViews } from "./ui/snapshot";
+import { cellParts, faceCentroids, facePartsOf, partsBySpill, shapeCells, summariseParts, tidyByParts, type ShapeCells, type ShapePart } from "./engine/shapeParts";
+import { findRegions } from "./engine/regions";
+import { creaseGeometry, faceConcavity, findPits, snapToCreases, type CreaseGeometry, type Pit } from "./engine/creases";
+import { regionBlobs, type BlobMap } from "./engine/blobs";
+import { ConnectionLine, KeyForm } from "./ui/TidyPanel";
+import { ConsultBox } from "./ui/ConsultBox";
 import { aiAsk, aiStatus, loadApiKey, loadKeyUsage, maskKey, saveApiKey, type AiRoute, type KeyUsage } from "./engine/aiClient";
 import { adviceKey, ask } from "./engine/adviceClient";
 import { recommendMixOption } from "@core/mixAdvice";
 import {
   describeChanges,
   hasCleanChanges,
+  hasColourEdits,
+  hasRecipeChanges,
   presetChanges,
   sanitizeChanges,
+  focusPrompt,
+  shapePrompt,
+  SHAPE_SCHEMA,
   tidyStablePrompt,
   tidyTurnPrompt,
   TIDY_SCHEMA,
+  type TidyExportInfo,
+  type TidyShape,
   type ChangeLine,
   type TidyChanges,
   type TidyContext,
@@ -209,6 +222,24 @@ function pairPressed(pair: [boolean, boolean]): boolean | "mixed" {
 
 /** From this much closer than the whole-model fit, the consult also gets the view on screen. */
 const CLOSE_UP_ZOOM = 1.6;
+/**
+ * Cells of the shape step: enough that a part (an arm, a sleeve, the face) is a few of them
+ * and its border falls near the real one, few enough that their numbers stay readable on
+ * six 640-pixel pictures (about 30 a picture).
+ */
+const SHAPE_CELL_COUNT = 90;
+/** Tints of the part map in 3D (one a part, in order). */
+const PART_TINTS = ["#E6194B", "#3CB44B", "#FFE119", "#4363D8", "#F58231", "#911EB4", "#42D4F4", "#F032E6", "#BFEF45", "#FABED4", "#469990", "#DCBEFF", "#9A6324", "#FFFAC8", "#800000", "#AAFFC3", "#808000", "#FFD8B1", "#000075", "#A9A9A9"];
+const SIX_VIEWS: ViewName[] = ["front", "back", "left", "right", "top", "iso"];
+
+/** The part map kept for a model: its cells (0-based) per part, for the mesh it was made on. */
+interface StoredPartMap {
+  faces: number;
+  cells: number;
+  subject: string;
+  parts: ShapePart[];
+  at: string;
+}
 
 const NO_OVERLAYS: HighlightOverlay[] = [];
 const NO_CALLOUTS: Callout[] = [];
@@ -596,7 +627,7 @@ export default function App() {
       entryId: string;
       title: string;
       lines: ChangeLine[];
-      settings: Pick<PipelineSettings, "palette" | "merge" | "mergeFlags" | "stripByModel" | "mix">;
+      settings: Pick<PipelineSettings, "palette" | "merge" | "mergeFlags" | "stripByModel" | "mix"> & Partial<Pick<PipelineSettings, "recipeOverrides" | "manualPhysical" | "export">>;
       colours: RGB[];
       chain: { base: RGB[]; result: RGB[] | null } | null;
       /** Colours a picked-patch tidy left (it bakes outside the tidy chain), and how many faces it changed. */
@@ -617,6 +648,14 @@ export default function App() {
   };
   /** A tidy waiting for its new palette before it bakes (02's Tidy up). */
   const [pendingTidy, setPendingTidy] = useState<{ entryId: string; protectAccents: boolean } | null>(null);
+  /** The part map per model (shape first: what it is, which cells make each part), kept in user-data. */
+  const [partMaps, setPartMaps] = useState<Record<string, StoredPartMap>>({});
+  const partMapsLoaded = useRef(false);
+  /** The part map shown in 3D, each part in its tint. */
+  const [partView, setPartView] = useState(false);
+  const shapeCellsRef = useRef<{ triangles: MeshModel["triangles"]; cells: ShapeCells } | null>(null);
+  /** A plan's settings, waiting for the colours it painted to be in before they bake. */
+  const [pendingPlan, setPendingPlan] = useState<{ changes: TidyChanges; entryId: string; title: string; lines: ChangeLine[]; dropped?: string[]; colours: RGB[] } | null>(null);
   /** Pictures of the colours before the tidy, kept while those colours stay (the cached part of the consult). */
   const tidyStableShotsRef = useRef<{ colours: RGB[]; urls: string[] } | null>(null);
   const [nomadReport, setNomadReport] = useState<{ message: string; warnings: string[] } | null>(null);
@@ -890,6 +929,9 @@ export default function App() {
   });
   const setStep = (next: number) => {
     setStepState(next);
+    // Each tab's consult talks about that tab: 03 about the mixing, 02 about the colours ("both" stays as chosen).
+    if (next === 3 && tidyScope === "clean") setTidyScope("mix");
+    if (next === 2 && tidyScope === "mix") setTidyScope("clean");
     try {
       window.localStorage.setItem("rodin-pipeline-step", String(next));
     } catch {
@@ -5058,7 +5100,15 @@ export default function App() {
       if (Array.isArray(saved)) setTidyLog(saved.slice(-200));
       tidyLogLoaded.current = true;
     });
+    void dataGet<Record<string, StoredPartMap>>("part-maps").then((saved) => {
+      if (saved && typeof saved === "object" && !Array.isArray(saved)) setPartMaps(saved);
+      partMapsLoaded.current = true;
+    });
   }, []);
+  useEffect(() => {
+    if (!partMapsLoaded.current) return;
+    void dataSet("part-maps", partMaps);
+  }, [partMaps]);
   // The conversation is kept in user-data like the rest of the work (last 200 entries).
   useEffect(() => {
     if (!tidyLogLoaded.current) return;
@@ -5075,6 +5125,58 @@ export default function App() {
   }, [tidyBusy !== null]);
 
   const tidyModelName = sourceInfo?.fileName ?? model?.name ?? "";
+
+  /** The newest AI change still waiting for ✅ (shown over the views too). */
+  const aiPreview = useMemo(() => {
+    for (let i = tidyLog.length - 1; i >= 0; i--) {
+      const entry = tidyLog[i];
+      if (entry.model !== tidyModelName || entry.role !== "ai") continue;
+      return entry.status === "preview" ? entry : null;
+    }
+    return null;
+  }, [tidyLog, tidyModelName]);
+
+  /** How the consults reach Claude (the same in 02, 03 and 04). */
+  const aiConnection = {
+    route: aiRoute,
+    keyMask: apiKey ? maskKey(apiKey) : null,
+    usage: keyUsage,
+    onSaveKey: (key: string) => {
+      saveApiKey(key);
+      setApiKey(key);
+    },
+    onClearKey: () => {
+      saveApiKey(null);
+      setApiKey(null);
+    },
+  };
+
+  /** The part map under the consult: what the model is, its parts with their size and tint. */
+  const partsShown = useMemo(() => {
+    const map = model ? partMaps[tidyModelName] : undefined;
+    if (!model || !map || map.faces !== model.triangles.length) return null;
+    const cells = shapeCellsRef.current?.triangles === model.triangles ? shapeCellsRef.current.cells : cellsFor(model);
+    const pct = (part: ShapePart) => part.cells.reduce((sum, c) => sum + (cells.areaPct[c] ?? 0), 0);
+    return { subject: map.subject, list: map.parts.map((part, p) => ({ name: part.name, pct: pct(part), tint: PART_TINTS[p % PART_TINTS.length] })) };
+  }, [model, partMaps, tidyModelName]);
+
+  // The part map in 3D: each part in its tint, while asked for (the model's colours come back when it is turned off).
+  useEffect(() => {
+    if (!partView || !model) return;
+    const map = partMaps[tidyModelName];
+    if (!map || map.faces !== model.triangles.length) return;
+    const cells = cellsFor(model);
+    if (map.cells !== cells.count) return;
+    const { partOfFace } = partFacesFor(model, map, cells);
+    const byPart: number[][] = map.parts.map(() => []);
+    for (let f = 0; f < partOfFace.length; f++) if (partOfFace[f] >= 0) byPart[partOfFace[f]].push(f);
+    for (const handle of editedViewers()) byPart.forEach((faces, p) => handle.setFaceColours(Int32Array.from(faces), hexToRgb(PART_TINTS[p % PART_TINTS.length])));
+    return () => {
+      const current = modelRef.current;
+      if (current) setModel({ ...current });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [partView, model?.triangleColors, model?.triangles, partMaps, tidyModelName]);
 
   function buildTidyContext(): TidyContext | null {
     if (!model) return null;
@@ -5093,6 +5195,22 @@ export default function App() {
       palette: palette.map((entry, position) => {
         const hex = rgbToHex(entry.rgb);
         const group = groupByHex.get(hex);
+        // How it prints (03): one filament, or a mixture in layers, and the colour that comes out.
+        const assignment = plan?.paletteToAssignment.get(entry.index);
+        let recipe: string | undefined;
+        let printed: string | undefined;
+        if (assignment?.kind === "physical") {
+          recipe = `E${assignment.extruder}`;
+          const slot = slots[assignment.extruder - 1];
+          if (slot) printed = rgbToHex(slot.filament.rgb);
+        } else if (assignment?.kind === "virtual") {
+          const blend = plan?.virtualBlends.find((b) => b.virtualId === assignment.virtualId);
+          if (blend) {
+            recipe = blend.components.map((c) => `E${c.extruder} ${c.count}`).join(" · ");
+            printed = rgbToHex(blend.displayRgb);
+          }
+        }
+        const key = String(entry.index);
         return {
           hex,
           areaPct: (areaByPosition[position] ?? 0) * 100,
@@ -5100,12 +5218,212 @@ export default function App() {
           shades: group?.colours.length ?? 1,
           protected: Boolean(settings.mergeFlags[hex]?.protect),
           output: stripOutputOf(hex)?.label,
+          recipe,
+          printed,
+          hand: settings.manualPhysical[key] !== undefined || settings.recipeOverrides[key] !== undefined,
         };
       }),
       slots: slots.map((slot) => ({ label: `E${slot.slot}`, hex: rgbToHex(slot.filament.rgb), name: slot.filament.name })),
       mix: settings.mix,
       mixScores: null,
       layerHeight: layerHeightMm ?? null,
+    };
+  }
+
+  /** The shape step's cells of this mesh (worked out once a mesh, the same every time). */
+  function cellsFor(current: MeshModel): ShapeCells {
+    const held = shapeCellsRef.current;
+    if (held && held.triangles === current.triangles) return held.cells;
+    const weights = current === model ? areaWeights : triangleAreaWeights(current);
+    const cells = shapeCells(faceCentroids(current.vertices, current.triangles), adjacencyFor(current), weights, SHAPE_CELL_COUNT);
+    shapeCellsRef.current = { triangles: current.triangles, cells };
+    return cells;
+  }
+
+  /** Face centres and normals, and how deep each face sits in a dent (per mesh). */
+  const creaseRef = useRef<{ triangles: MeshModel["triangles"]; geometry: CreaseGeometry; concavity: Float32Array } | null>(null);
+  function creasesFor(current: MeshModel): { geometry: CreaseGeometry; concavity: Float32Array } {
+    const held = creaseRef.current;
+    if (held && held.triangles === current.triangles) return held;
+    const geometry = creaseGeometry(current.vertices, current.triangles);
+    const concavity = faceConcavity(adjacencyFor(current), geometry);
+    creaseRef.current = { triangles: current.triangles, geometry, concavity };
+    return creaseRef.current;
+  }
+
+  /** The model's own colours where they still fit this mesh (the file's), else the colours now. */
+  function ownColoursOf(current: MeshModel): RGB[] {
+    const own = originalColoursRef.current;
+    return own && own.length === current.triangles.length ? own : current.triangleColors;
+  }
+
+  /** Each face's own colour as Lab (for the cost of crossing a colour change). */
+  const ownLabRef = useRef<{ colours: RGB[]; lab: Float32Array } | null>(null);
+  function ownLabOf(current: MeshModel): Float32Array {
+    const own = ownColoursOf(current);
+    if (ownLabRef.current?.colours === own) return ownLabRef.current.lab;
+    const lab = new Float32Array(own.length * 3);
+    const cache = new Map<number, LAB>();
+    for (let f = 0; f < own.length; f++) {
+      const c = own[f];
+      const key = (c[0] << 16) | (c[1] << 8) | c[2];
+      let v = cache.get(key);
+      if (!v) cache.set(key, (v = rgbToLab(c)));
+      lab[f * 3] = v.L;
+      lab[f * 3 + 1] = v.a;
+      lab[f * 3 + 2] = v.b;
+    }
+    ownLabRef.current = { colours: own, lab };
+    return lab;
+  }
+
+  /**
+   * Each face's part: the cells' parts, then the borders between parts moved into the groove
+   * (and onto the change of the model's own colour) nearby — a hand round a candy cane is the
+   * hand's up to where it meets the cane, not wherever a cell happened to end (11-04).
+   */
+  const partFacesRef = useRef<{ triangles: MeshModel["triangles"]; map: StoredPartMap; labels: Int32Array; partOfFace: Int32Array; partOfCell: Int32Array } | null>(null);
+  function partFacesFor(current: MeshModel, map: StoredPartMap, cells: ShapeCells): { partOfFace: Int32Array; partOfCell: Int32Array } {
+    const held = partFacesRef.current;
+    if (held && held.triangles === current.triangles && held.map === map && held.labels === labels) return held;
+    const partOfCell = cellParts(cells, map.parts);
+    const rough = facePartsOf(cells, partOfCell);
+    // Half a cell's width either side: a cell's faces are about √(faces a cell) across.
+    const band = Math.max(4, Math.min(80, Math.round(Math.sqrt(current.triangles.length / Math.max(1, cells.count)) * 0.35)));
+    const adjacency = adjacencyFor(current);
+    let partOfFace = snapToCreases(rough, adjacency, creasesFor(current).geometry, { band, lab: ownLabOf(current), grooveCost: 80, colourCost: 0.6 });
+    // A part's colour spilling into the next part's cells (a hand in the cane's cells) goes back to its part.
+    if (labels.length === current.triangles.length) {
+      const summary = summariseParts(partOfFace, map.parts.length, labels, palette.length, areaWeights);
+      partOfFace = partsBySpill(partOfFace, labels, adjacency, summary);
+    }
+    partFacesRef.current = { triangles: current.triangles, map, labels, partOfFace, partOfCell };
+    return partFacesRef.current;
+  }
+
+  /** The part looked at up close: its faces and blobs, for the colours they were made on. */
+  const focusRef = useRef<{ triangles: MeshModel["triangles"]; colours: RGB[]; part: string; map: BlobMap; mask: Uint8Array } | null>(null);
+
+  /** The dark holes and dents of the sculpt (eye holes of a button), for the colours as they are. */
+  const pitsRef = useRef<{ colours: RGB[]; pits: Pit[] } | null>(null);
+  function pitsFor(current: MeshModel): Pit[] {
+    if (pitsRef.current?.colours === current.triangleColors) return pitsRef.current.pits;
+    if (labels.length !== current.triangles.length) return [];
+    const { geometry, concavity } = creasesFor(current);
+    const pits = findPits(labels, adjacencyFor(current), concavity, areaWeights, ownColoursOf(current), geometry).slice(0, 16);
+    pitsRef.current = { colours: current.triangleColors, pits };
+    return pits;
+  }
+
+  /** The holes as the AI reads them (numbered P1…), with the part each lies in. */
+  function pitsContext(current: MeshModel, map: StoredPartMap | null, cells: ShapeCells | null): NonNullable<TidyContext["pits"]> {
+    const pits = pitsFor(current);
+    const partOfFace = map && cells && map.cells === cells.count ? partFacesFor(current, map, cells).partOfFace : null;
+    const hexOf = (label: number) => (palette[label] ? rgbToHex(palette[label].rgb) : "?");
+    return pits.map((pit, i) => {
+      let part: string | undefined;
+      if (partOfFace && map) {
+        const votes = new Map<number, number>();
+        for (const f of pit.faces) votes.set(partOfFace[f], (votes.get(partOfFace[f]) ?? 0) + 1);
+        const best = [...votes].sort((a, b) => b[1] - a[1])[0];
+        if (best && best[0] >= 0) part = map.parts[best[0]]?.name;
+      }
+      return {
+        id: i + 1,
+        inside: hexOf(pit.inside),
+        around: pit.around.slice(1).filter((a) => a.share >= 0.2).map((a) => hexOf(a.label)),
+        areaPct: pit.areaPct,
+        faces: pit.faces.length,
+        own: rgbToHex(pit.own),
+        part,
+      };
+    });
+  }
+
+  /** The part map kept for this model, if it was made on this mesh. */
+  function partMapFor(current: MeshModel | null, maps = partMaps): StoredPartMap | null {
+    const map = current ? maps[tidyModelName] : undefined;
+    return map && current && map.faces === current.triangles.length ? map : null;
+  }
+
+  /** The part map as the AI reads it: each part's size and the colours in it (palette as now). */
+  function shapeContext(current: MeshModel, map: StoredPartMap, cells: ShapeCells): TidyShape | null {
+    if (map.cells !== cells.count || labels.length !== current.triangles.length) return null;
+    const summary = summariseParts(partFacesFor(current, map, cells).partOfFace, map.parts.length, labels, palette.length, areaWeights);
+    return {
+      subject: map.subject,
+      cellCount: cells.count,
+      parts: map.parts.map((part, p) => ({
+        name: part.name,
+        areaPct: summary[p].areaPct,
+        cells: part.cells.map((c) => c + 1),
+        colours: summary[p].colours.map((c) => ({ hex: palette[c.label] ? rgbToHex(palette[c.label].rgb) : "?", pct: c.pct })),
+      })),
+    };
+  }
+
+  /** The patches too small to matter one by one, per colour (02: what the speck clean-up would take). */
+  function specksSummary(current: MeshModel): TidyContext["specks"] {
+    if (labels.length !== current.triangles.length) return null;
+    // Every patch of 0.02 % or more is listed (a part, not a speck): what is left over is the specks.
+    const map = findRegions(labels, adjacencyFor(current), areaWeights, { minPct: 0.02, max: 1_000_000 });
+    return map.unlisted
+      .filter((row) => row.tiny > 0)
+      .map((row) => ({ hex: palette[row.label] ? rgbToHex(palette[row.label].rgb) : "?", patches: row.patches, tiny: row.tiny, faces: row.faces }));
+  }
+
+  /** Loose pieces of the mesh (what "split loose pieces" would write apart). */
+  const piecesRef = useRef<{ triangles: MeshModel["triangles"]; count: number } | null>(null);
+  function piecesOfMesh(current: MeshModel): number {
+    const held = piecesRef.current;
+    if (held && held.triangles === current.triangles) return held.count;
+    const { offsets, neighbours } = adjacencyFor(current);
+    const n = current.triangles.length;
+    const seen = new Uint8Array(n);
+    const stack = new Int32Array(n);
+    let count = 0;
+    for (let s0 = 0; s0 < n; s0++) {
+      if (seen[s0]) continue;
+      count++;
+      let top = 0;
+      seen[s0] = 1;
+      stack[top++] = s0;
+      while (top > 0) {
+        const a = stack[--top];
+        for (let i = offsets[a]; i < offsets[a + 1]; i++) {
+          const b = neighbours[i];
+          if (!seen[b]) {
+            seen[b] = 1;
+            stack[top++] = b;
+          }
+        }
+      }
+    }
+    piecesRef.current = { triangles: current.triangles, count };
+    return count;
+  }
+
+  /** Step 04 as the AI reads it. */
+  function exportInfoNow(current: MeshModel): TidyExportInfo {
+    const e = settings.export;
+    return {
+      printer: printer.name || settings.export.printerId,
+      settings: {
+        targetHeight: e.targetHeight ?? Math.round(printHeightMm ?? 0),
+        splitObjects: e.splitObjects,
+        splitAsParts: e.splitAsParts,
+        closeHoles: e.closeHoles,
+        putOnBed: e.putOnBed,
+        centerOnBed: e.centerOnBed,
+        borderCut: e.cutSpan > 0,
+        printPreset: e.printPreset ?? "template",
+      },
+      sizeMm: printFit ? [printFit.size.x, printFit.size.y, printFit.size.z] : null,
+      bed: [printFit?.bed.x ?? e.bedX, printFit?.bed.y ?? e.bedY],
+      pieces: piecesOfMesh(current),
+      colours: palette.length,
+      extruders: slots.length,
+      lastExport: exportOutcome ? exportOutcome.message.slice(0, 300) : null,
     };
   }
 
@@ -5142,7 +5460,12 @@ export default function App() {
    * at an angle (the same every turn, so they are cached), then the state now
    * from six sides — the palette for colours, the print simulation for mixing.
    */
-  function takeTidyPictures(scope: TidyScope, closeUp: boolean): { stable: string[]; stableLabels: string[]; current: string[]; currentLabels: string[] } | null {
+  function takeTidyPictures(
+    scope: TidyScope,
+    closeUp: boolean,
+    shape?: { cells: ShapeCells; partOfCell: Int32Array | null },
+    pits: Pit[] = [],
+  ): { stable: string[]; stableLabels: string[]; current: string[]; currentLabels: string[] } | null {
     if (!model || !positions) return null;
     const viewName: Record<ViewName | "now", string> = { front: "앞", back: "뒤", left: "왼쪽", right: "오른쪽", top: "위", iso: "사선", now: "지금 화면" };
     const chain = tidyChainRef.current;
@@ -5165,17 +5488,54 @@ export default function App() {
         currentLabels.push(`${what} ${viewName[shot.view]}`);
       }
     };
-    if (scope === "clean") add(palettePics, ["front", "back", "left", "right", "top", "iso"], "결과(02 팔레트)");
-    else if (scope === "mix") add(printPics, ["front", "back", "left", "right", "top", "iso"], "결과(03 출력 시뮬레이션)");
+    // 02's pictures carry the cell numbers (and the part borders, once there is a part map).
+    const numbered = (views: ViewName[], what: string) => {
+      if (!palettePics || !shape) return add(palettePics, views, what);
+      const shots = renderNumberedViews(positions, palettePics, shape.cells.cellOf, shape.cells.count, views, 640, shape.partOfCell ?? undefined);
+      for (const shot of shots.shots) {
+        current.push(shot.dataUrl);
+        currentLabels.push(`${what} ${viewName[shot.view]} — 칸 번호${shape.partOfCell ? "·굵은 선 = 부위 경계" : ""}`);
+      }
+    };
+    if (scope === "clean") numbered(SIX_VIEWS, "결과(02 팔레트)");
+    else if (scope === "mix") add(printPics, SIX_VIEWS, "결과(03 출력 시뮬레이션)");
+    else if (scope === "export") add(printPics, ["front", "back", "iso"], "결과(출력 시뮬레이션)");
     else {
-      add(palettePics, ["front", "back", "iso"], "결과(02 팔레트)");
+      numbered(["front", "back", "iso"], "결과(02 팔레트)");
       add(printPics, ["front", "back", "iso"], "결과(03 출력 시뮬레이션)");
+    }
+    // The biggest hole up close, before and now: small holes (a button's eye holes) are a few pixels in the whole-model pictures.
+    if (pits.length > 0 && viewBounds && (scope === "clean" || scope === "both")) {
+      const pit = pits[0];
+      const size = Math.max(viewBounds.xSpan, viewBounds.ySpan, viewBounds.zMax - viewBounds.zMin);
+      const target = pointToView(pit.centre);
+      const dir = pointToView(pit.normal);
+      const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+      const d = size * 0.28;
+      const pose = {
+        position: [target[0] + (dir[0] / len) * d, target[1] + (dir[1] / len) * d, target[2] + (dir[2] / len) * d] as [number, number, number],
+        target,
+        up: [0, 0, 1] as [number, number, number],
+        fov: 30,
+        aspect: 1,
+        zoom: 4,
+      };
+      const beforeBuffer = buildColourBuffer(model.triangles.length, (i) => before[i]);
+      for (const [colours, what] of [
+        [beforeBuffer, "구멍 확대(P1 둘레) — 원본"],
+        [palettePics, "구멍 확대(P1 둘레) — 결과(02 팔레트)"],
+      ] as const) {
+        if (!colours) continue;
+        const [shot] = renderViews(positions, colours, [pose], 520);
+        current.push(shot.dataUrl);
+        currentLabels.push(what);
+      }
     }
     // What the owner is looking at, once zoomed in (or asked for, as the face
     // preset does): the same view before the tidy and now.  Small things like
     // eyes and a mouth are a few pixels in the whole-model pictures.
     const pose = (showResult ? viewerRef2 : viewerRef0).current?.cameraPose() ?? null;
-    if (pose && (closeUp || pose.zoom >= CLOSE_UP_ZOOM)) {
+    if (scope !== "export" && pose && (closeUp || pose.zoom >= CLOSE_UP_ZOOM)) {
       const beforeBuffer = buildColourBuffer(model.triangles.length, (i) => before[i]);
       const nowWhat = scope === "mix" ? "결과(03 출력 시뮬레이션)" : "결과(02 팔레트)";
       for (const [colours, what] of [
@@ -5196,21 +5556,23 @@ export default function App() {
    * once the new palette is in.  Starts over from the colours before the
    * last tidy while the model still shows its result.
    */
-  function applyTidy(changes: TidyChanges, entryId: string, title: string, lines: ChangeLine[], dropped?: string[]): void {
+  function applyTidy(changes: TidyChanges, entryId: string, title: string, lines: ChangeLine[], dropped?: string[], options?: { undoPushed?: boolean }): void {
     if (!model) return;
     // A chain from before the mesh changed (a cut confirmed or undone) cannot be gone back to.
     if (tidyChainRef.current && tidyChainRef.current.base.length !== model.triangles.length) tidyChainRef.current = null;
     const touchesClean = hasCleanChanges(changes);
     const chain = tidyChainRef.current;
     const showingTidy = chain !== null && chain.result === model.triangleColors;
-    pushTidyUndo({
-      entryId,
-      title,
-      lines,
-      settings: { palette: settings.palette, merge: settings.merge, mergeFlags: settings.mergeFlags, stripByModel: settings.stripByModel, mix: settings.mix },
-      colours: model.triangleColors,
-      chain: chain ? { ...chain } : null,
-    });
+    // A plan (applyPlan) recorded its own step before painting: one ↩ takes back all of it.
+    if (!options?.undoPushed)
+      pushTidyUndo({
+        entryId,
+        title,
+        lines,
+        settings: { palette: settings.palette, merge: settings.merge, mergeFlags: settings.mergeFlags, stripByModel: settings.stripByModel, mix: settings.mix },
+        colours: model.triangleColors,
+        chain: chain ? { ...chain } : null,
+      });
     if (touchesClean) {
       if (showingTidy && chain) {
         setModel({ ...model, triangleColors: chain.base, stats: { ...model.stats, uniqueFaceColors: countUniqueColours(chain.base) } });
@@ -5261,6 +5623,345 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingTidy, palette, settings.mergeFlags, model, busy]);
 
+  /**
+   * The colours a plan paints before anything bakes: each part one colour (its shading
+   * and specks to its main colour, its details kept), cells painted, group colours made
+   * clean.  Null when it paints nothing.  New colours come in as groups of their own.
+   */
+  function planColours(
+    current: MeshModel,
+    changes: TidyChanges,
+    mapNow?: StoredPartMap | null,
+  ): { next: RGB[]; also: Map<number, string>; pinned: { pins: number[][] | undefined; from: Record<string, number> | undefined } | undefined; faces: number; moved: Array<[string, string]>; pitHexes: string[] } | null {
+    if (labels.length !== current.triangles.length) return null;
+    const before = current.triangleColors;
+    const next = before.slice();
+    const touched = new Uint8Array(before.length);
+    let faces = 0;
+    const recolourTo = new Map((changes.recolour ?? []).map((m) => [m.hex, m.to]));
+    const hexOf = (position: number) => (palette[position] ? rgbToHex(palette[position].rgb) : "");
+    const rgbCache = new Map<string, RGB>();
+    // A colour recoloured in the same plan paints with its new colour.
+    const rgbOf = (hex: string): RGB => {
+      const final = recolourTo.get(hex) ?? hex;
+      let rgb = rgbCache.get(final);
+      if (!rgb) {
+        rgb = fillRgb(current, final);
+        rgbCache.set(final, rgb);
+      }
+      return rgb;
+    };
+    const paintFace = (f: number, rgb: RGB) => {
+      if (next[f] === rgb) return;
+      next[f] = rgb;
+      if (!touched[f]) {
+        touched[f] = 1;
+        faces++;
+      }
+    };
+    const map = mapNow === undefined ? partMapFor(current) : mapNow;
+    if ((changes.partTidy?.length || changes.paint?.length) && map) {
+      const cells = cellsFor(current);
+      if (map.cells === cells.count) {
+        const { partOfCell, partOfFace } = partFacesFor(current, map, cells);
+        // Protected as the plan leaves it: a colour it stops protecting is tidied with the rest, and a colour
+        // the plan gives to some parts (red: the mouth, the cane) is tidied away in the others (a red speck on a foot).
+        const unprotected = new Set(changes.unprotect ?? []);
+        const placed = new Set((changes.partTidy ?? []).flatMap((m) => [m.main, ...m.keep]));
+        const protectedLabels = new Uint8Array(palette.length);
+        palette.forEach((entry, position) => {
+          const hex = rgbToHex(entry.rgb);
+          if (placed.has(hex)) return;
+          if ((settings.mergeFlags[hex]?.protect && !unprotected.has(hex)) || changes.protect?.includes(hex)) protectedLabels[position] = 1;
+        });
+        const rules = (changes.partTidy ?? [])
+          .map((m) => ({
+            part: map.parts.findIndex((part) => part.name === m.part),
+            main: positionByHex.get(m.main) ?? -1,
+            mainHex: m.main,
+            keep: m.keep.map((hex) => positionByHex.get(hex)).filter((p): p is number => p !== undefined),
+          }))
+          .filter((rule) => rule.part >= 0);
+        const mainHexOfPart = new Map(rules.map((rule) => [rule.part, rule.mainHex]));
+        const labOf = (position: number) => rgbToLab(palette[position].rgb);
+        // A shade of a kept detail (a lighter eye) joins that detail, not the part's main colour.
+        const near = (label: number, keep: number[]): number | null => {
+          let best: number | null = null;
+          let bestD = 10;
+          const a = labOf(label);
+          for (const k of keep) {
+            const d = deltaE2000(a, labOf(k));
+            if (d < bestD) {
+              bestD = d;
+              best = k;
+            }
+          }
+          return best;
+        };
+        // A colour far from the kept one round it (a dark hole in a white button) is a detail, not shading.
+        const distinct = (label: number, around: number) => deltaE2000(labOf(label), labOf(around)) >= 25;
+        const out = tidyByParts(partOfFace, cells, partOfCell, labels, rules, { protectedLabels, near, adjacency: adjacencyFor(current), distinct });
+        for (let i = 0; i < out.faces.length; i++) {
+          const to = out.to[i];
+          paintFace(out.faces[i], to >= 0 ? rgbOf(hexOf(to)) : rgbOf(mainHexOfPart.get(out.parts[i]) ?? ""));
+        }
+        for (const m of changes.paint ?? []) {
+          const wanted = new Uint8Array(cells.count);
+          for (const c of m.cells) if (c >= 1 && c <= cells.count) wanted[c - 1] = 1;
+          const from = m.from ? new Set(m.from.map((hex) => positionByHex.get(hex)).filter((p): p is number => p !== undefined)) : null;
+          const rgb = rgbOf(m.into);
+          for (let f = 0; f < next.length; f++) if (wanted[cells.cellOf[f]] && (!from || from.has(labels[f]))) paintFace(f, rgb);
+        }
+      }
+    }
+    // A part up close: its pieces (blobs grouped by the AI), each one colour.
+    const focus = focusRef.current;
+    const focusUsable = Boolean(changes.pieces?.length && focus && focus.triangles === current.triangles && focus.colours === current.triangleColors);
+    if (focusUsable && focus) {
+      for (const piece of changes.pieces ?? []) {
+        const rgb = rgbOf(piece.colour);
+        for (const id of piece.blobs) {
+          const blob = focus.map.blobs[id - 1];
+          if (!blob) continue;
+          for (let k = 0; k < blob.members.length; k++) paintFace(focus.map.faces[blob.members[k]], rgb);
+        }
+      }
+    }
+    // Holes and dents (a button's eye holes) with the colour chosen for them.
+    const pitColours = new Set<string>();
+    if (changes.pits?.length) {
+      const pits = pitsFor(current);
+      for (const m of changes.pits) {
+        const rgb = rgbOf(m.into);
+        pitColours.add(rgbToHex(rgb));
+        for (const id of m.ids) for (const f of pits[id - 1]?.faces ?? []) paintFace(f, rgb);
+      }
+    }
+    // A group's colour made clean: its faces not painted already take the new colour; the group stays (as 🎨 on its chip).
+    const also = new Map<number, string>();
+    let pins = storedStrip?.pins;
+    let from = storedStrip?.from;
+    const moved: Array<[string, string]> = [];
+    for (const [hex, to] of recolourTo) {
+      const position = positionByHex.get(hex);
+      if (position === undefined) continue;
+      const rgb = hexToRgb(to);
+      for (let f = 0; f < next.length; f++) if (labels[f] === position && !touched[f]) paintFace(f, rgb);
+      const group = committedGroups.find((g) => g.colours.length > 0 && rgbToHex(g.rep) === hex);
+      const newKey = stripColourKey(rgb);
+      if (group) {
+        also.set(newKey, `${group.family}:${group.index}`);
+        const own = new Set(group.colours.map((colour) => colour.key));
+        if (pins?.some((keys) => keys.some((key) => own.has(key)))) pins = pins.map((keys) => (keys.some((key) => own.has(key)) ? [newKey] : keys));
+        from = fromMoved(from, (key) => (own.has(key) ? newKey : undefined)) ?? from;
+      }
+      moved.push([hex, rgbToHex(rgb)]);
+    }
+    // Colour borders into the grooves nearby (on by default with a part tidy): where sculpted parts of
+    // different colour meet, the colour changes at the bottom of the groove between them.
+    const band = changes.creaseSnap ?? (changes.partTidy?.length || focusUsable ? 3 : 0);
+    if (band > 0) {
+      // By group, not by shade: a group's faces keep their thousands of shades (the bake makes them one);
+      // a face that changes side takes the group's colour.  (11-04: by shade, the blue of the eyes mixed
+      // with the grey round it and the whole group came out grey-blue.)
+      const recolourKey = new Map<number, number>();
+      for (const [hex, to] of recolourTo) {
+        const position = positionByHex.get(hex);
+        if (position !== undefined) recolourKey.set(stripColourKey(hexToRgb(to)), position);
+      }
+      const extraOf = new Map<number, number>();
+      const colourOf: RGB[] = palette.map((entry) => rgbOf(rgbToHex(entry.rgb)));
+      const ids = new Int32Array(next.length);
+      for (let f = 0; f < next.length; f++) {
+        if (!touched[f]) {
+          ids[f] = labels[f];
+          continue;
+        }
+        const c = next[f];
+        const key = stripColourKey(c);
+        const position = positionByHex.get(rgbToHex(c)) ?? recolourKey.get(key);
+        if (position !== undefined) {
+          ids[f] = position;
+          continue;
+        }
+        let id = extraOf.get(key);
+        if (id === undefined) {
+          id = colourOf.length;
+          extraOf.set(key, id);
+          colourOf.push(c);
+        }
+        ids[f] = id;
+      }
+      // Protected colours and the holes' colours keep their faces.
+      const unprotected = new Set(changes.unprotect ?? []);
+      const frozen = new Uint8Array(colourOf.length);
+      palette.forEach((entry, position) => {
+        const hex = rgbToHex(entry.rgb);
+        if ((settings.mergeFlags[hex]?.protect && !unprotected.has(hex)) || changes.protect?.includes(hex)) frozen[position] = 1;
+      });
+      colourOf.forEach((c, id) => {
+        if (pitColours.has(rgbToHex(c))) frozen[id] = 1;
+      });
+      // A part up close changes only inside what was looked at.
+      const only = focusUsable && !changes.partTidy?.length && focus ? focus.mask : null;
+      const snapped = snapToCreases(ids, adjacencyFor(current), creasesFor(current).geometry, { band, frozen, lab: ownLabOf(current), grooveCost: 60, colourCost: 0.5, only });
+      for (let f = 0; f < next.length; f++) if (snapped[f] !== ids[f]) paintFace(f, colourOf[snapped[f]]);
+    }
+    // New colours (a part's clean main colour, a cell painted with one): a group of their own each.
+    const present = new Set<number>();
+    for (const group of committedGroups) for (const colour of group.colours) present.add(colour.key);
+    for (const rgb of rgbCache.values()) {
+      const key = stripColourKey(rgb);
+      if (present.has(key) || also.has(key) || pins?.some((keys) => keys.includes(key))) continue;
+      also.set(key, `new:${key}`);
+      pins = [...(pins ?? []), [key]];
+    }
+    if (faces === 0) return null;
+    return { next, also, pinned: pins !== storedStrip?.pins || from !== storedStrip?.from ? { pins, from } : undefined, faces, moved, pitHexes: [...pitColours] };
+  }
+
+  /** 03's hand choices, as a plan sets them (by the colour's palette number). */
+  function withRecipeChanges(prev: PipelineSettings, changes: TidyChanges): PipelineSettings {
+    const indexOf = (hex: string) => {
+      const position = positionByHex.get(hex);
+      return position === undefined || !palette[position] ? null : String(palette[position].index);
+    };
+    const overrides = { ...prev.recipeOverrides };
+    const manual = { ...prev.manualPhysical };
+    for (const m of changes.recipes ?? []) {
+      const key = indexOf(m.hex);
+      if (key === null) continue;
+      overrides[key] = { counts: m.counts };
+      delete manual[key];
+    }
+    for (const m of changes.single ?? []) {
+      const key = indexOf(m.hex);
+      if (key === null) continue;
+      manual[key] = m.extruder;
+      delete overrides[key];
+    }
+    for (const hex of changes.autoRecipe ?? []) {
+      const key = indexOf(hex);
+      if (key === null) continue;
+      delete overrides[key];
+      delete manual[key];
+    }
+    return { ...prev, recipeOverrides: overrides, manualPhysical: manual };
+  }
+
+  /**
+   * A plan from the consult, done at once as a preview (✅ keeps it, ↩ takes all of it
+   * back): 03's recipes and 04's settings, then the colours it paints (parts, cells,
+   * group colours), then its knobs and merges — those bake once the painted colours are in.
+   */
+  function applyPlan(changes: TidyChanges, entryId: string, title: string, lines: ChangeLine[], dropped?: string[], mapNow?: StoredPartMap | null): void {
+    if (!model) return;
+    if (tidyChainRef.current && tidyChainRef.current.base.length !== model.triangles.length) tidyChainRef.current = null;
+    const chain = tidyChainRef.current;
+    pushTidyUndo({
+      entryId,
+      title,
+      lines,
+      settings: {
+        palette: settings.palette,
+        merge: settings.merge,
+        mergeFlags: settings.mergeFlags,
+        stripByModel: settings.stripByModel,
+        mix: settings.mix,
+        recipeOverrides: settings.recipeOverrides,
+        manualPhysical: settings.manualPhysical,
+        export: settings.export,
+      },
+      colours: model.triangleColors,
+      chain: chain ? { ...chain } : null,
+    });
+    if (hasRecipeChanges(changes)) setSettings((prev) => withRecipeChanges(prev, changes));
+    if (changes.export) {
+      const ex = changes.export;
+      const next = { ...settings.export };
+      if (ex.targetHeight !== undefined) next.targetHeight = ex.targetHeight;
+      if (ex.splitObjects !== undefined) next.splitObjects = ex.splitObjects;
+      if (ex.splitAsParts !== undefined) next.splitAsParts = ex.splitAsParts;
+      if (ex.closeHoles !== undefined) next.closeHoles = ex.closeHoles;
+      if (ex.putOnBed !== undefined) next.putOnBed = ex.putOnBed;
+      if (ex.centerOnBed !== undefined) next.centerOnBed = ex.centerOnBed;
+      if (ex.borderCut !== undefined) {
+        next.cutSpan = ex.borderCut ? CUT_SPAN : 0;
+        next.cutChosen = true;
+      }
+      if (ex.printPreset !== undefined && ex.printPreset !== next.printPreset) {
+        next.printPreset = ex.printPreset;
+        setPreviewLayerHeight(null);
+      }
+      patchSettings("export", next);
+    }
+    const painted = hasColourEdits(changes) ? planColours(model, changes, mapNow) : null;
+    if (painted) {
+      keepGroupsFor(model.triangleColors, painted.next, painted.also.size ? painted.also : undefined, painted.pinned);
+      if (painted.moved.length) {
+        setSettings((prev) => {
+          let flags = prev.mergeFlags;
+          for (const [from, to] of painted.moved) flags = carryFlags(flags, from, to);
+          return { ...prev, mergeFlags: flags };
+        });
+        for (const [from, to] of painted.moved) twinHexes(from, to);
+      }
+      applyColours(model, painted.next, { keepSelection: true });
+    }
+    // Knobs and merges name colours as the palette was: a colour recoloured by this plan goes by its new name.
+    const renamed = new Map(painted?.moved ?? []);
+    const rename = (hex: string) => renamed.get(hex) ?? hex;
+    const rest: TidyChanges = {
+      target: changes.target,
+      minBlob: changes.minBlob,
+      smoothing: changes.smoothing,
+      smoothProtected: changes.smoothProtected,
+      trimTeeth: changes.trimTeeth,
+      lineSmooth: changes.lineSmooth,
+      // The holes' colour is protected: small as they are, the bake's speck clean-up would take them (11-04: minBlob 300 ate a button's eye holes).
+      protect: [...new Set([...(changes.protect ?? []).map(rename), ...(painted?.pitHexes ?? [])])],
+      unprotect: changes.unprotect?.map(rename),
+      merge: changes.merge?.map((m) => ({ from: rename(m.from), into: rename(m.into) })),
+      protectAccents: changes.protectAccents,
+      mix: changes.mix,
+    };
+    if (hasCleanChanges(rest) || rest.mix) {
+      if (painted) setPendingPlan({ changes: rest, entryId, title, lines, dropped, colours: painted.next });
+      else applyTidy(rest, entryId, title, lines, dropped, { undoPushed: true });
+      return;
+    }
+    setTidyHighlight(lines.length > 0 ? new Set(lines.map((line) => line.key)) : null);
+    setTidyResult({ entryId, title, lines, undone: false, dropped });
+    if (lines.length > 0) setStatus(t("tidy.statusDone", { n: lines.length }));
+  }
+
+  // A plan's knobs, once the colours it painted are in (their palette is laid out from them).
+  useEffect(() => {
+    const job = pendingPlan;
+    if (!job || !model || busy !== null) return;
+    if (model.triangleColors !== job.colours) return;
+    setPendingPlan(null);
+    applyTidy(job.changes, job.entryId, job.title, job.lines, job.dropped, { undoPushed: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingPlan, model, busy]);
+
+  /** ✅ on a preview: it stays (it is already in; only the mark changes). */
+  function acceptPreview(entryId: string): void {
+    const entry = tidyLog.find((e) => e.id === entryId);
+    setTidyLog((prev) => prev.map((e) => (e.id === entryId && e.status === "preview" ? { ...e, status: "applied" as const } : e)));
+    setStatus(t("tidy.previewApplied", { title: entry?.text.slice(0, 40) ?? "" }));
+  }
+
+  /** Whether ↩ can take this entry back: only the newest change can. */
+  function canCancelEntry(entryId: string): boolean {
+    const steps = tidyUndoRef.current;
+    return tidyUndoCount > 0 && steps[steps.length - 1]?.entryId === entryId;
+  }
+
+  function cancelEntry(entryId: string): void {
+    if (canCancelEntry(entryId)) undoTidy();
+  }
+
   /** Takes back the newest tidy (settings and colours); pressed again, the one before it, to the start. */
   function undoTidy(): void {
     const steps = tidyUndoRef.current;
@@ -5288,7 +5989,7 @@ export default function App() {
     setTidyUndoCount(tidyUndoRef.current.length);
     setTidyResult({ entryId: saved.entryId, title: saved.title, lines: saved.lines, undone: true, faces: saved.faces });
     setTidyLog((prev) => [
-      ...prev.map((entry) => (entry.id === saved.entryId && entry.status === "applied" ? { ...entry, status: "undone" as const } : entry)),
+      ...prev.map((entry) => (entry.id === saved.entryId && (entry.status === "applied" || entry.status === "preview") ? { ...entry, status: "undone" as const } : entry)),
       { id: `t${Date.now()}`, role: "sys", text: t("tidy.undoneLog", { title: saved.title }), at: new Date().toISOString(), model: tidyModelName, scope: tidyScope },
     ]);
     setStatus(t("tidy.statusUndoneMsg", { n: saved.lines.length }));
@@ -5382,35 +6083,126 @@ export default function App() {
     void tidyAsk(t(`tidy.consult.${preset.id}.ask` as Key), false, preset.closeUp);
   }
 
-  function applyTidySuggestion(entryId: string): void {
-    const entry = tidyLog.find((e) => e.id === entryId);
+  /** The context a plan is checked against now: the palette, the cells and the part map, step 04. */
+  function planContext(scope: TidyScope): TidyContext | null {
     const context = buildTidyContext();
-    if (!entry?.changes || !context || busy !== null) return;
-    // The values as shown, re-checked against the palette as it is now.
-    const { changes, dropped } = sanitizeChanges(entry.changes, context, entry.scope, t);
-    const lines = describeChanges(changes, context, t);
-    setTidyLog((prev) => prev.map((e) => (e.id === entryId ? { ...e, status: lines.length > 0 ? "applied" : "none", lines } : e)));
-    applyTidy(changes, entryId, t("tidy.bySuggestion"), lines, dropped);
+    if (!context || !model) return context;
+    if (scope === "clean" || scope === "both") {
+      const cells = cellsFor(model);
+      context.cellCount = cells.count;
+      const map = partMapFor(model);
+      context.shape = map ? shapeContext(model, map, cells) : null;
+      context.pits = pitsContext(model, map, cells);
+    }
+    if (scope === "export") context.exportInfo = exportInfoNow(model);
+    return context;
   }
 
-  async function tidyAsk(message: string, analyse: boolean, closeUp = false): Promise<void> {
+  /** 👀 on a proposal: tried as a preview (checked again against the state as it is now). */
+  function applyTidySuggestion(entryId: string): void {
+    const entry = tidyLog.find((e) => e.id === entryId);
+    if (!entry?.changes || busy !== null) return;
+    const context = planContext(entry.scope);
+    if (!context) return;
+    const { changes, dropped } = sanitizeChanges({ ...entry.changes, parts: undefined }, context, entry.scope, t);
+    const lines = describeChanges(changes, context, t);
+    setTidyLog((prev) => prev.map((e) => (e.id === entryId ? { ...e, status: lines.length > 0 ? "preview" : "none", lines } : e)));
+    if (lines.length > 0) applyPlan(changes, entryId, t("tidy.bySuggestion"), lines, dropped);
+  }
+
+  /** The shape step's answer as a part map (cells 0-based, each cell in one part only). */
+  function partsFromAnswer(raw: unknown, cellCount: number, faces: number): StoredPartMap | null {
+    if (!raw || typeof raw !== "object") return null;
+    const r = raw as Record<string, unknown>;
+    const taken = new Uint8Array(cellCount);
+    const parts: ShapePart[] = [];
+    for (const item of Array.isArray(r.parts) ? r.parts : []) {
+      if (!item || typeof item !== "object") continue;
+      const m = item as Record<string, unknown>;
+      const name = String(m.name ?? "").trim().slice(0, 24);
+      const cells: number[] = [];
+      for (const v of Array.isArray(m.cells) ? m.cells : []) {
+        const c = Math.round(Number(v)) - 1;
+        if (c >= 0 && c < cellCount && !taken[c]) {
+          taken[c] = 1;
+          cells.push(c);
+        }
+      }
+      if (!name || cells.length === 0) continue;
+      const same = parts.find((part) => part.name === name);
+      if (same) same.cells.push(...cells);
+      else parts.push({ name, cells });
+    }
+    if (parts.length === 0) return null;
+    return { faces, cells: cellCount, subject: String(r.subject ?? "").trim().slice(0, 80), parts, at: new Date().toISOString() };
+  }
+
+  async function tidyAsk(message: string, analyse: boolean, closeUp = false, scopeArg?: TidyScope, options?: { reshapeOnly?: boolean }): Promise<void> {
     if (!model || tidyBusy !== null || busy !== null) return;
-    const scope = tidyScope;
-    const history = tidyLog.filter((entry) => entry.model === tidyModelName);
+    const scope = scopeArg ?? tidyScope;
+    const exporting = scope === "export";
+    const history = tidyLog.filter((entry) => entry.model === tidyModelName && (entry.scope === "export") === exporting);
     const at = () => new Date().toISOString();
+    const sys = (text: string) => setTidyLog((prev) => [...prev, { id: `s${Date.now()}${Math.random().toString(36).slice(2, 5)}`, role: "sys", text, at: at(), model: tidyModelName, scope }]);
     setTidyLog((prev) => [...prev, { id: `u${Date.now()}`, role: "user", text: message, at: at(), model: tidyModelName, scope }]);
     const controller = new AbortController();
     tidyAbortRef.current = controller;
+    const route = aiRoute ?? "local";
     try {
       const context = buildTidyContext();
       if (!context) return;
-      if (scope !== "clean") {
+      const shaping = scope === "clean" || scope === "both";
+      let cells: ShapeCells | null = null;
+      let map = options?.reshapeOnly ? null : partMapFor(model);
+      if (shaping) {
+        setTidyBusy(t("tidy.busyShapeShots"));
+        await yieldToUi();
+        cells = cellsFor(model);
+        context.cellCount = cells.count;
+        if (map && map.cells !== cells.count) map = null;
+        if (!map) {
+          // Shape first: what the model is, and which cells make each part (no owner check needed — it is the AI's own step).
+          const shots = takeTidyPictures("clean", false, { cells, partOfCell: null });
+          if (!shots) return;
+          if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
+          setTidyBusy(t("tidy.busyShape"));
+          const shaped = await aiAsk(
+            {
+              stable: tidyStablePrompt(context),
+              stableImages: shots.stable,
+              images: shots.current,
+              text: shapePrompt(context, [...shots.stableLabels, ...shots.currentLabels], message),
+              schema: SHAPE_SCHEMA,
+              tag: "shape",
+            },
+            controller.signal,
+            route,
+          );
+          if (aiRoute === "key") setKeyUsage(loadKeyUsage());
+          const made = shaped.ok ? partsFromAnswer(shaped.result, cells.count, model.triangles.length) : null;
+          if (made) {
+            map = made;
+            setPartMaps((prev) => ({ ...prev, [tidyModelName]: made }));
+            sys(t("tidy.shapeLog", { subject: made.subject || "?", n: made.parts.length, names: made.parts.map((part) => part.name).join(", ") }));
+          } else sys(t("tidy.shapeFailed", { message: shaped.ok ? "—" : shaped.error }));
+        }
+        if (options?.reshapeOnly) return;
+        if (map) {
+          setTidyBusy(t("tidy.busyParts"));
+          await yieldToUi();
+          context.shape = shapeContext(model, map, cells);
+        }
+        context.specks = specksSummary(model);
+        context.pits = pitsContext(model, map, cells);
+      }
+      if (exporting) context.exportInfo = exportInfoNow(model);
+      if (scope === "mix" || scope === "both") {
         setTidyBusy(t("tidy.busyScores"));
         context.mixScores = await rateMixOptions().catch(() => null);
       }
       setTidyBusy(t("tidy.busyShots"));
       await yieldToUi();
-      const pictures = takeTidyPictures(scope, closeUp);
+      const pictures = takeTidyPictures(scope, closeUp, cells ? { cells, partOfCell: map ? cellParts(cells, map.parts) : null } : undefined, shaping ? pitsFor(model) : []);
       if (!pictures) return;
       if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
       setTidyBusy(t("tidy.busyThinking", { n: pictures.stable.length + pictures.current.length }));
@@ -5424,15 +6216,37 @@ export default function App() {
           tag: "tidy",
         },
         controller.signal,
-        aiRoute ?? "local",
+        route,
       );
       if (aiRoute === "key") setKeyUsage(loadKeyUsage());
       if (!answer.ok) throw new Error(answer.error);
       const raw = answer.result;
       // The state may have moved while Claude was thinking: check against it as it is now.
       const now = buildTidyContext() ?? context;
+      Object.assign(now, { cellCount: context.cellCount, shape: context.shape, specks: context.specks, pits: context.pits, exportInfo: context.exportInfo, mixScores: context.mixScores });
+      const sameMesh = modelRef.current !== null && modelRef.current.triangles === model.triangles;
       const { changes, dropped } = sanitizeChanges(raw.changes, now, scope, t);
+      // A corrected part map (the owner said where an arm ends) is kept at once: it is not a colour change.
+      let mapNow = map;
+      if (changes.parts && cells && sameMesh) {
+        const updated: StoredPartMap = {
+          faces: model.triangles.length,
+          cells: cells.count,
+          subject: changes.parts.subject || map?.subject || "",
+          parts: changes.parts.list.map((part) => ({ name: part.name, cells: part.cells.map((c) => c - 1) })),
+          at: at(),
+        };
+        mapNow = updated;
+        setPartMaps((prev) => ({ ...prev, [tidyModelName]: updated }));
+        now.shape = shapeContext(model, updated, cells);
+      }
+      if (!sameMesh && (changes.partTidy || changes.paint)) {
+        delete changes.partTidy;
+        delete changes.paint;
+        dropped.push(t("tidy.drop.meshChanged"));
+      }
       const lines = describeChanges(changes, now, t);
+      const doable = lines.filter((line) => line.key !== "parts");
       const asked = raw.asked_to_change === true && !analyse;
       const observations = Array.isArray(raw.observations) ? raw.observations.map(String).filter(Boolean).slice(0, 6) : [];
       const entry: TidyLogEntry = {
@@ -5445,26 +6259,168 @@ export default function App() {
         observations,
         changes,
         lines,
-        status: lines.length === 0 ? "none" : asked ? "applied" : "suggested",
+        status: doable.length === 0 ? (lines.length > 0 ? "applied" : "none") : asked && sameMesh ? "preview" : "suggested",
         dropped: dropped.length ? dropped : undefined,
       };
       setTidyLog((prev) => [...prev, entry]);
-      // The mesh may have changed while Claude was thinking (a cut confirmed or undone): then the answer is only kept as a suggestion.
-      const sameMesh = modelRef.current !== null && modelRef.current.triangles === model?.triangles;
-      if (asked && lines.length > 0 && sameMesh) applyTidy(changes, entry.id, t("tidy.byAi"), lines, dropped);
+      if (asked && doable.length > 0 && sameMesh) applyPlan({ ...changes, parts: undefined }, entry.id, t("tidy.byAiPreview"), doable, dropped, mapNow);
     } catch (err) {
       const stopped = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
-      setTidyLog((prev) => [
-        ...prev,
+      sys(stopped ? t("tidy.stopped") : t("tidy.failed", { message: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      setTidyBusy(null);
+      tidyAbortRef.current = null;
+    }
+  }
+
+  /**
+   * 🎯 One part up close: its cells and the cells round it, cut into blobs by the model's own colours
+   * (few colours and many, shading merged where no groove is), numbered on close-ups for Claude, which
+   * groups them into pieces by their shape and gives each one colour.  A preview, as every plan.
+   */
+  async function focusAsk(part: string, message?: string): Promise<void> {
+    if (!model || !positions || tidyBusy !== null || busy !== null) return;
+    const scope: TidyScope = "clean";
+    const at = () => new Date().toISOString();
+    const sys = (text: string) => setTidyLog((prev) => [...prev, { id: `s${Date.now()}${Math.random().toString(36).slice(2, 5)}`, role: "sys", text, at: at(), model: tidyModelName, scope }]);
+    const map = partMapFor(model);
+    const cells = cellsFor(model);
+    const index = map ? map.parts.findIndex((p) => p.name === part) : -1;
+    if (!map || map.cells !== cells.count || index < 0) {
+      sys(t("tidy.focusNoParts"));
+      return;
+    }
+    const ask = message ?? t("tidy.focusAsk", { part });
+    setTidyLog((prev) => [...prev, { id: `u${Date.now()}`, role: "user", text: ask, at: at(), model: tidyModelName, scope }]);
+    const controller = new AbortController();
+    tidyAbortRef.current = controller;
+    try {
+      setTidyBusy(t("tidy.busyBlobs", { part }));
+      await yieldToUi();
+      // The part's cells and the cells round them (the part map is rough at its edges).
+      const own = new Uint8Array(cells.count);
+      for (const c of map.parts[index].cells) own[c] = 1;
+      const near = own.slice();
+      for (const c of map.parts[index].cells) for (const d of cells.touching[c].keys()) near[d] = 1;
+      const faces: number[] = [];
+      const partFaces: number[] = [];
+      for (let f = 0; f < cells.cellOf.length; f++) {
+        if (near[cells.cellOf[f]]) faces.push(f);
+        if (own[cells.cellOf[f]]) partFaces.push(f);
+      }
+      const regionFaces = Int32Array.from(faces);
+      const blobMap = regionBlobs(regionFaces, ownColoursOf(model), areaWeights, adjacencyFor(model), creasesFor(model).concavity, { coarse: 6, fine: 24, max: 36 });
+      const mask = new Uint8Array(model.triangles.length);
+      for (const f of regionFaces) mask[f] = 1;
+      focusRef.current = { triangles: model.triangles, colours: model.triangleColors, part, map: blobMap, mask };
+      // The close-up: straight at the part (its mean normal), and turned 35° about the up axis.
+      const centre = [0, 0, 0];
+      const normal = [0, 0, 0];
+      let sum = 0;
+      let reach = 0;
+      for (const f of partFaces) {
+        const o = f * 9;
+        const ax = positions[o], ay = positions[o + 1], az = positions[o + 2];
+        const ux = positions[o + 3] - ax, uy = positions[o + 4] - ay, uz = positions[o + 5] - az;
+        const vx = positions[o + 6] - ax, vy = positions[o + 7] - ay, vz = positions[o + 8] - az;
+        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const w = Math.hypot(nx, ny, nz) / 2;
+        sum += w;
+        centre[0] += ((ax + positions[o + 3] + positions[o + 6]) / 3) * w;
+        centre[1] += ((ay + positions[o + 4] + positions[o + 7]) / 3) * w;
+        centre[2] += ((az + positions[o + 5] + positions[o + 8]) / 3) * w;
+        normal[0] += nx / 2;
+        normal[1] += ny / 2;
+        normal[2] += nz / 2;
+      }
+      if (sum > 0) for (let k = 0; k < 3; k++) centre[k] /= sum;
+      for (const f of partFaces) {
+        const o = f * 9;
+        reach = Math.max(reach, Math.hypot(positions[o] - centre[0], positions[o + 1] - centre[1], positions[o + 2] - centre[2]));
+      }
+      const nl = Math.hypot(normal[0], normal[1], normal[2]);
+      const dir = nl > 1e-9 ? normal.map((v) => v / nl) : [0, -1, 0];
+      const fov = 30;
+      const distance = (Math.max(reach, 1e-3) / Math.sin(((fov / 2) * Math.PI) / 180)) * 1.1;
+      const poseAlong = (d: number[]) => ({
+        position: [centre[0] + d[0] * distance, centre[1] + d[1] * distance, centre[2] + d[2] * distance] as [number, number, number],
+        target: centre as [number, number, number],
+        // Looking straight down (or up), "up" on the picture is the model's front-back axis.
+        up: (Math.abs(d[2]) > 0.9 ? [0, 1, 0] : [0, 0, 1]) as [number, number, number],
+        fov,
+        aspect: 1,
+        zoom: 4,
+      });
+      const turn = (d: number[], deg: number) => {
+        const a = (deg * Math.PI) / 180;
+        return [d[0] * Math.cos(a) - d[1] * Math.sin(a), d[0] * Math.sin(a) + d[1] * Math.cos(a), d[2]];
+      };
+      const poseA = poseAlong(dir);
+      const poseB = poseAlong(turn(dir, 35));
+      const ownBuffer = buildColourBuffer(model.triangles.length, (i) => ownColoursOf(model)[i]);
+      const codes = new Int32Array(model.triangles.length).fill(-1);
+      regionFaces.forEach((f, i) => {
+        codes[f] = blobMap.blobOf[i];
+      });
+      setTidyBusy(t("tidy.busyShots"));
+      await yieldToUi();
+      const stableShots = takeTidyPictures("clean", false);
+      const numbered = renderNumberedViews(positions, ownBuffer, codes, blobMap.blobs.length, [poseA, poseB], 720);
+      const [plainOwn] = renderViews(positions, ownBuffer, [poseA], 560);
+      const nowBuffer = paletteColours ?? sourceColours;
+      const nowShot = nowBuffer ? renderViews(positions, nowBuffer, [poseA], 560)[0] : null;
+      const images = [plainOwn.dataUrl, ...numbered.shots.map((shot) => shot.dataUrl), ...(nowShot ? [nowShot.dataUrl] : [])];
+      const labels = [`${part} 확대 — 원본 색`, `${part} 확대 — 덩어리 번호(원본 색 위)`, `${part} 확대 35° 돌려서 — 덩어리 번호`, ...(nowShot ? [`${part} 확대 — 지금 결과(02 팔레트)`] : [])];
+      if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
+      const context = buildTidyContext();
+      if (!context) return;
+      context.cellCount = cells.count;
+      context.shape = shapeContext(model, map, cells);
+      context.focus = {
+        part,
+        blobs: blobMap.blobs.map((b) => ({ id: b.id, areaPct: b.areaPct, mean: rgbToHex(b.mean), family: b.familyName })),
+      };
+      setTidyBusy(t("tidy.busyThinking", { n: (stableShots?.stable.length ?? 0) + images.length }));
+      const history = tidyLog.filter((entry) => entry.model === tidyModelName && entry.scope !== "export");
+      const answer = await aiAsk(
         {
-          id: `s${Date.now()}`,
-          role: "sys",
-          text: stopped ? t("tidy.stopped") : t("tidy.failed", { message: err instanceof Error ? err.message : String(err) }),
-          at: at(),
-          model: tidyModelName,
-          scope,
+          stable: tidyStablePrompt(context),
+          stableImages: stableShots?.stable ?? [],
+          images,
+          text: focusPrompt(context, history, ask, [...(stableShots?.stableLabels ?? []), ...labels]),
+          schema: TIDY_SCHEMA,
+          tag: "focus",
         },
-      ]);
+        controller.signal,
+        aiRoute ?? "local",
+      );
+      if (aiRoute === "key") setKeyUsage(loadKeyUsage());
+      if (!answer.ok) throw new Error(answer.error);
+      const raw = answer.result;
+      const now = buildTidyContext() ?? context;
+      Object.assign(now, { cellCount: context.cellCount, shape: context.shape, focus: context.focus });
+      const sameMesh = modelRef.current !== null && modelRef.current.triangles === model.triangles && modelRef.current.triangleColors === model.triangleColors;
+      const { changes, dropped } = sanitizeChanges(raw.changes, now, scope, t);
+      delete changes.parts;
+      const lines = describeChanges(changes, now, t);
+      const entry: TidyLogEntry = {
+        id: `a${Date.now()}`,
+        role: "ai",
+        text: String(raw.reply ?? "").trim() || "…",
+        at: at(),
+        model: tidyModelName,
+        scope,
+        observations: Array.isArray(raw.observations) ? raw.observations.map(String).filter(Boolean).slice(0, 6) : [],
+        changes,
+        lines,
+        status: lines.length === 0 ? "none" : sameMesh ? "preview" : "suggested",
+        dropped: dropped.length ? dropped : undefined,
+      };
+      setTidyLog((prev) => [...prev, entry]);
+      if (lines.length > 0 && sameMesh) applyPlan(changes, entry.id, t("tidy.byAiPreview"), lines, dropped);
+    } catch (err) {
+      const stopped = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
+      sys(stopped ? t("tidy.stopped") : t("tidy.failed", { message: err instanceof Error ? err.message : String(err) }));
     } finally {
       setTidyBusy(null);
       tidyAbortRef.current = null;
@@ -6576,7 +7532,7 @@ export default function App() {
                 onHideHighlight={() => setTidyHighlight(null)}
                 ai={aiAvailable}
                 consult={WITH_CLAUDE}
-                log={tidyLog.filter((entry) => entry.model === tidyModelName)}
+                log={tidyLog.filter((entry) => entry.model === tidyModelName && entry.scope !== "export")}
                 busy={tidyBusy}
                 elapsed={tidyElapsed}
                 onSend={(message) => void tidyAsk(message, false)}
@@ -6584,19 +7540,16 @@ export default function App() {
                 onStop={() => tidyAbortRef.current?.abort()}
                 onApplySuggestion={applyTidySuggestion}
                 onConsultPreset={tidyConsultPreset}
-                connection={{
-                  route: aiRoute,
-                  keyMask: apiKey ? maskKey(apiKey) : null,
-                  usage: keyUsage,
-                  onSaveKey: (key) => {
-                    saveApiKey(key);
-                    setApiKey(key);
-                  },
-                  onClearKey: () => {
-                    saveApiKey(null);
-                    setApiKey(null);
-                  },
-                }}
+                onApplyPreview={acceptPreview}
+                onCancelEntry={cancelEntry}
+                canCancel={canCancelEntry}
+                onAuto={() => void tidyAsk(t(tidyScope === "mix" ? "tidy.mixAutoAsk" : "tidy.autoAsk"), false)}
+                parts={partsShown}
+                partView={partView}
+                onPartView={setPartView}
+                onRedoParts={() => void tidyAsk(t("tidy.partsRedo"), false, false, "clean", { reshapeOnly: true })}
+                onFocusPart={(part) => void focusAsk(part)}
+                connection={aiConnection}
                 disabled={isBusy}
               />
             )}
@@ -6689,6 +7642,8 @@ export default function App() {
                 onChoosePrinter={choosePrinter}
                 printerNotice={printerNotice}
                 slotCount={slots.length}
+                slotColours={slots.map((slot) => ({ label: `E${slot.slot}`, hex: rgbToHex(slot.filament.rgb), name: slot.filament.name }))}
+                slotsAreDefault={settings.filaments.hex.slice(0, settings.filaments.count).every((hex, i) => hex.toUpperCase() === DEFAULT_SETTINGS.filaments.hex[i].toUpperCase())}
                 onExport={() => void export3mf()}
                 busy={isBusy}
                 templateInfo={template?.info ?? null}
@@ -6711,6 +7666,32 @@ export default function App() {
                 }}
                 onOpenGather={() => setGatherOpen(true)}
               />
+              {WITH_CLAUDE && model && (
+                <section className="pane-section tidy" aria-label={t("tidy.exportConsult")}>
+                  <ConsultBox
+                    title={t("tidy.exportConsult")}
+                    sub={t("tidy.exportSub")}
+                    inputId="export-consult-input"
+                    ai={aiAvailable}
+                    log={tidyLog.filter((entry) => entry.model === tidyModelName && entry.scope === "export")}
+                    busy={tidyBusy}
+                    elapsed={tidyElapsed}
+                    disabled={isBusy}
+                    auto={{ label: t("tidy.exportAuto"), hint: t("tidy.exportAutoHint"), onClick: () => void tidyAsk(t("tidy.exportAutoAsk"), false, false, "export") }}
+                    examples={[t("tidy.exExport3"), t("tidy.exExport1"), t("tidy.exExport2")]}
+                    placeholder={t("tidy.exExport3")}
+                    onSend={(message) => void tidyAsk(message, false, false, "export")}
+                    onStop={() => tidyAbortRef.current?.abort()}
+                    onTry={applyTidySuggestion}
+                    onApply={acceptPreview}
+                    onCancel={cancelEntry}
+                    canCancel={canCancelEntry}
+                    connection={aiConnection}
+                    keyForm={<KeyForm connection={aiConnection} />}
+                    connectionLine={<ConnectionLine connection={aiConnection} />}
+                  />
+                </section>
+              )}
               </>
             )}
           </div>
@@ -7310,6 +8291,19 @@ export default function App() {
               <span className="drag-badge" style={{ left: showSource ? `calc(${100 / paneCount}% + 12px)` : 12 }}>
                 {t("view.dragging")}
               </span>
+            )}
+            {aiPreview && (
+              <div className="ai-preview-banner" role="status">
+                <span>{t("tidy.previewBanner", { n: aiPreview.lines?.length ?? 0 })}</span>
+                <button type="button" className="btn small primary" disabled={tidyBusy !== null} onClick={() => acceptPreview(aiPreview.id)}>
+                  ✅ {t("tidy.previewApply")}
+                </button>
+                {canCancelEntry(aiPreview.id) && (
+                  <button type="button" className="btn small" disabled={tidyBusy !== null || isBusy} onClick={() => cancelEntry(aiPreview.id)}>
+                    ↩ {t("tidy.previewCancel")}
+                  </button>
+                )}
+              </div>
             )}
             {compareStep && cutNoticeShown && cutNotice && (
               <div className="cut-notice" role="status">
