@@ -95,7 +95,7 @@ import { CleanupPanel } from "./ui/CleanupPanel";
 import { ColourMap, type ColourMapHandle } from "./ui/ColourMap";
 import { loadStoredBackground, storeBackground, type ViewBackground } from "./ui/background";
 import { blendRecipeText } from "./engine/plan";
-import { buildFaceAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
+import { atlasPointOnFace, buildFaceAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
 import { HelpTip } from "./ui/HelpTip";
 import { GyupaLoader } from "./ui/GyupaLoader";
 import { LoadSection, type SourceInfo } from "./ui/LoadSection";
@@ -1964,6 +1964,11 @@ export default function App() {
   // The brush shows its own circle and the eyedropper takes a colour, not a patch.
   useEffect(() => {
     if (brushMode) hoverFaceRef.current = null;
+    if (brushMode) {
+      // The brush has its own circles on both views.
+      for (const handle of viewerHandles()) handle.setPointerMark(null);
+      mapRef.current?.setPointer(null);
+    }
     if (brushMode || eyedropper) setHoverPatch(null);
     else if (hoverFaceRef.current !== null) hoverFace(hoverFaceRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4244,6 +4249,8 @@ export default function App() {
     if (!hit) return;
     const current = atlasRef.current?.atlas ?? null;
     if (!current) return;
+    // The pointer is on the model now: the model's own mark (the map's last spot) goes.
+    for (const handle of viewerHandles()) handle.setPointerMark(null);
     mapRef.current?.setPointer(faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS), true);
   }
 
@@ -4274,9 +4281,22 @@ export default function App() {
     paintAtHit(hit, slot);
   }
 
-  function mapHover(face: number | null): void {
+  function mapHover(face: number | null, at?: [number, number]): void {
     if (!brushMode) {
       hoverFace(face);
+      // The spot under the map's pointer, marked on the model (it stays where the pointer last touched the
+      // map); the map's own mark goes, the pointer is here now.
+      const current = modelRef.current;
+      const built = atlasRef.current?.atlas ?? null;
+      if (face !== null && face >= 0 && at && current && built) {
+        const geometry = faceGeometryFor(current);
+        const mark = {
+          point: pointToView(atlasPointOnFace(built, current, face, at[0], at[1])),
+          normal: pointToView([geometry.normals[face * 3], geometry.normals[face * 3 + 1], geometry.normals[face * 3 + 2]]),
+        };
+        for (const handle of viewerHandles()) handle.setPointerMark(mark);
+        mapRef.current?.setPointer(null);
+      }
       return;
     }
     const current = modelRef.current;

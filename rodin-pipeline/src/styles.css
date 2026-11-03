@@ -247,7 +247,9 @@ details > summary.muted:hover { color: var(--text-2); }
 /* Leader-line tags over picked patches in the 3D view: a dot on the model, a
    leg out at 45°, a short run, and the tag at its end. */
 .callout-layer { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; }
-.callout { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+.callout { position: absolute; left: 0; top: 0; width: 0; height: 0; transition: opacity 0.15s; }
+/* the brush at a label: it thins out so the paint under it shows (MeshViewer fadeCalloutsNear) */
+.callout.faded { opacity: 0.12; }
 /* the dot and its leader, one shape: drawn right and up, mirrored for the other ways */
 /* every leader and dot under every label (the callouts share the layer's stacking context) */
 .callout-mark { position: absolute; left: 0; top: 0; overflow: visible; z-index: 0; }

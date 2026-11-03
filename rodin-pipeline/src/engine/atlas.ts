@@ -645,7 +645,7 @@ export function facesUnderMapBrush(atlas: FaceAtlas, model: MeshModel, geometry:
  * face's atlas triangle are its weights in 3D (a chart is an affine projection).  A face
  * squeezed too thin to tell gives its centroid.
  */
-function atlasPointOnFace(atlas: FaceAtlas, model: MeshModel, face: number, x: number, y: number): [number, number, number] {
+export function atlasPointOnFace(atlas: FaceAtlas, model: MeshModel, face: number, x: number, y: number): [number, number, number] {
   const uv = atlas.faceUv;
   const o = face * 6;
   const x0 = uv[o], y0 = uv[o + 1], x1 = uv[o + 2], y1 = uv[o + 3], x2 = uv[o + 4], y2 = uv[o + 5];

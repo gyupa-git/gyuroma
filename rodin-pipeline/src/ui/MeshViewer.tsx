@@ -81,6 +81,12 @@ export interface BrushCursor {
   blocked?: boolean;
 }
 
+/** The spot under the colour map's pointer, to mark on the surface. */
+export interface PointerMark {
+  point: [number, number, number];
+  normal: [number, number, number];
+}
+
 export interface MeshViewerHandle {
   /** Recolour faces in place (0..255 sRGB) without a React round trip. */
   setFaceColours(faces: ArrayLike<number>, rgb: RGB): void;
@@ -88,6 +94,8 @@ export interface MeshViewerHandle {
   setFaceColourList(faces: ArrayLike<number>, rgbs: Uint8Array): void;
   /** Show/hide the brush circle on the surface. */
   setBrushCursor(cursor: BrushCursor | null): void;
+  /** Mark the spot under the colour map's pointer on the surface (a ring of constant screen size); null hides it. */
+  setPointerMark(mark: PointerMark | null): void;
   /** Unit vector the camera looks along. */
   viewDirection(): [number, number, number];
   /** Pan so that `point` sits at the screen centre (orientation and distance unchanged). */
@@ -247,6 +255,44 @@ interface PlacedCallout {
   at: string;
   lead: string;
   spot: string;
+  /** Where the label and its leader ended up on screen (null until laid out). */
+  box: Box | null;
+  segments: Segment[];
+  /** Thinned out because the brush is at it (see fadeCalloutsNear). */
+  faded: boolean;
+}
+
+/** How close (CSS px) the brush comes to a label, its leader or its dot before the label thins out. */
+const CALLOUT_FADE_NEAR = 26;
+
+function pointToSegment(x: number, y: number, s: Segment): number {
+  const [x0, y0, x1, y1] = s;
+  const dx = x1 - x0, dy = y1 - y0;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / len2));
+  return Math.hypot(x - (x0 + t * dx), y - (y0 + t * dy));
+}
+
+/**
+ * The brush at (x, y): labels it is near — their box, leader or dot — thin out so the
+ * paint under them can be seen, and come back as it moves away; null clears all.
+ */
+function fadeCalloutsNear(state: ViewerState, x: number | null, y = 0): void {
+  for (const c of state.callouts) {
+    if (!c.tag) continue;
+    let near = false;
+    if (x !== null && c.shown) {
+      const b = c.box;
+      near =
+        Math.hypot(x - c.x, y - c.y) <= CALLOUT_FADE_NEAR ||
+        (b !== null && x >= b.x0 - CALLOUT_FADE_NEAR && x <= b.x1 + CALLOUT_FADE_NEAR && y >= b.y0 - CALLOUT_FADE_NEAR && y <= b.y1 + CALLOUT_FADE_NEAR) ||
+        c.segments.some((segment) => pointToSegment(x, y, segment) <= CALLOUT_FADE_NEAR * 0.7);
+    }
+    if (near !== c.faded) {
+      c.faded = near;
+      c.el.classList.toggle("faded", near);
+    }
+  }
 }
 
 /** The label's distance from its dot: across to its near edge, and up (or down) to its middle. */
@@ -400,6 +446,8 @@ function layOutTags(tags: PlacedCallout[], width: number, height: number): void 
       }
     if (!best) continue;
     const { box, lead } = best;
+    c.box = box;
+    c.segments = lead.segments;
     taken.push(box);
     labels.push(box);
     leaders.push(...lead.segments);
@@ -871,6 +919,8 @@ interface ViewerState {
   callouts: PlacedCallout[];
   cursorGroup: THREE.Group;
   cursorLine: THREE.LineLoop;
+  /** The spot under the colour map's pointer, marked on the surface (see setPointerMark). */
+  pointerMark: THREE.Group;
   pickMaterial: THREE.ShaderMaterial;
   pickTarget: THREE.WebGLRenderTarget | null;
   /** Viewport height in CSS pixels, shared by every outline material. */
@@ -1217,6 +1267,7 @@ function requestRender(state: ViewerState): void {
       state.cut.mesh.material = state.mesh.material;
       state.cut.mesh.visible = state.mesh.visible;
     }
+    if (state.pointerMark.visible) fitPointerMark(state);
     state.renderer.render(state.scene, state.camera);
     placeCallouts(state);
     // Camera position, readable from outside (debugging / tests).
@@ -1545,6 +1596,32 @@ function makeCursorLine(): THREE.LineLoop {
   return line;
 }
 
+/** The mark for the spot under the colour map's pointer: a white ring on a dark one, read on any colour, drawn over everything. */
+function makePointerMark(): THREE.Group {
+  const group = new THREE.Group();
+  const piece = (geometry: THREE.BufferGeometry, color: number, opacity: number, order: number) => {
+    const material = new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+    material.toneMapped = false;
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.renderOrder = order;
+    return mesh;
+  };
+  group.add(piece(new THREE.RingGeometry(0.62, 1, 40), 0x000000, 0.7, 21));
+  group.add(piece(new THREE.RingGeometry(0.72, 0.9, 40), 0xffffff, 1, 22));
+  group.add(piece(new THREE.CircleGeometry(0.16, 24), 0xffffff, 1, 22));
+  group.visible = false;
+  return group;
+}
+
+/** Keeps the pointer mark about 9 px across on screen wherever the camera is. */
+function fitPointerMark(state: ViewerState): void {
+  const mark = state.pointerMark;
+  const height = Math.max(1, state.renderer.domElement.clientHeight);
+  const distance = state.camera.position.distanceTo(mark.position);
+  const perPixel = (2 * distance * Math.tan((state.camera.fov * Math.PI) / 360)) / height;
+  mark.scale.setScalar(Math.max(1e-6, perPixel * 9));
+}
+
 export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function MeshViewer(
   { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
   ref,
@@ -1658,6 +1735,27 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         line.visible = true;
         requestRender(state);
       },
+      setPointerMark(mark) {
+        const state = stateRef.current;
+        if (!state) return;
+        const group = state.pointerMark;
+        if (!mark) {
+          if (group.visible) {
+            group.visible = false;
+            delete state.renderer.domElement.dataset.pointerMark;
+            requestRender(state);
+          }
+          return;
+        }
+        const normal = new THREE.Vector3(...mark.normal);
+        if (normal.lengthSq() === 0) normal.set(0, 0, 1);
+        normal.normalize();
+        group.position.set(mark.point[0], mark.point[1], mark.point[2]).addScaledVector(normal, 1e-3);
+        group.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
+        group.visible = true;
+        state.renderer.domElement.dataset.pointerMark = mark.point.map((v) => v.toFixed(3)).join(",");
+        requestRender(state);
+      },
       viewDirection() {
         const state = stateRef.current;
         if (!state) return [0, 0, -1];
@@ -1719,6 +1817,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const cursorGroup = new THREE.Group();
     const cursorLine = makeCursorLine();
     cursorGroup.add(cursorLine);
+    const pointerMark = makePointerMark();
+    cursorGroup.add(pointerMark);
     scene.add(cursorGroup);
 
     const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 1000);
@@ -1746,6 +1846,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       callouts: [],
       cursorGroup,
       cursorLine,
+      pointerMark,
       pickMaterial: makePickMaterial(),
       pickTarget: null,
       outlineViewport: { value: 1 },
@@ -1795,9 +1896,13 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       if (!brushRef.current) {
         reportHover(hit ? hit.faceIndex : null, hit?.piece);
         callbacksRef.current.onHoverHit?.(hit);
+        fadeCalloutsNear(state, null);
         return;
       }
       hoverFace = null;
+      // Labels the brush comes to thin out, so the paint under them shows.
+      const bounds = renderer.domElement.getBoundingClientRect();
+      fadeCalloutsNear(state, move.x - bounds.left, move.y - bounds.top);
       // Only the brush circle is shown while the pointer is on the surface.
       if (!eyedropperRef.current) renderer.domElement.style.cursor = hit ? "none" : "crosshair";
       if (move.drag) callbacksRef.current.onBrushDrag?.(hit);
@@ -1860,6 +1965,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       pendingMove = null;
       reportHover(null);
       callbacksRef.current.onHoverHit?.(null);
+      fadeCalloutsNear(state, null);
       if (brushRef.current) {
         callbacksRef.current.onBrushHover?.(null);
         if (!eyedropperRef.current && !handRef.current) renderer.domElement.style.cursor = "crosshair";
@@ -1909,6 +2015,10 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       state.pickTarget?.dispose();
       cursorLine.geometry.dispose();
       (cursorLine.material as THREE.Material).dispose();
+      for (const piece of pointerMark.children as THREE.Mesh[]) {
+        piece.geometry.dispose();
+        (piece.material as THREE.Material).dispose();
+      }
       if (state.focusMesh) {
         state.focusMesh.geometry.dispose();
         (state.focusMesh.material as THREE.Material).dispose();
@@ -2154,6 +2264,9 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         el,
         tag: el.querySelector<HTMLElement>(".callout-tag"),
         leaders: [...el.querySelectorAll<SVGPathElement>(".callout-mark path")],
+        box: null,
+        segments: [],
+        faded: false,
         x: 0,
         y: 0,
         shown: false,

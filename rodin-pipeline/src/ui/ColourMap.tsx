@@ -34,7 +34,8 @@ export interface ColourMapProps {
   hand?: boolean;
   background?: ViewBackground;
   onPick?: (face: number | null, info: PickInfo) => void;
-  onHover?: (face: number | null) => void;
+  /** The face under the pointer and where on the map (atlas pixels); null when it leaves the map. */
+  onHover?: (face: number | null, at?: [number, number]) => void;
   onBrushStart?: () => void;
   /** Paint around an atlas position: the caller knows the brush radius and the faces the surface has there. */
   onBrushPaintAt?: (x: number, y: number) => void;
@@ -434,7 +435,7 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         }
       } else {
         const current = atlasRef.current;
-        callbacksRef.current.onHover?.(current && !handRef.current ? faceAtAtlasPixel(current, position[0], position[1]) : null);
+        callbacksRef.current.onHover?.(current && !handRef.current ? faceAtAtlasPixel(current, position[0], position[1]) : null, position);
       }
       requestDraw();
     };
