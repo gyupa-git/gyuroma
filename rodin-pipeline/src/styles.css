@@ -1141,3 +1141,5 @@ span + span > .gyupa-spin-swirl { animation-direction: normal, reverse; }
   .guide-gyupa .gg-body, .guide-gyupa .gg-foot, .guide-gyupa .gg-hand > circle { animation: none !important; }
   .guide-light, .guide-bubble, .guide-gyupa .gg-hand, .guide-gyupa .gg-pen { transition: none; }
 }
+/* The S key beside "only inside the selected patches", as the tool dock shows its keys. */
+.mask-toggle .key { color: var(--iris-300); font-family: var(--mono); font-weight: 600; font-size: 11px; }

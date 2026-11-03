@@ -646,6 +646,8 @@ export default function App() {
   const [healMode, setHealMode] = useState(false);
   const healOnRef = useRef(false);
   healOnRef.current = brushMode && healMode;
+  /** The plain brush is on (its "only inside the selected patches" box is there), and that box: for the S key. */
+  const maskKeyRef = useRef({ on: false, checked: false });
   /** Turning the healing brush on with a colour off the palette: the first palette colour is taken (it paints palette colours only). */
   const healPickRef = useRef<() => void>(() => {});
   /** The healing brush's inner circle (model units): its tip — what lies under it is healed; never wider than the brush. */
@@ -658,6 +660,7 @@ export default function App() {
   // Off by default: a brush held to a selection paints nothing until something
   // is selected, and "nothing happens" is the one failure a tool must not have.
   const [brushMaskOnly, setBrushMaskOnly] = useState(false);
+  maskKeyRef.current = { on: brushMode && !healMode, checked: brushMaskOnly };
   /** Solo / x-ray view of whatever is highlighted (picked patches and selected colours). */
   const [focusMode, setFocusMode] = useState<FocusMode>("normal");
   const [eyedropper, setEyedropper] = useState(false);
@@ -4854,7 +4857,13 @@ export default function App() {
       } else if (event.code === "KeyG") setFillMode((v) => !v);
       else if (event.code === "KeyI") setEyedropper((v) => !v);
       else if (event.code === "KeyC") setGapMode((v) => !v);
-      else return;
+      else if (event.code === "KeyS") {
+        // S: the brush's "only inside the selected patches", while the plain brush is on.
+        if (!maskKeyRef.current.on) return;
+        const next = !maskKeyRef.current.checked;
+        setBrushMaskOnly(next);
+        setStatus(t(next ? "brush.maskOnlyOn" : "brush.maskOnlyOff"));
+      } else return;
       event.preventDefault();
     };
     window.addEventListener("keydown", onKey);
@@ -6922,7 +6931,7 @@ export default function App() {
                       <span className="muted">{t("brush.keys")}</span>
                       {!healMode && (
                         <label className="inline" style={{ gap: 6 }}>
-                          <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
+                          <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")} <span className="key">S</span>
                         </label>
                       )}
                       {brushMaskOnly && !pickedMask && <span className="warn">{t("brush.selectFirst")}</span>}
@@ -7151,7 +7160,7 @@ export default function App() {
                 <span className="muted">{healMode ? t("brush.healKeys") : t("brush.keys")}</span>
                 {!healMode && (
                   <label className={`mask-toggle${brushMaskOnly && !pickedMask ? " warn" : ""}`} title={t("brush.selectFirst")}>
-                    <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
+                    <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")} <span className="key">S</span>
                   </label>
                 )}
               </div>
