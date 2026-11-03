@@ -34,6 +34,7 @@ export function CleanupPanel({
   onMergeSelected,
   onRemoveSpecks,
   speckFaces,
+  speckMm,
   onSpeckFaces,
   busy,
   advanced,
@@ -73,6 +74,8 @@ export function CleanupPanel({
   onRemoveSpecks: (hex: string) => void;
   /** The biggest patch "얼룩 없애기" takes (faces), set right beside it. */
   speckFaces: number;
+  /** That many average faces, printed: the diameter of a disc of that area (mm), or null without a model. */
+  speckMm: number | null;
   onSpeckFaces: (n: number) => void;
   busy: boolean;
   /** The full palette table and its settings, behind "고급". */
@@ -311,6 +314,7 @@ export function CleanupPanel({
               <span className="muted">{t("clean.specksUpTo")}</span>
               <NumberField value={speckFaces} min={1} max={1000000} step={50} width={66} disabled={busy} onChange={onSpeckFaces} />
               <span className="muted">{t("clean.specksFaces")}</span>
+              {speckMm !== null && <span className="muted mono">{t("clean.specksAbout", { mm: speckMm >= 10 ? speckMm.toFixed(0) : speckMm.toFixed(1) })}</span>}
             </div>
           </>
         ) : (

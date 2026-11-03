@@ -1080,6 +1080,12 @@ export default function App() {
     [geometryVertices, geometryTriangles],
   );
   const areaWeightList = useMemo(() => Array.from(areaWeights), [areaWeights]);
+  /** The model's whole area (model units²), for turning a face count into a printed size. */
+  const areaTotal = useMemo(() => {
+    let sum = 0;
+    for (let i = 0; i < areaWeights.length; i++) sum += areaWeights[i];
+    return sum;
+  }, [areaWeights]);
   // The preview stands the model the way the export will place it, so what is
   // on screen is what comes out of the slicer.
   /** The orientation the previews are drawn in (the one the model exports in). */
@@ -6317,6 +6323,7 @@ export default function App() {
                 onMergeSelected={mergeSelected}
                 onRemoveSpecks={removeSpecksInto}
                 speckFaces={speckFaces}
+                speckMm={model && areaTotal > 0 ? discDiameter((speckFaces * areaTotal) / model.triangles.length * mmPerUnit * mmPerUnit) : null}
                 onSpeckFaces={(n) => setSpeckFaces(Math.max(1, Math.min(1_000_000, Math.round(n))))}
                 busy={isBusy}
                 advanced={
