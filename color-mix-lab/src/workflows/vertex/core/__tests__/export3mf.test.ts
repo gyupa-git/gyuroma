@@ -451,6 +451,42 @@ describe("split to objects", () => {
     }
   });
 
+  it("as parts: one object, a volume per shell over its own triangles, every triangle's paint kept", async () => {
+    const whole = await buildPrusa3mfBlob(twoShellOptions(false));
+    const parts = await buildPrusa3mfBlob({ ...twoShellOptions(true), splitAsParts: true });
+    const zip = await readZip(parts.blob);
+    const xml = await zip.file("3D/3dmodel.model")!.async("text");
+    const config = await zip.file("Metadata/Slic3r_PE_model.config")!.async("text");
+    const wholeXml = await (await readZip(whole.blob)).file("3D/3dmodel.model")!.async("text");
+    expect(parts.summary.objectCount).toBe(1);
+    expect(parts.summary.partCount).toBe(2);
+    expect((xml.match(/<object id="/g) ?? []).length).toBe(1);
+    expect((xml.match(/<item objectid="/g) ?? []).length).toBe(1);
+    expect((config.match(/<object id="/g) ?? []).length).toBe(1);
+    // Two volumes, back to back over the one mesh's triangles.
+    const ranges = [...config.matchAll(/<volume firstid="(\d+)" lastid="(\d+)"/g)].map((m) => [Number(m[1]), Number(m[2])]);
+    const triangles = (xml.match(/<triangle /g) ?? []).length;
+    expect(ranges.length).toBe(2);
+    expect(ranges[0][0]).toBe(0);
+    expect(ranges[1][0]).toBe(ranges[0][1] + 1);
+    expect(ranges[1][1]).toBe(triangles - 1);
+    expect(ranges[0][1] + 1).toBe(triangles / 2);
+    const paint = (text: string) => [...text.matchAll(/mmu_segmentation="([^"]+)"/g)].map((m) => m[1]);
+    expect(paint(xml).slice().sort()).toEqual(paint(wholeXml).slice().sort());
+    // Every vertex the triangles use is written once, numbered from 0.
+    const vertexCount = (xml.match(/<vertex /g) ?? []).length;
+    const indices = [...xml.matchAll(/v1="(\d+)" v2="(\d+)" v3="(\d+)"/g)].flatMap((m) => [Number(m[1]), Number(m[2]), Number(m[3])]);
+    expect(Math.max(...indices)).toBe(vertexCount - 1);
+  });
+
+  it("as parts does nothing without the split: one object, one part", async () => {
+    const whole = await buildPrusa3mfBlob({ ...twoShellOptions(false), splitAsParts: true });
+    const config = await (await readZip(whole.blob)).file("Metadata/Slic3r_PE_model.config")!.async("text");
+    expect(whole.summary.objectCount).toBe(1);
+    expect(whole.summary.partCount).toBe(1);
+    expect((config.match(/<volume /g) ?? []).length).toBe(1);
+  });
+
   it("gives every object its own entry in Slic3r_PE_model.config", async () => {
     const split = await buildPrusa3mfBlob(twoShellOptions(true));
     const zip = await readZip(split.blob);

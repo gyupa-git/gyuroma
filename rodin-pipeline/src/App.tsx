@@ -5893,6 +5893,7 @@ export default function App() {
         },
         accentProtection: "off",
         splitObjects: e.splitObjects,
+        splitAsParts: e.splitAsParts,
         // PrusaSlicer's XL profiles and the template's config mean nothing to other slicers.
         printPreset: prusa ? e.printPreset : null,
         printPresetSupportWord: t("exp.supportPresetSuffix"),
@@ -5927,7 +5928,7 @@ export default function App() {
           ids: result.summary.virtualIds.join(", ") || "-",
           renumbered,
           config: result.summary.printerConfigIncluded ? t("status.configIncluded") : t("status.configOmitted"),
-          objects: result.summary.objectCount,
+          objects: result.summary.partCount > result.summary.objectCount ? t("status.exportedParts", { objects: result.summary.objectCount, parts: result.summary.partCount }) : t("status.exportedObjects", { objects: result.summary.objectCount }),
         }),
       );
     } catch (err) {

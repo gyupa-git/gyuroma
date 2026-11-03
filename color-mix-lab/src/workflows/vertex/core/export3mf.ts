@@ -108,6 +108,14 @@ export interface Export3mfOptions {
    */
   splitObjects?: boolean;
   /**
+   * With splitObjects (PrusaSlicer files only): the shells are written as the parts of one
+   * object instead of objects of their own — one mesh, a volume per shell in the model
+   * config, as PrusaSlicer saves a multi-part object.  Its pieces then stay where they
+   * are when the file opens (separate objects floating above the bed are dropped onto it
+   * one by one: a head left lying beside its body, 11-04), and each part keeps its paint.
+   */
+  splitAsParts?: boolean;
+  /**
    * D-2: Metadata/Slic3r_PE.config is omitted by default so that the printer
    * profile selected in PrusaSlicer stays untouched.  Set to true to copy the
    * (slot-extended) config from the loaded 3MF template instead.
@@ -565,6 +573,18 @@ interface MeshShell {
   faceCount: number;
 }
 
+/** Every shell, one after another, as the one mesh of a multi-part object (volumes by triangle range). */
+function partsShell(options: Export3mfOptions, components: MeshComponent[]): MeshShell {
+  const total = components.reduce((n, component) => n + component.triangles.length, 0);
+  const faces = new Int32Array(total);
+  let at = 0;
+  for (const component of components) {
+    faces.set(component.triangles, at);
+    at += component.triangles.length;
+  }
+  return { name: titleFromFilename(options.fileName), faces, faceCount: total };
+}
+
 /** One object per connected shell, or the whole mesh as a single object. */
 function meshShells(options: Export3mfOptions, components: MeshComponent[] | null): MeshShell[] {
   const title = titleFromFilename(options.fileName);
@@ -764,10 +784,12 @@ function buildModelConfig(
   outputFileName: string,
   defaultExtruder: number,
   components?: MeshComponent[] | null,
+  asParts = false,
 ): string {
   const title = titleFromFilename(outputFileName);
   const sourceFile = model.name || `${modelBaseName(outputFileName)}.obj`;
   const split = Boolean(components && components.length > 1);
+  if (split && asParts) return partsModelConfig(components as MeshComponent[], title, sourceFile, defaultExtruder);
   const faceCounts = split
     ? (components as MeshComponent[]).map((c) => c.triangles.length)
     : [model.triangles.length];
@@ -798,6 +820,41 @@ function buildModelConfig(
     })
     .join("");
   return `<?xml version="1.0" encoding="UTF-8"?>\n<config>\n${objects}</config>\n`;
+}
+
+/** One object, a volume (part) per shell: consecutive triangle ranges of its one mesh, in shell order. */
+function partsModelConfig(components: MeshComponent[], title: string, sourceFile: string, defaultExtruder: number): string {
+  const extruder = Math.max(1, Math.round(defaultExtruder));
+  let first = 0;
+  const volumes = components
+    .map((component, index) => {
+      const name = `${title} ${index + 1}`;
+      const last = first + component.triangles.length - 1;
+      const text =
+        `  <volume firstid="${first}" lastid="${last}">\n` +
+        `   <metadata type="volume" key="name" value="${xmlEscape(name)}"/>\n` +
+        `   <metadata type="volume" key="volume_type" value="ModelPart"/>\n` +
+        `   <metadata type="volume" key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>\n` +
+        `   <metadata type="volume" key="source_file" value="${xmlEscape(sourceFile)}"/>\n` +
+        `   <metadata type="volume" key="source_object_id" value="0"/>\n` +
+        `   <metadata type="volume" key="source_volume_id" value="${index}"/>\n` +
+        `   <metadata type="volume" key="source_offset_x" value="0"/>\n` +
+        `   <metadata type="volume" key="source_offset_y" value="0"/>\n` +
+        `   <metadata type="volume" key="source_offset_z" value="0"/>\n` +
+        `   <mesh edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>\n` +
+        `  </volume>\n`;
+      first = last + 1;
+      return text;
+    })
+    .join("");
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>\n<config>\n` +
+    ` <object id="1" instances_count="1">\n` +
+    `  <metadata type="object" key="name" value="${xmlEscape(title)}"/>\n` +
+    `  <metadata type="object" key="extruder" value="${extruder}"/>\n` +
+    volumes +
+    ` </object>\n</config>\n`
+  );
 }
 
 function writeContentTypes(includePng: boolean): string {
@@ -1368,6 +1425,8 @@ export interface Export3mfSummary {
   bedSize?: { x: number; y: number };
   /** 3MF objects written: more than one when the shells were split. */
   objectCount: number;
+  /** Parts in all (the shells of one object when written as parts; else one per object). */
+  partCount: number;
   /** Written as a Bambu Studio project, with this many mixed filaments. */
   bambuMixedFilaments?: number;
 }
@@ -1417,7 +1476,9 @@ export async function buildPrusa3mfBlob(
     components && components.length > 1 && components.length <= MAX_SPLIT_OBJECTS
       ? components
       : null;
-  const shells = meshShells(options, splitComponents);
+  // Parts of one object: PrusaSlicer's own layout (Bambu-family files keep objects of their own).
+  const asParts = Boolean(options.splitAsParts && splitComponents && options.slicer !== "bambu");
+  const shells = asParts ? [partsShell(options, splitComponents as MeshComponent[])] : meshShells(options, splitComponents);
   const leaves = resolvePaintLeaves(options.palette, paletteToPaintCode, paletteIndices);
 
   // D-3: never write an inconsistent project.
@@ -1448,6 +1509,7 @@ export async function buildPrusa3mfBlob(
     fileName,
     options.placement.defaultExtruder,
     splitComponents,
+    asParts,
   );
   const fsJson = fullSpectrumJson(options.physicalSlots, virtuals);
 
@@ -1481,6 +1543,7 @@ export async function buildPrusa3mfBlob(
     scale: transformResult.resolvedScale,
     bedSize: transformResult.bedSize,
     objectCount: shells.length,
+    partCount: asParts ? (splitComponents as MeshComponent[]).length : shells.length,
   };
   // The mesh goes out a piece at a time, compressed as it is written: a model of
   // millions of faces is never held as one string (the browser caps a string at

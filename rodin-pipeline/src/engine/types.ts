@@ -75,6 +75,12 @@ export interface ExportSettings {
   targetHeight: number | null;
   /** Write each separate piece as its own 3MF object (PrusaSlicer's own split erases the paint). */
   splitObjects: boolean;
+  /**
+   * With splitObjects, for PrusaSlicer: the pieces as the parts of one object, not objects of
+   * their own — they stay put when the file opens (no "objects at multiple heights" question,
+   * no head dropped beside its body, 11-04).  On by default.
+   */
+  splitAsParts: boolean;
   putOnBed: boolean;
   centerOnBed: boolean;
   bedX: number;
@@ -218,6 +224,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     // handful of layers and looks single-coloured. Default every export to 70 mm.
     targetHeight: DEFAULT_TARGET_HEIGHT,
     splitObjects: true,
+    splitAsParts: true,
     putOnBed: true,
     centerOnBed: true,
     bedX: 360,
