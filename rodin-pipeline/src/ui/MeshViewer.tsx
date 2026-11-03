@@ -1045,6 +1045,7 @@ function dropStrokePreview(state: ViewerState, flush: boolean): void {
   state.scene.remove(preview.mesh);
   preview.mesh.geometry.dispose();
   state.stroke = null;
+  delete state.renderer.domElement.dataset.painted;
   if (!flush || !state.geometry) return;
   for (const name of ["color", "softColor"]) {
     const attribute = state.geometry.getAttribute(name) as THREE.BufferAttribute | undefined;
@@ -1697,6 +1698,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     }
     hideCutPieces(state, faces);
     addToStrokePreview(state, shown);
+    // Test hook: how many faces the stroke preview holds.
+    state.renderer.domElement.dataset.painted = String(state.stroke?.count ?? 0);
     requestRender(state);
   }
 

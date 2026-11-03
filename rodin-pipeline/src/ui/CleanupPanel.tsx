@@ -6,6 +6,7 @@ import { NO_TONE, isNoTone, type Tone } from "../engine/groupTone";
 import type { MergeFlag, MergeSettings } from "../engine/types";
 import { useT } from "../i18n";
 import type { StripOutput } from "./ColourStrip";
+import { ColourPicker } from "./ColourPicker";
 import { HelpTip } from "./HelpTip";
 import { NumberField, pct } from "./common";
 import { Icon } from "./Shell";
@@ -50,6 +51,8 @@ export function CleanupPanel({
   onToneScope,
   pieceFaces,
   onRejoin,
+  onPickColour,
+  onPickDraft,
 }: {
   strip: ColourStripData | null;
   /** The groups at rest (the palette). */
@@ -103,6 +106,9 @@ export function CleanupPanel({
   pieceFaces: number;
   /** A split-off piece back into the group it came from. */
   onRejoin: () => void;
+  /** The big swatch as a colour picker: the colour chosen for the faces the sliders work on, and meanwhile the colour being chosen (null: closed). */
+  onPickColour: (hex: string) => void;
+  onPickDraft: (hex: string | null) => void;
 }) {
   const t = useT();
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -143,12 +149,15 @@ export function CleanupPanel({
         {focus && focusHex ? (
           <>
             <div className="group-card">
-              {/* while adjusted: the colour it started as on the left, as it is now on the right */}
-              <span
-                className="big-swatch"
-                title={toneFrom && shownHex !== toneFrom ? `${toneFrom} → ${shownHex}` : undefined}
-                style={{ background: toneFrom && shownHex !== toneFrom ? `linear-gradient(90deg, ${toneFrom} 0 50%, ${shownHex} 50% 100%)` : shownHex }}
-              />
+              {/* The swatch opens the colour picker (its colour shown on the model while choosing);
+                  while adjusted: the colour it started as on the left, as it is now on the right */}
+              <ColourPicker value={shownHex} before={focusHex} commit disabled={busy} className="big-swatch-trigger" title={t("tone.pickHint")} onDraft={onPickDraft} onChange={onPickColour}>
+                <span
+                  className="big-swatch"
+                  title={toneFrom && shownHex !== toneFrom ? `${toneFrom} → ${shownHex}` : undefined}
+                  style={{ background: toneFrom && shownHex !== toneFrom ? `linear-gradient(90deg, ${toneFrom} 0 50%, ${shownHex} 50% 100%)` : shownHex }}
+                />
+              </ColourPicker>
               <span style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0 }}>
                 <span className="hex">{shownHex}</span>
                 {/* One colour prints; the original texture's shades stay underneath (cuts and edges are worked out

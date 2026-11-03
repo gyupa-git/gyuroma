@@ -648,8 +648,10 @@ export default function App() {
   healOnRef.current = brushMode && healMode;
   /** Turning the healing brush on with a colour off the palette: the first palette colour is taken (it paints palette colours only). */
   const healPickRef = useRef<() => void>(() => {});
-  /** The healing brush's inner circle (model units): a speck that fits in it is taken, a bigger patch stays. */
+  /** The healing brush's inner circle (model units): its tip — what lies under it is healed; never wider than the brush. */
   const [healSize, setHealSize] = useState(0.5);
+  /** Where the brush circles were last shown, so a size change redraws them there. */
+  const brushHitRef = useRef<ViewerHit | null>(null);
   /** "얼룩 없애기": a patch of more faces than this stays (set beside the button; follows the model's size at first). */
   const [speckFaces, setSpeckFaces] = useState(600);
   const [brushRadius, setBrushRadius] = useState(1);
@@ -843,6 +845,8 @@ export default function App() {
   const [pickCustom, setPickCustom] = useState("#FF0000");
   /** The colour being chosen in the picker, laid over the selection meanwhile (null: the picker is closed). */
   const [pickPreviewHex, setPickPreviewHex] = useState<string | null>(null);
+  /** The group card's picker while open: the faces it paints, and whether the views show its colour yet. */
+  const groupPickRef = useRef<{ faces: Int32Array; touched: boolean } | null>(null);
   const hoverTimerRef = useRef<number | null>(null);
   const templateRestoredRef = useRef(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
@@ -2587,6 +2591,93 @@ export default function App() {
     setToneScopeChoice(scope);
   }
 
+  /** The faces the card's colour picker works on — what the sliders would: the picked pieces of the group, or every face of it. */
+  function groupPickFaces(): { faces: Int32Array; whole: boolean } | null {
+    if (!model || !cardGroup || !faceColourIndex) return null;
+    if (toneScope === "piece" && cardPieces.length > 0) {
+      let n = 0;
+      for (const patch of cardPieces) n += patch.faces.length;
+      const faces = new Int32Array(n);
+      let at = 0;
+      for (const patch of cardPieces) {
+        faces.set(patch.faces, at);
+        at += patch.faces.length;
+      }
+      return { faces, whole: false };
+    }
+    const own = new Set(cardGroup.colours.map((colour) => colour.key));
+    const { index, keys } = faceColourIndex;
+    const ownUnique = new Uint8Array(keys.length);
+    for (let u = 0; u < keys.length; u++) if (own.has(keys[u])) ownUnique[u] = 1;
+    const faces: number[] = [];
+    for (let f = 0; f < index.length; f++) if (ownUnique[index[f]]) faces.push(f);
+    return { faces: Int32Array.from(faces), whole: true };
+  }
+
+  /**
+   * The card's big swatch is a colour picker.  While it is open, its faces show
+   * the colour being chosen (as a slider drag shows); closed without Apply, the
+   * views show the model's own colours again.
+   */
+  function previewGroupPick(hex: string | null): void {
+    const current = modelRef.current;
+    if (!current) return;
+    if (hex === null) {
+      if (groupPickRef.current?.touched) setModel({ ...current });
+      groupPickRef.current = null;
+      return;
+    }
+    let held = groupPickRef.current;
+    if (!held) {
+      const got = groupPickFaces();
+      if (!got) return;
+      held = { faces: got.faces, touched: false };
+      groupPickRef.current = held;
+    }
+    held.touched = true;
+    const rgb = hexToRgb(hex);
+    for (const handle of [viewerRef0.current, viewerRef1.current, viewerRef2.current]) handle?.setFaceColours(held.faces, rgb);
+  }
+
+  /**
+   * The card's picker applied: its faces take the colour chosen, as a fill does —
+   * a colour the model does not have as a band of its own; the picked pieces as a
+   * group of their own, the whole group as the same group in its new colour (its
+   * protection and its place in the merge choices go along).  ⌘Z takes it back.
+   */
+  function applyGroupPick(hex: string): void {
+    const chosen = hex.toUpperCase();
+    if (!model || !cardHex || !/^#[0-9A-F]{6}$/.test(chosen)) return;
+    const got = groupPickFaces();
+    // The model itself changes now: nothing to put back when the picker closes.
+    groupPickRef.current = null;
+    if (!got || got.faces.length === 0) return;
+    if (chosen === cardHex) {
+      setStatus(t("status.fillSame", { hex: chosen }));
+      return;
+    }
+    const { faces, whole } = got;
+    const rgb = fillRgb(model, chosen);
+    const next = model.triangleColors.slice();
+    for (let i = 0; i < faces.length; i++) next[faces[i]] = rgb;
+    const grouping = groupingForNew(chosen);
+    keepGroupsFor(model.triangleColors, next, grouping?.also, grouping?.pinned);
+    const was = cardHex;
+    if (whole) {
+      if (grouping) setSettings((prev) => ({ ...prev, mergeFlags: carryFlags(prev.mergeFlags, was, chosen) }));
+      twinHexes(was, chosen);
+      setSelectedHexes((prev) => prev.map((h) => (h === was ? chosen : h)));
+    }
+    endToneSession();
+    // The picked pieces keep their faces, now in the new colour: the card follows them there.
+    const painted = new Uint8Array(model.triangles.length);
+    for (let i = 0; i < faces.length; i++) painted[faces[i]] = 1;
+    setPickedPatches((prev) => prev.map((patch) => (painted[patch.anchor] ? { ...patch, hex: chosen } : patch)));
+    applyColours(model, next, { keepSelection: true });
+    const n = faces.length.toLocaleString();
+    setStatus(whole ? t("status.groupRecoloured", { from: was, to: chosen, n }) : t("status.recoloured", { n, hex: chosen, patches: cardPieces.length }));
+  }
+
   /**
    * What each colour slider would make of the group's colour from one end to
    * the other (the other two where they are), for the slider's track: the
@@ -4320,6 +4411,7 @@ export default function App() {
   }
 
   function showBrushCursorAt(hit: ViewerHit | null): void {
+    brushHitRef.current = hit;
     const blocked = !healMode && brushMaskOnly && (!pickedMask || hit === null || !pickedMask[hit.faceIndex]);
     for (const handle of viewerHandles())
       handle.setBrushCursor(hit ? { point: hit.point, normal: hit.normal, radius: brushRadius, blocked, inner: healMode ? healSize : undefined } : null);
@@ -4350,40 +4442,26 @@ export default function App() {
     const current = modelRef.current;
     const built = atlasRef.current?.atlas ?? null;
     if (!current || !built || !strokeRef.current) return;
-    const reach = facesUnderMapBrush(built, current, faceGeometryFor(current), x, y, brushRadius);
-    paintFaces(healMode ? healFaces(current, reach) : reach);
+    const geometry = faceGeometryFor(current);
+    const reach = facesUnderMapBrush(built, current, geometry, x, y, brushRadius);
+    paintFaces(healMode ? healFaces(current, reach, facesUnderMapBrush(built, current, geometry, x, y, Math.min(healSize, brushRadius))) : reach);
   }
 
   /**
-   * The healing brush's dab: of the faces in reach (the outer circle), those in specks of
-   * other colours lying in the brush colour — patches enclosed by it, wholly inside the
-   * reach, and small enough to fit the inner circle — so the brush never crosses the
-   * colour's own outline and never takes a big patch.  What earlier dabs took counts as
-   * the colour already.
+   * The healing brush's dab (the owner's rule, 11-03): the other colours under the
+   * inner circle — the tip — turn into the brush colour where, inside the outer
+   * circle, that colour encloses them.  A patch is judged inside the outer circle
+   * only (a neck to a body of its own colour outside is a short open stretch; a
+   * body's own edge a long one, left alone), and only what lies under the tip is
+   * painted — so the brush never crosses the colour's own outline, and a blotch
+   * joined to something is a blotch all the same.  What earlier dabs took counts
+   * as the colour already.
    */
-  function healFaces(current: MeshModel, reach: Int32Array): Int32Array {
+  function healFaces(current: MeshModel, reach: Int32Array, tip: Int32Array): Int32Array {
     const stroke = strokeRef.current;
     const into = positionByHex.get(brushHex);
     if (!stroke || into === undefined || labels.length !== current.triangles.length) return new Int32Array(0);
-    const c = faceGeometryFor(current).centroids;
-    const limit = healSize * healSize;
-    const fits = (faces: number[]): boolean => {
-      let mx = 0, my = 0, mz = 0;
-      for (const f of faces) {
-        mx += c[f * 3];
-        my += c[f * 3 + 1];
-        mz += c[f * 3 + 2];
-      }
-      mx /= faces.length;
-      my /= faces.length;
-      mz /= faces.length;
-      for (const f of faces) {
-        const dx = c[f * 3] - mx, dy = c[f * 3 + 1] - my, dz = c[f * 3 + 2] - mz;
-        if (dx * dx + dy * dy + dz * dz > limit) return false;
-      }
-      return true;
-    };
-    return specksIn(labels, adjacencyFor(current), { into, within: reach, maxFaces: 0, enclosed: 0.8, protectedLabels: protectedPositions(), taken: stroke.healed, fits });
+    return specksIn(labels, adjacencyFor(current), { into, within: reach, tip, maxFaces: 0, enclosed: 0.8, protectedLabels: protectedPositions(), taken: stroke.healed });
   }
 
   /**
@@ -4416,8 +4494,11 @@ export default function App() {
     const current = modelRef.current;
     if (!hit || !current || !strokeRef.current) return;
     const viewDir = viewerRefs[slot]?.current?.viewDirection() ?? null;
-    const reach = facesInSphere(faceGeometryFor(current), pointToModel(hit.point), brushRadius, viewDir ? pointToModel(viewDir) : null);
-    paintFaces(healMode ? healFaces(current, reach) : reach);
+    const geometry = faceGeometryFor(current);
+    const centre = pointToModel(hit.point);
+    const along = viewDir ? pointToModel(viewDir) : null;
+    const reach = facesInSphere(geometry, centre, brushRadius, along);
+    paintFaces(healMode ? healFaces(current, reach, facesInSphere(geometry, centre, Math.min(healSize, brushRadius), along)) : reach);
   }
 
   function brushStart3D(hit: ViewerHit | null, slot: number): void {
@@ -4469,8 +4550,13 @@ export default function App() {
   }, [geometryTriangles]);
   const brushSliderValue = Math.round(1000 * Math.max(0, Math.min(1, Math.log(brushRadius / brushBounds.min) / Math.log(brushBounds.max / brushBounds.min))));
   const setBrushRadiusClamped = (next: number) => setBrushRadius(Number(Math.max(brushBounds.min, Math.min(brushBounds.max, next)).toPrecision(3)));
-  const healSliderValue = Math.round(1000 * Math.max(0, Math.min(1, Math.log(healSize / brushBounds.min) / Math.log(brushBounds.max / brushBounds.min))));
-  const setHealSizeClamped = (next: number) => setHealSize(Number(Math.max(brushBounds.min, Math.min(brushBounds.max, next)).toPrecision(3)));
+  // The healing spot runs from the smallest brush up to the brush itself: never past the outer circle.
+  const healTop = Math.max(brushRadius, brushBounds.min * 1.001);
+  const healSliderValue = Math.round(1000 * Math.max(0, Math.min(1, Math.log(healSize / brushBounds.min) / Math.log(healTop / brushBounds.min))));
+  const setHealSizeClamped = (next: number) => setHealSize(Number(Math.max(brushBounds.min, Math.min(healTop, next)).toPrecision(3)));
+  useEffect(() => {
+    if (healSize > brushRadius) setHealSize(brushRadius);
+  }, [brushRadius, healSize]);
 
   // [ and ] shrink / grow the brush while brush mode is on.
   useEffect(() => {
@@ -4494,6 +4580,12 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [brushMode, brushRadius, brushBounds, healSize]);
+
+  // The circles on the model follow the sizes as they change (the slider, [ ] { }), not only on the next move.
+  useEffect(() => {
+    if (brushMode && brushHitRef.current) showBrushCursorAt(brushHitRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brushMode, brushRadius, healSize, healMode]);
 
   // Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redoes the last colour change.
   useEffect(() => {
@@ -6381,6 +6473,8 @@ export default function App() {
                 onToneScope={chooseToneScope}
                 pieceFaces={pieceFaceCount}
                 onRejoin={rejoinPiece}
+                onPickColour={applyGroupPick}
+                onPickDraft={previewGroupPick}
                 onToggleSelected={toggleSelectedHex}
                 outputOf={stripOutputOf}
                 flags={settings.mergeFlags}
@@ -6759,7 +6853,7 @@ export default function App() {
                       {healMode && (
                         <>
                           <span title={t("brush.healSizeHint")}>{t("brush.healSize")}</span>
-                          <NumberField value={healSize} min={0.001} max={10000} step={Math.max(0.001, Number((healSize / 5).toPrecision(1)))} onChange={(v) => setHealSize(Math.max(0.001, v))} />
+                          <NumberField value={healSize} min={0.001} max={brushRadius} step={Math.max(0.001, Number((healSize / 5).toPrecision(1)))} onChange={(v) => setHealSize(Math.max(0.001, Math.min(brushRadius, v)))} />
                         </>
                       )}
                       <span className="muted">{t("brush.keys")}</span>
@@ -6993,7 +7087,7 @@ export default function App() {
                       step={1}
                       value={healSliderValue}
                       title={t("brush.healSizeHint")}
-                      onChange={(e) => setHealSizeClamped(brushBounds.min * Math.pow(brushBounds.max / brushBounds.min, Number(e.target.value) / 1000))}
+                      onChange={(e) => setHealSizeClamped(brushBounds.min * Math.pow(healTop / brushBounds.min, Number(e.target.value) / 1000))}
                     />
                     <b>{healSize}</b>
                   </>

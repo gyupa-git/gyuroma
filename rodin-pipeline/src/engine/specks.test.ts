@@ -65,9 +65,39 @@ describe("specksIn", () => {
     // A second dab over the same ground finds nothing new.
     const second = specksIn(labels, adjacency, { into: PINK, within, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken });
     expect(second.length).toBe(0);
-    // A dab that covers only half of the blotch leaves it: the brush must not cross the colour's outline by halves.
+    // A dab that covers only half of the blotch leaves it: cut at the reach, the blotch is open along its whole far side.
     const half = Int32Array.from(faces(["5,5", "6,5", "5,6", "6,6", "5,7", "6,7"]));
     expect(specksIn(labels, adjacency, { into: PINK, within: half, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken: null }).length).toBe(0);
+  });
+
+  it("judges a patch inside the reach only — a blotch joined by a neck goes, a body's edge stays — and paints under the tip", () => {
+    // A black 2×2 blotch (x 5–6, y 11–12) joined by a one-cell neck (x 7–9, y 12) to the big black region (x 10–14, y 10–14).
+    const joined = (x: number, y: number): number =>
+      (x >= 10 && x <= 14 && y >= 10 && y <= 14) || (x >= 5 && x <= 6 && y >= 11 && y <= 12) || (y === 12 && x >= 7 && x <= 9) ? BLACK : PINK;
+    const g = grid(20, joined);
+    const cells = (x0: number, x1: number, y0: number, y1: number): string[] => {
+      const out: string[] = [];
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) out.push(`${x},${y}`);
+      return out;
+    };
+    const f = (list: string[]) => Int32Array.from(list.flatMap((c) => g.cellFaces.get(c) as number[]));
+    const rules = { into: PINK, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken: null };
+    // The reach x 3–9, y 9–15 holds the blotch and the neck, not the region: the whole of it goes (the neck's
+    // end is one open edge of fourteen), nothing outside the reach.
+    const within = f(cells(3, 9, 9, 15));
+    const all = new Set(specksIn(g.labels, g.adjacency, { ...rules, within }));
+    expect(all.size).toBe((4 + 3) * 2);
+    for (const face of g.cellFaces.get("10,12") as number[]) expect(all.has(face)).toBe(false);
+    // The tip over the blotch only (x 4–6, y 10–13): the blotch goes, the neck stays for the next dab.
+    const tip = f(cells(4, 6, 10, 13));
+    const got = new Set(specksIn(g.labels, g.adjacency, { ...rules, within, tip }));
+    expect(got.size).toBe(4 * 2);
+    for (const face of g.cellFaces.get("7,12") as number[]) expect(got.has(face)).toBe(false);
+    for (const face of g.cellFaces.get("5,11") as number[]) expect(got.has(face)).toBe(true);
+    // A body's edge: the reach x 7–11, y 8–16 takes in a two-cell-deep strip of the region (and the neck,
+    // joined to it), open along the whole of x = 11: left alone.
+    const edge = f(cells(7, 11, 8, 16));
+    expect(specksIn(g.labels, g.adjacency, { ...rules, within: edge, tip: edge }).length).toBe(0);
   });
 
   it("never takes a protected colour", () => {

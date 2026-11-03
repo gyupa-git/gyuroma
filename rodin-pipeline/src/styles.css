@@ -501,8 +501,10 @@ table.grid td .colour-select-trigger { min-width: 140px; }
 .cp-sv-marker { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6); pointer-events: none; }
 /* The hue bar: its own rainbow, whatever the bars around it give their inputs (`.stage input` painted it plain, 11-03). */
 .colour-picker-popover input.cp-hue { -webkit-appearance: none; appearance: none; width: 100%; height: 12px; padding: 0; border: 0; border-radius: 6px; background: linear-gradient(to right, #f00 0%, #ff0 17%, #0f0 33%, #0ff 50%, #00f 67%, #f0f 83%, #f00 100%); outline: none; margin: 0; }
-.colour-picker-popover input.cp-hue::-webkit-slider-runnable-track { height: 12px; background: transparent; border: 0; }
-.colour-picker-popover input.cp-hue::-moz-range-track { height: 12px; background: transparent; border: 0; }
+/* The rainbow on the track as well (the way the tone sliders paint theirs): a browser that keeps its own track
+   draws it over the input's background, and the bar shows no colour. */
+.colour-picker-popover input.cp-hue::-webkit-slider-runnable-track { height: 12px; border: 0; border-radius: 6px; background: linear-gradient(to right, #f00 0%, #ff0 17%, #0f0 33%, #0ff 50%, #00f 67%, #f0f 83%, #f00 100%); }
+.colour-picker-popover input.cp-hue::-moz-range-track { height: 12px; border: 0; border-radius: 6px; background: linear-gradient(to right, #f00 0%, #ff0 17%, #0f0 33%, #0ff 50%, #00f 67%, #f0f 83%, #f00 100%); }
 .colour-picker-popover input.cp-hue::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; margin-top: -2px; border-radius: 50%; background: #fff; border: 2px solid #141415; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.3); cursor: pointer; }
 .colour-picker-popover input.cp-hue::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 2px solid #141415; cursor: pointer; }
 .cp-row { display: flex; align-items: center; gap: 6px; }
@@ -674,7 +676,10 @@ table.grid td .colour-select-trigger { min-width: 140px; }
 
 /* --- step 02 left panel: the selected group ------------------------------- */
 .group-card { display: flex; gap: 12px; align-items: center; }
-.group-card .big-swatch { width: 44px; height: 44px; border-radius: 8px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12); flex: 0 0 auto; }
+.group-card .big-swatch { width: 44px; height: 44px; border-radius: 8px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12); flex: 0 0 auto; display: block; }
+/* The big swatch is the colour picker's button: the swatch itself, a ring around it while hovered or open. */
+.group-card .colour-picker-trigger.big-swatch-trigger { padding: 0; border-radius: 9px; flex: 0 0 auto; }
+.group-card .colour-picker-trigger.big-swatch-trigger:hover, .group-card .colour-picker-trigger.big-swatch-trigger.open { background: transparent; border-color: transparent; box-shadow: 0 0 0 2px var(--iris-300); }
 .group-card .hex { font-family: var(--mono); font-size: 14px; font-weight: 500; }
 .group-card .sub { color: var(--text-2); }
 .group-card .sub .mono { color: var(--text); }

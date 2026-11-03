@@ -13,16 +13,23 @@ export interface SpeckOptions {
   protectedLabels: Uint8Array | null;
   /** Faces already turned to `into` (an earlier dab of the same stroke): they count as it and are not taken again; marked for the faces found. */
   taken: Uint8Array | null;
-  /** A last word on a patch (its size, say): false leaves it. */
-  fits?: (faces: number[]) => boolean;
+  /**
+   * The brush's tip (its inner circle, inside `within`): only patches under it are looked at, and
+   * only their faces under it are taken — what runs on past the tip stays for the next dab.
+   * Null: every face in reach.
+   */
+  tip?: Int32Array | null;
 }
 
 /**
  * The specks in a colour: the patches of other colours that lie inside it —
- * enclosed by it along most of their border — small enough, and, within a
- * brush's reach, wholly inside that reach, so the brush never crosses the
- * colour's own outline.  A speck inside a speck is found on a later pass, once
- * the outer one is taken.  Returns the faces to recolour.
+ * enclosed by it along most of their border — and small enough.  Within a
+ * brush's reach a patch is judged inside the reach only: where it runs on
+ * past the reach it is cut, and that stretch of its border counts as open
+ * — a neck to a body of the same colour outside is a short stretch (the
+ * blotch goes), a body's own edge a long one (it stays), so the brush never
+ * crosses the colour's own outline.  A speck inside a speck is found on a
+ * later pass, once the outer one is taken.  Returns the faces to recolour.
  */
 export function specksIn(labels: Int32Array, adjacency: FaceAdjacency, options: SpeckOptions): Int32Array {
   const n = labels.length;
@@ -40,7 +47,8 @@ export function specksIn(labels: Int32Array, adjacency: FaceAdjacency, options: 
     else map!.set(f, v);
   };
   const out: number[] = [];
-  const seeds = options.within;
+  const tip = options.tip ? new Set<number>(options.tip) : null;
+  const seeds = options.tip ?? options.within;
   const seedCount = seeds ? seeds.length : n;
   for (let pass = 0; pass < 3; pass++) {
     // What was left last pass may be enclosed now that the patch around it is taken.
@@ -52,7 +60,7 @@ export function specksIn(labels: Int32Array, adjacency: FaceAdjacency, options: 
     let found = 0;
     for (let s = 0; s < seedCount; s++) {
       const seed = seeds ? seeds[s] : s;
-      if (taken[seed] || mark(seed) !== 0 || labels[seed] === into) continue;
+      if (taken[seed] || mark(seed) !== 0 || labels[seed] === into || (reach && !reach.has(seed))) continue;
       const label = labels[seed];
       if (protectedLabels?.[label]) {
         setMark(seed, 1);
@@ -65,10 +73,6 @@ export function specksIn(labels: Int32Array, adjacency: FaceAdjacency, options: 
       let good = 0;
       for (let q = 0; q < faces.length && ok; q++) {
         const a = faces[q];
-        if (reach && !reach.has(a)) {
-          ok = false;
-          break;
-        }
         if (maxFaces > 0 && faces.length > maxFaces) {
           ok = false;
           break;
@@ -81,6 +85,11 @@ export function specksIn(labels: Int32Array, adjacency: FaceAdjacency, options: 
             continue;
           }
           if (labels[g] === label) {
+            if (reach && !reach.has(g)) {
+              // The patch runs on past the reach: cut here, and this way it is open.
+              border++;
+              continue;
+            }
             const m = mark(g);
             if (m === 0) {
               setMark(g, 3);
@@ -96,13 +105,18 @@ export function specksIn(labels: Int32Array, adjacency: FaceAdjacency, options: 
           }
         }
       }
-      if (ok && border > 0 && good >= enclosed * border && (!options.fits || options.fits(faces))) {
+      if (ok && border > 0 && good >= enclosed * border) {
         for (const a of faces) {
+          if (tip && !tip.has(a)) {
+            // Past the tip: left for the next dab (the part taken counts as the colour for it).
+            setMark(a, 1);
+            continue;
+          }
           setMark(a, 2);
           taken[a] = 1;
           out.push(a);
+          found++;
         }
-        found += faces.length;
       } else {
         for (const a of faces) setMark(a, 1);
       }
