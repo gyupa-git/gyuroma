@@ -4396,11 +4396,21 @@ export default function App() {
   }, [geometryTriangles]);
   const brushSliderValue = Math.round(1000 * Math.max(0, Math.min(1, Math.log(brushRadius / brushBounds.min) / Math.log(brushBounds.max / brushBounds.min))));
   const setBrushRadiusClamped = (next: number) => setBrushRadius(Number(Math.max(brushBounds.min, Math.min(brushBounds.max, next)).toPrecision(3)));
+  const healSliderValue = Math.round(1000 * Math.max(0, Math.min(1, Math.log(healSize / brushBounds.min) / Math.log(brushBounds.max / brushBounds.min))));
+  const setHealSizeClamped = (next: number) => setHealSize(Number(Math.max(brushBounds.min, Math.min(brushBounds.max, next)).toPrecision(3)));
 
   // [ and ] shrink / grow the brush while brush mode is on.
   useEffect(() => {
     if (!brushMode) return;
     const onKey = (event: KeyboardEvent) => {
+      if (event.key === "{" || event.key === "}") {
+        if (!healOnRef.current) return;
+        const target = event.target as HTMLElement | null;
+        if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+        event.preventDefault();
+        setHealSizeClamped(healSize * (event.key === "{" ? 0.8 : 1.25));
+        return;
+      }
       if (event.key !== "[" && event.key !== "]") return;
       const target = event.target as HTMLElement | null;
       if (typingIn(target)) return;
@@ -4410,7 +4420,7 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [brushMode, brushRadius, brushBounds]);
+  }, [brushMode, brushRadius, brushBounds, healSize]);
 
   // Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y redoes the last colour change.
   useEffect(() => {
@@ -6874,7 +6884,22 @@ export default function App() {
                   onChange={(e) => setBrushRadiusClamped(brushBounds.min * Math.pow(brushBounds.max / brushBounds.min, Number(e.target.value) / 1000))}
                 />
                 <b>{brushRadius}</b>
-                <span className="muted">{t("brush.keys")}</span>
+                {healMode && (
+                  <>
+                    <span title={t("brush.healSizeHint")}>{t("brush.healSizeShort")}</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1000}
+                      step={1}
+                      value={healSliderValue}
+                      title={t("brush.healSizeHint")}
+                      onChange={(e) => setHealSizeClamped(brushBounds.min * Math.pow(brushBounds.max / brushBounds.min, Number(e.target.value) / 1000))}
+                    />
+                    <b>{healSize}</b>
+                  </>
+                )}
+                <span className="muted">{healMode ? t("brush.healKeys") : t("brush.keys")}</span>
                 <label className={`mask-toggle${brushMaskOnly && !pickedMask ? " warn" : ""}`} title={t("brush.selectFirst")}>
                   <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
                 </label>
