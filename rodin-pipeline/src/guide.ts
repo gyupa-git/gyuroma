@@ -132,8 +132,8 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 2,
         at: [".tool-dock", ".stage"],
-        ko: "얼굴의 점·얼룩은 **힐링 H**로 지워요. 색을 고르고 문지르면 그 색에 둘러싸인 다른 색만 그 색이 되고, 외곽선 밖은 안 칠해요. 바깥 원은 닿는 범위, 안쪽 원은 지울 조각의 크기. 02 '선택한 그룹'의 **얼룩 없애기**는 모델 전체를 한 번에 해 주죠.",
-        en: "Dots and blotches go with **Heal H**: pick the colour and rub — only the other colours lying in it turn into it, never past its outline. The outer circle is the reach, the inner one the biggest speck. **Remove specks** in 02's selected group does the whole model at once.",
+        ko: "얼굴의 점·얼룩은 **힐링 H**로 지워요. 색을 고르고 문지르면 그 색에 둘러싸인 다른 색만 그 색이 되고, 외곽선 밖은 안 칠해요. 바깥 원은 닿는 범위, 안쪽 원은 지울 조각의 크기. 02 '선택한 그룹'의 **얼룩 없애기**는 모델 전체를 한 번에 — 옆 숫자가 지울 조각의 최대 크기예요.",
+        en: "Dots and blotches go with **Heal H**: pick the colour and rub — only the other colours lying in it turn into it, never past its outline. The outer circle is the reach, the inner one the biggest speck. **Remove specks** in 02's selected group does the whole model at once — the number beside it is the biggest patch it takes.",
       },
       {
         step: 2,

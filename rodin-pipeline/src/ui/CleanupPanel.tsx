@@ -33,6 +33,8 @@ export function CleanupPanel({
   onMergeUp,
   onMergeSelected,
   onRemoveSpecks,
+  speckFaces,
+  onSpeckFaces,
   busy,
   advanced,
   highlight,
@@ -69,6 +71,9 @@ export function CleanupPanel({
   onMergeSelected: (targetHex: string) => void;
   /** The small patches of other colours lying in this colour turn into it. */
   onRemoveSpecks: (hex: string) => void;
+  /** The biggest patch "얼룩 없애기" takes (faces), set right beside it. */
+  speckFaces: number;
+  onSpeckFaces: (n: number) => void;
   busy: boolean;
   /** The full palette table and its settings, behind "고급". */
   advanced: ReactNode;
@@ -297,10 +302,15 @@ export function CleanupPanel({
                 <Icon name="link" />
                 <span>{t("clean.cross")}</span>
               </button>
-              <button type="button" disabled={busy} title={t("clean.specksHint", { n: mergeSettings.minBlobDefault })} onClick={() => onRemoveSpecks(focusHex)}>
+            </div>
+            <div className="specks-row" title={t("clean.specksHint", { n: speckFaces })}>
+              <button type="button" disabled={busy} onClick={() => onRemoveSpecks(focusHex)}>
                 <Icon name="heal" />
                 <span>{t("clean.specks")}</span>
               </button>
+              <span className="muted">{t("clean.specksUpTo")}</span>
+              <NumberField value={speckFaces} min={1} max={1000000} step={50} width={66} disabled={busy} onChange={onSpeckFaces} />
+              <span className="muted">{t("clean.specksFaces")}</span>
             </div>
           </>
         ) : (

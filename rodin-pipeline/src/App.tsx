@@ -650,6 +650,8 @@ export default function App() {
   const healPickRef = useRef<() => void>(() => {});
   /** The healing brush's inner circle (model units): a speck that fits in it is taken, a bigger patch stays. */
   const [healSize, setHealSize] = useState(0.5);
+  /** "얼룩 없애기": a patch of more faces than this stays (set beside the button; follows the model's size at first). */
+  const [speckFaces, setSpeckFaces] = useState(600);
   const [brushRadius, setBrushRadius] = useState(1);
   // Off by default: a brush held to a selection paints nothing until something
   // is selected, and "nothing happens" is the one failure a tool must not have.
@@ -4130,6 +4132,7 @@ export default function App() {
     brushForRadius.current = radius;
     setBrushRadius(Number((radius * 0.04).toPrecision(2)));
     setHealSize(Number((radius * 0.02).toPrecision(2)));
+    setSpeckFaces(Math.max(150, Math.round(model.triangles.length / 4000 / 50) * 50));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometryTriangles]);
 
@@ -4322,7 +4325,7 @@ export default function App() {
     const current = modelRef.current;
     const into = positionByHex.get(hex);
     if (!current || into === undefined || labels.length !== current.triangles.length) return;
-    const maxFaces = settings.merge.minBlobDefault;
+    const maxFaces = speckFaces;
     const faces = specksIn(labels, adjacencyFor(current), { into, within: null, maxFaces, enclosed: 0.8, protectedLabels: protectedPositions(), taken: null });
     if (faces.length === 0) {
       setStatus(t("status.specksNone", { hex, n: maxFaces }));
@@ -6313,6 +6316,8 @@ export default function App() {
                 onMergeUp={(family, index) => keepStripCuts(removeCut(committedCuts, family, index))}
                 onMergeSelected={mergeSelected}
                 onRemoveSpecks={removeSpecksInto}
+                speckFaces={speckFaces}
+                onSpeckFaces={(n) => setSpeckFaces(Math.max(1, Math.min(1_000_000, Math.round(n))))}
                 busy={isBusy}
                 advanced={
                   <MergeSection

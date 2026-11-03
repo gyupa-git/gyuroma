@@ -250,6 +250,9 @@ details > summary.muted:hover { color: var(--text-2); }
 .callout { position: absolute; left: 0; top: 0; width: 0; height: 0; transition: opacity 0.15s; }
 /* the brush at a label: it thins out so the paint under it shows (MeshViewer fadeCalloutsNear) */
 .callout.faded { opacity: 0.12; }
+/* 얼룩 없애기 with its size right beside it */
+.specks-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+.specks-row button { display: inline-flex; align-items: center; gap: 6px; }
 /* the dot and its leader, one shape: drawn right and up, mirrored for the other ways */
 /* every leader and dot under every label (the callouts share the layer's stacking context) */
 .callout-mark { position: absolute; left: 0; top: 0; overflow: visible; z-index: 0; }
