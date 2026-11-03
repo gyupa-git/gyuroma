@@ -40,7 +40,7 @@ export interface Rodin3mfLoadResult {
   /** Palette colours from project_settings.config (index 0 = extruder 1). */
   palette: RGB[];
   paletteHex: string[];
-  paletteSource: "project_settings" | "fallback";
+  paletteSource: "project_settings" | "full_spectrum" | "fallback";
   /** Painted extruder number per face (1-based, 0 = unpainted). */
   faceExtruder: Int32Array;
   /** Majority extruder number per vertex (1-based, 0 = no incident face). */
@@ -198,6 +198,39 @@ export function parseModelXml(xml: string): ParsedModelFile {
 
 function normalizeZipPath(path: string): string {
   return path.replace(/^\/+/, "");
+}
+
+export const PRUSA_FULL_SPECTRUM_PATH = "Metadata/Prusa_Slicer_full_spectrum.json";
+
+/**
+ * The colours of a PrusaSlicer ColorMix table: physical and virtual extruders by id
+ * (index 0 = extruder 1).  A missing id gets a placeholder; nothing usable → [].
+ */
+export function parseFullSpectrumPalette(text: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  if (!parsed || typeof parsed !== "object") return [];
+  const byId = new Map<number, string>();
+  for (const key of ["physical_extruders", "virtual_extruders"]) {
+    const list = (parsed as Record<string, unknown>)[key];
+    if (!Array.isArray(list)) continue;
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object") continue;
+      const { id, color } = entry as { id?: unknown; color?: unknown };
+      if (typeof id !== "number" || !Number.isInteger(id) || id < 1 || id > 256 || typeof color !== "string") continue;
+      const hex = parseHexColour(color);
+      if (hex) byId.set(id, rgbToHex([hex[0], hex[1], hex[2]]));
+    }
+  }
+  if (byId.size === 0) return [];
+  const max = Math.max(...byId.keys());
+  const out: string[] = [];
+  for (let id = 1; id <= max; id++) out.push(byId.get(id) ?? FALLBACK_PALETTE_HEX[(id - 1) % FALLBACK_PALETTE_HEX.length]);
+  return out;
 }
 
 /** Extract the filament_colour palette from Bambu Studio project_settings.config. */
@@ -375,6 +408,16 @@ export async function loadRodin3mf(
   const settingsText = await readZipText(zip, RODIN_PROJECT_SETTINGS_PATH);
   let paletteHex = settingsText ? parseProjectSettingsPalette(settingsText) : [];
   let paletteSource: Rodin3mfLoadResult["paletteSource"] = "project_settings";
+  if (paletteHex.length === 0) {
+    // A PrusaSlicer ColorMix file (규로마's own export among them) keeps its colours in the mix
+    // table: the real filaments and each mix's colour, by extruder number (11-04: an export opened
+    // again came in as placeholder purples and oranges).
+    const spectrum = await readZipText(zip, PRUSA_FULL_SPECTRUM_PATH);
+    if (spectrum) {
+      paletteHex = parseFullSpectrumPalette(spectrum);
+      if (paletteHex.length > 0) paletteSource = "full_spectrum";
+    }
+  }
   if (paletteHex.length === 0) {
     paletteSource = "fallback";
     warnings.push(

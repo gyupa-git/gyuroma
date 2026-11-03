@@ -15,7 +15,7 @@ export interface SourceInfo {
     paletteHex: string[];
     usedPaletteNumbers: number[];
     warnings: string[];
-    paletteSource: "project_settings" | "fallback";
+    paletteSource: "project_settings" | "full_spectrum" | "fallback";
     paletteCount: number;
     usedColourCount: number;
     unpaintedTriangleCount: number;
@@ -151,8 +151,10 @@ export function LoadSection({
                 <span>{t("load.rodinPalette")}</span>
                 <b>
                   {t("load.paletteUsed", { count: rodin.paletteCount, used: rodin.usedColourCount })}
-                  {rodin.paletteSource === "fallback" ? t("load.paletteFallback") : ""}
+                  {rodin.paletteSource === "fallback" ? t("load.paletteFallback") : rodin.paletteSource === "full_spectrum" ? t("load.paletteMixTable") : ""}
                 </b>
+                {/* A print file (an export): its colours are the filaments and mixes, not the model's own. */}
+                {rodin.paletteSource === "full_spectrum" && <span className="load-note warn">{t("load.printFileNote")}</span>}
               </>
             )}
             {rodin && rodin.unpaintedTriangleCount > 0 && (

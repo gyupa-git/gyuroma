@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   loadRodin3mf,
   parseModelXml,
+  parseFullSpectrumPalette,
   parseProjectSettingsPalette,
   RODIN_TEXTURE_MODE_MESSAGE,
 } from "../rodin3mf";
@@ -148,5 +149,25 @@ describe("Feature A: Rodin Face Color 3MF", () => {
     expect(object.mesh?.triangles[0]).toEqual([0, 1, 2]);
     expect(object.mesh?.codes[0]).toBe("1C");
     expect(parsed.buildItems[0].objectId).toBe("7");
+  });
+});
+
+describe("parseFullSpectrumPalette (a ColorMix print file opened again)", () => {
+  it("gives every extruder id its colour, physical and mixed, with placeholders for gaps", () => {
+    const text = JSON.stringify({
+      version: 1,
+      physical_extruders: [{ id: 1, color: "#FFFFFF" }, { id: 2, color: "#111111" }],
+      virtual_extruders: [{ id: 4, color: "#a1281d", components: [{ extruder: 1, ratio: 0.5 }, { extruder: 2, ratio: 0.5 }] }],
+    });
+    const palette = parseFullSpectrumPalette(text);
+    expect(palette.length).toBe(4);
+    expect(palette[0]).toBe("#FFFFFF");
+    expect(palette[1]).toBe("#111111");
+    expect(palette[3]).toBe("#A1281D");
+    expect(palette[2]).toMatch(/^#[0-9A-F]{6}$/);
+  });
+  it("is empty for anything else", () => {
+    expect(parseFullSpectrumPalette("not json")).toEqual([]);
+    expect(parseFullSpectrumPalette(JSON.stringify({ physical_extruders: "x" }))).toEqual([]);
   });
 });
