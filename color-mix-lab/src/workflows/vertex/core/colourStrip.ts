@@ -201,15 +201,57 @@ export function normaliseCuts(strip: ColourStripData, cuts: StripCuts): StripCut
  * inside a family they fall where the lightness changes most, by a weighted
  * one-dimensional partition over lightness bins.
  */
+/** A family whose colours span this much lightness (L*) keeps two groups before any family gets a third. */
+const SPLIT_SPREAD = 45;
+
+/**
+ * The lightness (L*) a family's colours span, between its area-weighted 3rd and
+ * 97th percentiles: a speck of white in a black family counts for nothing.
+ */
+function lightnessSpread(family: StripFamily): number {
+  if (family.weight <= 0 || family.colours.length < 2) return 0;
+  const edge = family.weight * 0.03;
+  let acc = 0;
+  let light = family.colours[0].lab.L;
+  for (const colour of family.colours) {
+    acc += colour.weight;
+    if (acc >= edge) {
+      light = colour.lab.L;
+      break;
+    }
+  }
+  acc = 0;
+  let dark = family.colours[family.colours.length - 1].lab.L;
+  for (let i = family.colours.length - 1; i >= 0; i--) {
+    acc += family.colours[i].weight;
+    if (acc >= edge) {
+      dark = family.colours[i].lab.L;
+      break;
+    }
+  }
+  return light - dark;
+}
+
 export function initialCuts(strip: ColourStripData, targetGroups: number): StripCuts {
   const families = strip.families;
   if (families.length === 0) return {};
   const target = Math.max(families.length, Math.min(targetGroups, families.reduce((n, f) => n + f.colours.length, 0)));
-  // Largest-remainder allocation with a floor of one per family.
+  // Largest-remainder allocation with a floor of one per family — and, before any family
+  // gets a third, a second group for each family that runs from light to dark (white and
+  // black are both "neutral": one group would paint the one as the other), biggest first.
   const alloc = families.map(() => 1);
   let remaining = target - families.length;
+  const wide = families
+    .map((_family, i) => i)
+    .filter((i) => families[i].colours.length > 1 && lightnessSpread(families[i]) >= SPLIT_SPREAD)
+    .sort((a, b) => families[b].weight - families[a].weight);
+  for (const i of wide) {
+    if (remaining <= 0) break;
+    alloc[i]++;
+    remaining--;
+  }
   const quota = families.map((family) => family.weight * remaining);
-  const base = quota.map((q, i) => Math.min(Math.floor(q), families[i].colours.length - 1));
+  const base = quota.map((q, i) => Math.min(Math.floor(q), families[i].colours.length - alloc[i]));
   for (let i = 0; i < families.length; i++) {
     alloc[i] += base[i];
     remaining -= base[i];

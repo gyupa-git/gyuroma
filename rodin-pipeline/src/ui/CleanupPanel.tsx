@@ -32,6 +32,7 @@ export function CleanupPanel({
   onSplitGroup,
   onMergeUp,
   onMergeSelected,
+  onRemoveSpecks,
   busy,
   advanced,
   highlight,
@@ -66,6 +67,8 @@ export function CleanupPanel({
   onMergeUp: (family: number, index: number) => void;
   /** Bake every selected group into `targetHex` (across families too). */
   onMergeSelected: (targetHex: string) => void;
+  /** The small patches of other colours lying in this colour turn into it. */
+  onRemoveSpecks: (hex: string) => void;
   busy: boolean;
   /** The full palette table and its settings, behind "고급". */
   advanced: ReactNode;
@@ -293,6 +296,10 @@ export function CleanupPanel({
               >
                 <Icon name="link" />
                 <span>{t("clean.cross")}</span>
+              </button>
+              <button type="button" disabled={busy} title={t("clean.specksHint", { n: mergeSettings.minBlobDefault })} onClick={() => onRemoveSpecks(focusHex)}>
+                <Icon name="gap" />
+                <span>{t("clean.specks")}</span>
               </button>
             </div>
           </>

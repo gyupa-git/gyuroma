@@ -27,7 +27,8 @@ export interface ColourMapProps {
   /** Bump to repaint every pixel. */
   coloursVersion: number;
   masks: AtlasMasks;
-  brush: { active: boolean; radiusPx: number; hex: string };
+  /** The brush circle; `innerPx` the healing brush's inner circle (the biggest speck it takes). */
+  brush: { active: boolean; radiusPx: number; hex: string; innerPx?: number };
   /** Next click samples a colour instead of picking/painting. */
   eyedropper?: boolean;
   /** Space held: a hand — the left button pans, and nothing is picked or painted. */
@@ -165,6 +166,16 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         ctx.strokeStyle = "#9aa0ff";
         ctx.stroke();
         ctx.setLineDash([]);
+        const inner = brushRef.current.innerPx;
+        if (inner && inner > 0) {
+          ctx.beginPath();
+          ctx.arc(cx, cy, Math.max(1, Math.min(inner, brushRef.current.radiusPx) * view.scale), 0, Math.PI * 2);
+          ctx.lineWidth = 1;
+          ctx.setLineDash(dashed ? [4, 3] : []);
+          ctx.strokeStyle = "rgba(154, 160, 255, 0.7)";
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
         ctx.beginPath();
         ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
         ctx.fillStyle = "#9aa0ff";

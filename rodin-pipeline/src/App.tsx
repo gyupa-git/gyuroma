@@ -96,6 +96,7 @@ import { ColourMap, type ColourMapHandle } from "./ui/ColourMap";
 import { loadStoredBackground, storeBackground, type ViewBackground } from "./ui/background";
 import { blendRecipeText } from "./engine/plan";
 import { atlasPointOnFace, buildFaceAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
+import { specksIn } from "./engine/specks";
 import { HelpTip } from "./ui/HelpTip";
 import { GyupaLoader } from "./ui/GyupaLoader";
 import { LoadSection, type SourceInfo } from "./ui/LoadSection";
@@ -641,6 +642,14 @@ export default function App() {
   const atlasRef = useRef<{ triangles: MeshModel["triangles"]; atlas: FaceAtlas } | null>(null);
   const faceGeometryRef = useRef<{ triangles: MeshModel["triangles"]; geometry: FaceGeometry } | null>(null);
   const [brushMode, setBrushMode] = useState(false);
+  /** The healing brush: the brush, but it turns only the specks of other colours lying in the brush colour, never past its outline. */
+  const [healMode, setHealMode] = useState(false);
+  const healOnRef = useRef(false);
+  healOnRef.current = brushMode && healMode;
+  /** Turning the healing brush on with a colour off the palette: the first palette colour is taken (it paints palette colours only). */
+  const healPickRef = useRef<() => void>(() => {});
+  /** The healing brush's inner circle (model units): a speck that fits in it is taken, a bigger patch stays. */
+  const [healSize, setHealSize] = useState(0.5);
   const [brushRadius, setBrushRadius] = useState(1);
   // Off by default: a brush held to a selection paints nothing until something
   // is selected, and "nothing happens" is the one failure a tool must not have.
@@ -679,7 +688,7 @@ export default function App() {
   /** A picked place at least this wide on the print (mm) is asked about first. */
   const [gapBigMm, setGapBigMm] = useState(GAP_BIG_DIAMETER_MM);
   const [coloursVersion, setColoursVersion] = useState(0);
-  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[] } | null>(null);
+  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[]; healed: Uint8Array | null } | null>(null);
   /**
    * A brush stroke just committed: which faces it painted, from which colours to
    * which.  A stroke changes only those faces, so the colour buffers, the labels and
@@ -1762,6 +1771,10 @@ export default function App() {
     if (/^#[0-9A-F]{6}$/.test(candidate)) return candidate;
     return hexByPosition[0] ?? "#FF0000";
   }, [pickTarget, pickCustom, hexByPosition]);
+
+  healPickRef.current = () => {
+    if (positionByHex.get(brushHex) === undefined && hexByPosition[0]) setPickTarget(hexByPosition[0]);
+  };
 
   /** Where a palette colour prints, for the spectrum and the group panel. */
   const stripOutputOf = useCallback(
@@ -4116,6 +4129,7 @@ export default function App() {
     if (brushForRadius.current !== null && Math.abs(brushForRadius.current - radius) <= 1e-6 * radius) return;
     brushForRadius.current = radius;
     setBrushRadius(Number((radius * 0.04).toPrecision(2)));
+    setHealSize(Number((radius * 0.02).toPrecision(2)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometryTriangles]);
 
@@ -4187,7 +4201,11 @@ export default function App() {
       setStatus(t("status.brushNeedsSelection"));
       return false;
     }
-    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex, changed: [] };
+    if (healMode && positionByHex.get(brushHex) === undefined) {
+      setStatus(t("status.healPalette"));
+      return false;
+    }
+    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex, changed: [], healed: healMode ? new Uint8Array(current.triangleColors.length) : null };
     return true;
   }
 
@@ -4231,7 +4249,7 @@ export default function App() {
   function showBrushCursorAt(hit: ViewerHit | null): void {
     const blocked = brushMaskOnly && (!pickedMask || hit === null || !pickedMask[hit.faceIndex]);
     for (const handle of viewerHandles())
-      handle.setBrushCursor(hit ? { point: hit.point, normal: hit.normal, radius: brushRadius, blocked } : null);
+      handle.setBrushCursor(hit ? { point: hit.point, normal: hit.normal, radius: brushRadius, blocked, inner: healMode ? healSize : undefined } : null);
   }
 
   function brushHover3D(hit: ViewerHit | null): void {
@@ -4259,16 +4277,74 @@ export default function App() {
     const current = modelRef.current;
     const built = atlasRef.current?.atlas ?? null;
     if (!current || !built || !strokeRef.current) return;
-    paintFaces(facesUnderMapBrush(built, current, faceGeometryFor(current), x, y, brushRadius));
+    const reach = facesUnderMapBrush(built, current, faceGeometryFor(current), x, y, brushRadius);
+    paintFaces(healMode ? healFaces(current, reach) : reach);
+  }
+
+  /**
+   * The healing brush's dab: of the faces in reach (the outer circle), those in specks of
+   * other colours lying in the brush colour — patches enclosed by it, wholly inside the
+   * reach, and small enough to fit the inner circle — so the brush never crosses the
+   * colour's own outline and never takes a big patch.  What earlier dabs took counts as
+   * the colour already.
+   */
+  function healFaces(current: MeshModel, reach: Int32Array): Int32Array {
+    const stroke = strokeRef.current;
+    const into = positionByHex.get(brushHex);
+    if (!stroke || into === undefined || labels.length !== current.triangles.length) return new Int32Array(0);
+    const c = faceGeometryFor(current).centroids;
+    const limit = healSize * healSize;
+    const fits = (faces: number[]): boolean => {
+      let mx = 0, my = 0, mz = 0;
+      for (const f of faces) {
+        mx += c[f * 3];
+        my += c[f * 3 + 1];
+        mz += c[f * 3 + 2];
+      }
+      mx /= faces.length;
+      my /= faces.length;
+      mz /= faces.length;
+      for (const f of faces) {
+        const dx = c[f * 3] - mx, dy = c[f * 3 + 1] - my, dz = c[f * 3 + 2] - mz;
+        if (dx * dx + dy * dy + dz * dz > limit) return false;
+      }
+      return true;
+    };
+    return specksIn(labels, adjacencyFor(current), { into, within: reach, maxFaces: 0, enclosed: 0.8, protectedLabels: protectedPositions(), taken: stroke.healed, fits });
+  }
+
+  /**
+   * The specks in a colour, all at once (02's "얼룩 없애기"): the small patches of other colours
+   * lying in it — enclosed by it, up to the small-island size — turn into it.  Shown at once,
+   * as a stroke is, and committed by the stroke's quick path: only those faces changed.
+   */
+  function removeSpecksInto(hex: string): void {
+    const current = modelRef.current;
+    const into = positionByHex.get(hex);
+    if (!current || into === undefined || labels.length !== current.triangles.length) return;
+    const maxFaces = settings.merge.minBlobDefault;
+    const faces = specksIn(labels, adjacencyFor(current), { into, within: null, maxFaces, enclosed: 0.8, protectedLabels: protectedPositions(), taken: null });
+    if (faces.length === 0) {
+      setStatus(t("status.specksNone", { hex, n: maxFaces }));
+      return;
+    }
+    const rgb = hexToRgb(hex);
+    const next = current.triangleColors.slice();
+    for (let i = 0; i < faces.length; i++) next[faces[i]] = rgb;
+    for (const handle of viewerHandles()) handle.setFaceColours(faces, rgb);
+    mapRef.current?.repaintFaces(faces);
+    keepGroupsFor(current.triangleColors, next);
+    strokePatchRef.current = { from: current.triangleColors, to: next, faces, rgb, exact: false };
+    applyColours(current, next, { keepSelection: true, uniqueFaceColors: stripFor(next).colourCount });
+    setStatus(t("status.specksDone", { n: faces.length.toLocaleString(), hex }));
   }
 
   function paintAtHit(hit: ViewerHit | null, slot: number): void {
     const current = modelRef.current;
     if (!hit || !current || !strokeRef.current) return;
     const viewDir = viewerRefs[slot]?.current?.viewDirection() ?? null;
-    paintFaces(
-      facesInSphere(faceGeometryFor(current), pointToModel(hit.point), brushRadius, viewDir ? pointToModel(viewDir) : null),
-    );
+    const reach = facesInSphere(faceGeometryFor(current), pointToModel(hit.point), brushRadius, viewDir ? pointToModel(viewDir) : null);
+    paintFaces(healMode ? healFaces(current, reach) : reach);
   }
 
   function brushStart3D(hit: ViewerHit | null, slot: number): void {
@@ -4532,8 +4608,15 @@ export default function App() {
         setFillMode(false);
         setEyedropper(false);
         setGapMode(false);
-      } else if (event.code === "KeyB") setBrushMode((v) => !v);
-      else if (event.code === "KeyG") setFillMode((v) => !v);
+      } else if (event.code === "KeyB") {
+        setBrushMode((v) => !v || healOnRef.current);
+        setHealMode(false);
+      } else if (event.code === "KeyH") {
+        const on = !healOnRef.current;
+        setBrushMode(on);
+        setHealMode(on);
+        if (on) healPickRef.current();
+      } else if (event.code === "KeyG") setFillMode((v) => !v);
       else if (event.code === "KeyI") setEyedropper((v) => !v);
       else if (event.code === "KeyC") setGapMode((v) => !v);
       else return;
@@ -6212,6 +6295,7 @@ export default function App() {
                 onSplitGroup={(family, fraction) => keepStripCuts(addCut(committedCuts, family, fraction))}
                 onMergeUp={(family, index) => keepStripCuts(removeCut(committedCuts, family, index))}
                 onMergeSelected={mergeSelected}
+                onRemoveSpecks={removeSpecksInto}
                 busy={isBusy}
                 advanced={
                   <MergeSection
@@ -6541,7 +6625,8 @@ export default function App() {
             <div className="stage-bars">
               {model && (brushMode || fillMode) && (
                 <div className="stage-bar brush-bar">
-                  <b>{fillMode ? t("fill.title") : t("brush.title")}</b>
+                  <b>{fillMode ? t("fill.title") : healMode ? t("brush.healTitle") : t("brush.title")}</b>
+                  {healMode && !fillMode && <span className="muted">{t("brush.healNote")}</span>}
                   <span>{t("brush.colour")}</span>
                   <ColourSelect
                     value={pickTarget || "__new__"}
@@ -6555,7 +6640,7 @@ export default function App() {
                       { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
                     ]}
                   />
-                  {(pickTarget === "__new__" || !pickTarget) && <ColourPicker value={pickCustom} onChange={(hex) => setPickCustom(hex.toUpperCase())} />}
+                  <ColourPicker value={brushHex} title={t("brush.pickHint")} onChange={(hex) => { setPickCustom(hex.toUpperCase()); setPickTarget("__new__"); }} />
                   <button
                     type="button"
                     className={`btn small eyedropper-toggle${eyedropper ? " active" : ""}`}
@@ -6571,6 +6656,12 @@ export default function App() {
                     <>
                       <span>{t("brush.size")}</span>
                       <NumberField value={brushRadius} min={0.001} max={10000} step={Math.max(0.001, Number((brushRadius / 5).toPrecision(1)))} onChange={(v) => setBrushRadiusClamped(v)} />
+                      {healMode && (
+                        <>
+                          <span title={t("brush.healSizeHint")}>{t("brush.healSize")}</span>
+                          <NumberField value={healSize} min={0.001} max={10000} step={Math.max(0.001, Number((healSize / 5).toPrecision(1)))} onChange={(v) => setHealSize(Math.max(0.001, v))} />
+                        </>
+                      )}
                       <span className="muted">{t("brush.keys")}</span>
                       <label className="inline" style={{ gap: 6 }}>
                         <input type="checkbox" checked={brushMaskOnly} onChange={(e) => setBrushMaskOnly(e.target.checked)} /> {t("brush.maskOnly")}
@@ -6741,7 +6832,7 @@ export default function App() {
                           { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
                         ]}
                       />
-                      {pickTarget === "__new__" && <ColourPicker value={pickCustom} onChange={(hex) => setPickCustom(hex.toUpperCase())} />}
+                      <ColourPicker value={brushHex} title={t("brush.pickHint")} onChange={(hex) => { setPickCustom(hex.toUpperCase()); setPickTarget("__new__"); }} />
                       {!brushMode && (
                         <button
                           type="button"
@@ -6817,7 +6908,7 @@ export default function App() {
                 colourOf={colourOfFace}
                 coloursVersion={coloursVersion}
                 masks={atlasMasks}
-                brush={{ active: brushMode, radiusPx: atlas ? brushRadius * atlas.scale : 4, hex: brushHex }}
+                brush={{ active: brushMode, radiusPx: atlas ? brushRadius * atlas.scale : 4, hex: brushHex, innerPx: healMode && atlas ? healSize * atlas.scale : undefined }}
                 eyedropper={eyedropper}
                 hand={hand}
                 background={background}
@@ -6966,16 +7057,22 @@ export default function App() {
           )}
           {showDock && (
             <div className="tool-dock" role="toolbar" aria-label={t("tool.aria")}>
-              <button type="button" aria-pressed={!brushMode && !fillMode && !eyedropper && !gapMode} title={t("pick.hint")} onClick={() => { setBrushMode(false); setFillMode(false); setEyedropper(false); setGapMode(false); }}>
+              <button type="button" aria-pressed={!brushMode && !fillMode && !eyedropper && !gapMode} title={t("pick.hint")} onClick={() => { setBrushMode(false); setHealMode(false); setFillMode(false); setEyedropper(false); setGapMode(false); }}>
                 <Icon name="select" size={17} stroke={1.4} />
                 <span>
                   {t("tool.select")} <span className="key">V</span>
                 </span>
               </button>
-              <button type="button" aria-pressed={brushMode} title={t("brush.hint")} onClick={() => setBrushMode((v) => !v)}>
+              <button type="button" aria-pressed={brushMode && !healMode} title={t("brush.hint")} onClick={() => { setBrushMode((v) => !v || healMode); setHealMode(false); }}>
                 <Icon name="brush" size={17} stroke={1.4} />
                 <span>
                   {t("tool.brush")} <span className="key">B</span>
+                </span>
+              </button>
+              <button type="button" aria-pressed={brushMode && healMode} title={t("heal.hint")} onClick={() => { const on = !(brushMode && healMode); setBrushMode(on); setHealMode(on); if (on) healPickRef.current(); }}>
+                <Icon name="gap" size={17} stroke={1.4} />
+                <span>
+                  {t("tool.heal")} <span className="key">H</span>
                 </span>
               </button>
               <button type="button" aria-pressed={fillMode} title={t("fill.hint")} onClick={() => setFillMode((v) => !v)}>

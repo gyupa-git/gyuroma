@@ -79,6 +79,8 @@ export interface BrushCursor {
   radius: number;
   /** Nothing would be painted here (outside the selection the brush is held to). */
   blocked?: boolean;
+  /** The healing brush's inner circle: the biggest speck it takes (model units); none for the plain brush. */
+  inner?: number;
 }
 
 /** The spot under the colour map's pointer, to mark on the surface. */
@@ -919,6 +921,8 @@ interface ViewerState {
   callouts: PlacedCallout[];
   cursorGroup: THREE.Group;
   cursorLine: THREE.LineLoop;
+  /** The healing brush's inner circle. */
+  cursorInner: THREE.LineLoop;
   /** The spot under the colour map's pointer, marked on the surface (see setPointerMark). */
   pointerMark: THREE.Group;
   pickMaterial: THREE.ShaderMaterial;
@@ -1716,9 +1720,11 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         const state = stateRef.current;
         if (!state) return;
         const line = state.cursorLine;
+        const inner = state.cursorInner;
         if (!cursor) {
           if (line.visible) {
             line.visible = false;
+            inner.visible = false;
             requestRender(state);
           }
           return;
@@ -1733,6 +1739,15 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         line.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal);
         line.scale.setScalar(Math.max(1e-6, cursor.radius));
         line.visible = true;
+        if (cursor.inner && cursor.inner > 0) {
+          (inner.material as THREE.LineBasicMaterial).color.set(cursor.blocked ? 0xef6f6f : 0x9aa0ff);
+          inner.position.copy(line.position);
+          inner.quaternion.copy(line.quaternion);
+          inner.scale.setScalar(Math.max(1e-6, Math.min(cursor.inner, cursor.radius)));
+          inner.visible = true;
+        } else {
+          inner.visible = false;
+        }
         requestRender(state);
       },
       setPointerMark(mark) {
@@ -1817,6 +1832,9 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const cursorGroup = new THREE.Group();
     const cursorLine = makeCursorLine();
     cursorGroup.add(cursorLine);
+    const cursorInner = makeCursorLine();
+    (cursorInner.material as THREE.LineBasicMaterial).opacity = 0.6;
+    cursorGroup.add(cursorInner);
     const pointerMark = makePointerMark();
     cursorGroup.add(pointerMark);
     scene.add(cursorGroup);
@@ -1846,6 +1864,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       callouts: [],
       cursorGroup,
       cursorLine,
+      cursorInner,
       pointerMark,
       pickMaterial: makePickMaterial(),
       pickTarget: null,
@@ -2015,6 +2034,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       state.pickTarget?.dispose();
       cursorLine.geometry.dispose();
       (cursorLine.material as THREE.Material).dispose();
+      cursorInner.geometry.dispose();
+      (cursorInner.material as THREE.Material).dispose();
       for (const piece of pointerMark.children as THREE.Mesh[]) {
         piece.geometry.dispose();
         (piece.material as THREE.Material).dispose();
