@@ -552,7 +552,10 @@ export default function App() {
       return "model";
     }
   });
+  /** The area went to "picked" by itself, on picking: it goes back to the whole model when the pick goes. */
+  const tidyAreaAutoRef = useRef(false);
   const setTidyArea = (next: TidyArea) => {
+    tidyAreaAutoRef.current = false;
     setTidyAreaState(next);
     try {
       window.localStorage.setItem("rodin-pipeline-tidy-area", next);
@@ -2307,6 +2310,21 @@ export default function App() {
     return overlayFor("pickPreview", pickedMask, look);
   }, [pickPreviewHex, pickedMask, pickedOverlay, overlayFor]);
 
+  // Patches picked: a preset goes on them (11-04: white clothes picked, "smooth borders" ran on the whole
+  // model and the face went orange).  Picking switches the area once; a choice made by hand stays.
+  const hadPickRef = useRef(false);
+  useEffect(() => {
+    const has = pickedPatches.length > 0;
+    if (has === hadPickRef.current) return;
+    hadPickRef.current = has;
+    if (has && tidyArea === "model") {
+      tidyAreaAutoRef.current = true;
+      setTidyAreaState("picked");
+    } else if (!has && tidyAreaAutoRef.current) {
+      tidyAreaAutoRef.current = false;
+      setTidyAreaState("model");
+    }
+  }, [pickedPatches.length, tidyArea]);
   const pickedFaceCount = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.faces.length, 0), [pickedPatches]);
   const pickedFraction = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.fraction, 0), [pickedPatches]);
   const pickedHexes = useMemo(() => [...new Set(pickedPatches.map((patch) => patch.hex))], [pickedPatches]);
@@ -5003,6 +5021,10 @@ export default function App() {
         }))
         .sort((a, b) => Number(b.merged) - Number(a.merged) || b.after - a.after);
       setMergeReport({ rows, stats: result.stats, coloursBefore: countUniqueColours(model.triangleColors), coloursAfter: countUniqueColours(next) });
+      // Every group keeps its band under its one colour: left as they were, the spectrum's cuts (shares of each
+      // family's area) fall elsewhere on the few colours left, and a group lands in its neighbour's band
+      // (11-04: the face's tan in the protected orange's — the face turned orange).
+      keepGroupsFor(model.triangleColors, next);
       applyColours(model, next);
       setStatus(
         t("status.mergeDone", {
