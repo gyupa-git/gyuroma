@@ -100,6 +100,46 @@ describe("specksIn", () => {
     expect(specksIn(g.labels, g.adjacency, { ...rules, within: edge, tip: edge }).length).toBe(0);
   });
 
+  it("auto (into = -1): each speck takes the colour around it, with no colour chosen", () => {
+    // Left half pink, right half gold; a black dot in each half, and a black blotch on the line between them.
+    const two = (x: number, y: number): number => {
+      if (x === 4 && y === 5) return BLACK;
+      if (x === 15 && y === 5) return BLACK;
+      if (x >= 9 && x <= 10 && y >= 12 && y <= 13) return BLACK; // half in pink, half in gold: enclosed by neither
+      return x < 10 ? PINK : GOLD;
+    };
+    const g = grid(20, two);
+    const targets: number[] = [];
+    const relabel = new Map<number, number>();
+    const got = specksIn(g.labels, g.adjacency, { into: -1, within: null, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken: null, relabel, targets });
+    const to = new Map<number, number>();
+    got.forEach((face, i) => to.set(face, targets[i]));
+    for (const face of g.cellFaces.get("4,5") as number[]) expect(to.get(face)).toBe(PINK);
+    for (const face of g.cellFaces.get("15,5") as number[]) expect(to.get(face)).toBe(GOLD);
+    for (const face of g.cellFaces.get("9,12") as number[]) expect(to.has(face)).toBe(false);
+    expect(got.length).toBe(4);
+    expect(relabel.size).toBe(4);
+    // The big halves are never a speck of each other.
+    for (const face of g.cellFaces.get("0,0") as number[]) expect(to.has(face)).toBe(false);
+  });
+
+  it("within a reach, a speck with a soft edge (a core and a ring of another shade) goes whole", () => {
+    // Pink ground; a gold 2×2 core (x 6–7, y 6–7) in a one-cell black ring (x 5–8, y 5–8).
+    const soft = (x: number, y: number): number => (x >= 6 && x <= 7 && y >= 6 && y <= 7 ? GOLD : x >= 5 && x <= 8 && y >= 5 && y <= 8 ? BLACK : PINK);
+    const g = grid(14, soft);
+    const cells: string[] = [];
+    for (let y = 2; y <= 11; y++) for (let x = 2; x <= 11; x++) cells.push(`${x},${y}`);
+    const within = Int32Array.from(cells.flatMap((c) => g.cellFaces.get(c) as number[]));
+    for (const into of [-1, PINK]) {
+      const targets: number[] = [];
+      const got = specksIn(g.labels, g.adjacency, { into, within, tip: within, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken: null, relabel: new Map(), targets });
+      expect(got.length).toBe(16 * 2);
+      expect(new Set(targets)).toEqual(new Set([PINK]));
+    }
+    // The whole-model pass keeps the old rule: the core is enclosed by the ring, not by pink, and the ring by both.
+    expect(specksIn(g.labels, g.adjacency, { into: PINK, within: null, maxFaces: 0, enclosed: 0.8, protectedLabels: null, taken: null }).length).toBe(0);
+  });
+
   it("never takes a protected colour", () => {
     const protectedLabels = new Uint8Array(3);
     protectedLabels[BLACK] = 1;

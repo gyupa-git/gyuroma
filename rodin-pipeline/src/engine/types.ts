@@ -86,9 +86,11 @@ export interface ExportSettings {
   /**
    * Faces along the colour borders cut along a smooth line through the border
    * (@core/borderCut), shown so while working and written so: the window of
-   * that line in border edges; 0 = off (the faces as they are).
+   * that line in border edges; 0 = off (the faces as they are).  Off until turned on.
    */
   cutSpan: number;
+  /** The cut was turned on or off by hand (11-03: on by default, it kept asking to be confirmed for a cut nobody made). */
+  cutChosen?: boolean;
 }
 
 /** Per palette colour (keyed by hex) merge decisions. */
@@ -223,7 +225,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     defaultExtruder: 1,
     includePrinterConfig: false,
     printPreset: null,
-    cutSpan: CUT_SPAN,
+    cutSpan: 0,
   },
   mergeFlags: {},
   manualPhysical: {},

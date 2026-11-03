@@ -692,7 +692,7 @@ export default function App() {
   /** A picked place at least this wide on the print (mm) is asked about first. */
   const [gapBigMm, setGapBigMm] = useState(GAP_BIG_DIAMETER_MM);
   const [coloursVersion, setColoursVersion] = useState(0);
-  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[]; healed: Uint8Array | null } | null>(null);
+  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[]; healed: Uint8Array | null; relabel: Map<number, number> | null; healColours: Set<number> | null } | null>(null);
   /**
    * A brush stroke just committed: which faces it painted, from which colours to
    * which.  A stroke changes only those faces, so the colour buffers, the labels and
@@ -1788,9 +1788,8 @@ export default function App() {
     return hexByPosition[0] ?? "#FF0000";
   }, [pickTarget, pickCustom, hexByPosition]);
 
-  healPickRef.current = () => {
-    if (positionByHex.get(brushHex) === undefined && hexByPosition[0]) setPickTarget(hexByPosition[0]);
-  };
+  // The healing brush needs no colour of its own any more (it takes the colour around each speck).
+  healPickRef.current = () => {};
 
   /** Where a palette colour prints, for the spectrum and the group panel. */
   const stripOutputOf = useCallback(
@@ -4375,11 +4374,17 @@ export default function App() {
       setStatus(t("status.brushNeedsSelection"));
       return false;
     }
-    if (healMode && positionByHex.get(brushHex) === undefined) {
-      setStatus(t("status.healPalette"));
-      return false;
-    }
-    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly && !healMode ? pickedMask : null, count: 0, rgb: fillRgb(current, brushHex), hex: brushHex, changed: [], healed: healMode ? new Uint8Array(current.triangleColors.length) : null };
+    strokeRef.current = {
+      working: current.triangleColors.slice(),
+      mask: brushMaskOnly && !healMode ? pickedMask : null,
+      count: 0,
+      rgb: fillRgb(current, brushHex),
+      hex: brushHex,
+      changed: [],
+      healed: healMode ? new Uint8Array(current.triangleColors.length) : null,
+      relabel: healMode ? new Map() : null,
+      healColours: healMode ? new Set() : null,
+    };
     return true;
   }
 
@@ -4413,12 +4418,17 @@ export default function App() {
       setStatus(t("status.brushNothing"));
       return;
     }
-    const grouping = groupingForNew(stroke.rgb);
+    // The healing brush puts palette colours only: no new group.
+    const grouping = stroke.healColours ? undefined : groupingForNew(stroke.rgb);
     keepGroupsFor(current.triangleColors, stroke.working, grouping?.also, grouping?.pinned);
-    // Only the painted faces changed: buffers, labels and map are patched for them (strokePatchRef).
-    strokePatchRef.current = { from: current.triangleColors, to: stroke.working, faces: Int32Array.from(stroke.changed), rgb: stroke.rgb, exact: false };
+    // Only the painted faces changed: buffers, labels and map are patched for them (strokePatchRef) —
+    // one colour only; a healing stroke that put several is worked out whole.
+    strokePatchRef.current =
+      !stroke.healColours || stroke.healColours.size === 1
+        ? { from: current.triangleColors, to: stroke.working, faces: Int32Array.from(stroke.changed), rgb: stroke.rgb, exact: false }
+        : null;
     applyColours(current, stroke.working, { keepSelection: true, uniqueFaceColors: stripFor(stroke.working).colourCount });
-    setStatus(t("status.brushed", { n: stroke.count.toLocaleString(), hex: stroke.hex }));
+    setStatus(stroke.healColours ? t("status.healed", { n: stroke.count.toLocaleString() }) : t("status.brushed", { n: stroke.count.toLocaleString(), hex: stroke.hex }));
   }
 
   function showBrushCursorAt(hit: ViewerHit | null): void {
@@ -4455,7 +4465,8 @@ export default function App() {
     if (!current || !built || !strokeRef.current) return;
     const geometry = faceGeometryFor(current);
     const reach = facesUnderMapBrush(built, current, geometry, x, y, brushRadius);
-    paintFaces(healMode ? healFaces(current, reach, facesUnderMapBrush(built, current, geometry, x, y, Math.min(healSize, brushRadius))) : reach);
+    if (healMode) paintHealed(healFaces(current, reach, facesUnderMapBrush(built, current, geometry, x, y, Math.min(healSize, brushRadius))));
+    else paintFaces(reach);
   }
 
   /**
@@ -4468,11 +4479,40 @@ export default function App() {
    * joined to something is a blotch all the same.  What earlier dabs took counts
    * as the colour already.
    */
-  function healFaces(current: MeshModel, reach: Int32Array, tip: Int32Array): Int32Array {
+  function healFaces(current: MeshModel, reach: Int32Array, tip: Int32Array): { faces: Int32Array; targets: number[] } {
     const stroke = strokeRef.current;
-    const into = positionByHex.get(brushHex);
-    if (!stroke || into === undefined || labels.length !== current.triangles.length) return new Int32Array(0);
-    return specksIn(labels, adjacencyFor(current), { into, within: reach, tip, maxFaces: 0, enclosed: 0.8, protectedLabels: protectedPositions(), taken: stroke.healed });
+    const targets: number[] = [];
+    if (!stroke || labels.length !== current.triangles.length) return { faces: new Int32Array(0), targets };
+    // No colour to choose (11-03: the "change to" colour was orange, the specks lay in yellow, and nothing went):
+    // each speck takes the colour around it.
+    const faces = specksIn(labels, adjacencyFor(current), { into: -1, within: reach, tip, maxFaces: 0, enclosed: 0.8, protectedLabels: protectedPositions(), taken: stroke.healed, relabel: stroke.relabel, targets });
+    return { faces, targets };
+  }
+
+  /** The healing brush's dab painted: each face in the palette colour around its speck. */
+  function paintHealed({ faces, targets }: { faces: Int32Array; targets: number[] }): void {
+    const stroke = strokeRef.current;
+    if (!stroke || faces.length === 0) return;
+    const changed: number[] = [];
+    const each: number[] = [];
+    for (let i = 0; i < faces.length; i++) {
+      const rgb = palette[targets[i]]?.rgb;
+      if (!rgb) continue;
+      const f = faces[i];
+      const c = stroke.working[f];
+      if (c[0] === rgb[0] && c[1] === rgb[1] && c[2] === rgb[2]) continue;
+      stroke.working[f] = rgb;
+      changed.push(f);
+      each.push(rgb[0], rgb[1], rgb[2]);
+      stroke.healColours?.add(targets[i]);
+      stroke.rgb = rgb;
+    }
+    if (changed.length === 0) return;
+    stroke.count += changed.length;
+    for (let i = 0; i < changed.length; i++) stroke.changed.push(changed[i]);
+    const list = Uint8Array.from(each);
+    for (const handle of viewerHandles()) handle.setFaceColourList(changed, list);
+    mapRef.current?.repaintFaces(changed);
   }
 
   /**
@@ -4509,7 +4549,8 @@ export default function App() {
     const centre = pointToModel(hit.point);
     const along = viewDir ? pointToModel(viewDir) : null;
     const reach = facesInSphere(geometry, centre, brushRadius, along);
-    paintFaces(healMode ? healFaces(current, reach, facesInSphere(geometry, centre, Math.min(healSize, brushRadius), along)) : reach);
+    if (healMode) paintHealed(healFaces(current, reach, facesInSphere(geometry, centre, Math.min(healSize, brushRadius), along)));
+    else paintFaces(reach);
   }
 
   function brushStart3D(hit: ViewerHit | null, slot: number): void {
@@ -5562,7 +5603,7 @@ export default function App() {
   }, [cutNotice, cutReady]);
 
   function toggleCut(on: boolean): void {
-    patchSettings("export", { ...settings.export, cutSpan: on ? CUT_SPAN : 0 });
+    patchSettings("export", { ...settings.export, cutSpan: on ? CUT_SPAN : 0, cutChosen: true });
     setCutNotice(on ? "on" : null);
   }
 
@@ -6832,6 +6873,9 @@ export default function App() {
                 <div className="stage-bar brush-bar">
                   <b>{fillMode ? t("fill.title") : healMode ? t("brush.healTitle") : t("brush.title")}</b>
                   {healMode && !fillMode && <span className="muted">{t("brush.healNote")}</span>}
+                  {/* The healing brush takes the colour around each speck: no colour controls for it. */}
+                  {!(healMode && !fillMode) && (
+                  <>
                   <span>{t("brush.colour")}</span>
                   <ColourSelect
                     value={pickTarget || "__new__"}
@@ -6857,6 +6901,8 @@ export default function App() {
                   >
                     {t("brush.eyedropper")}
                   </button>
+                  </>
+                  )}
                   {brushMode ? (
                     <>
                       <span>{t("brush.size")}</span>

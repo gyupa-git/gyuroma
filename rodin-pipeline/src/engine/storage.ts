@@ -19,6 +19,8 @@ export function mergeSettings(stored: unknown): PipelineSettings {
   // otherwise keep exporting unit-scale models as 2 mm objects.
   if (!(typeof out.export.targetHeight === "number" && out.export.targetHeight > 0))
     out.export.targetHeight = DEFAULT_TARGET_HEIGHT;
+  // The cut along the borders was on by default: a setting nobody chose goes back to off.
+  if (!out.export.cutChosen) out.export.cutSpan = 0;
   if (isRecord(stored.mergeFlags)) out.mergeFlags = stored.mergeFlags as PipelineSettings["mergeFlags"];
   if (Array.isArray(stored.filamentList))
     out.filamentList = stored.filamentList.filter(
