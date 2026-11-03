@@ -2129,7 +2129,8 @@ export default function App() {
           title: hex,
           value: pct(share),
           extra: count > 1 ? t("callout.pieces", { n: count.toLocaleString() }) : undefined,
-          detail: info ? `→ ${info.label}${info.recipe ? ` · ${info.recipe}` : ""}` : undefined,
+          // Where it prints (and the mix) from 03 on: 02 is about colours, not filaments.
+          detail: step >= 3 && info ? `→ ${info.label}${info.recipe ? ` · ${info.recipe}` : ""}` : undefined,
         });
         if (showRings) for (const face of anchors) rings.push({ kind: "ring", point: at(face), hex, title: "", value: "" });
       }
@@ -2147,11 +2148,11 @@ export default function App() {
         value: pct(patch.fraction),
         // The colour's own share when this patch is only part of it (the chip over the view shows that one).
         extra: whole !== undefined && whole - patch.fraction > 0.0005 ? t("callout.total", { pct: pct(whole) }) : undefined,
-        detail: info ? `→ ${info.label}${info.recipe ? ` · ${info.recipe}` : ""}` : undefined,
+        detail: step >= 3 && info ? `→ ${info.label}${info.recipe ? ` · ${info.recipe}` : ""}` : undefined,
       };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model, pickedPatches, selectedHexes, palette, piecesCache, showRings, pointToView, extruderInfoByIndex, positionByHex, areaByPosition, t]);
+  }, [model, pickedPatches, selectedHexes, palette, piecesCache, showRings, pointToView, extruderInfoByIndex, positionByHex, areaByPosition, t, step]);
 
   // What solo / x-ray single out: picked patches and selected colours together.
   const focusMask = useMemo<Uint8Array | null>(() => {
@@ -2307,18 +2308,6 @@ export default function App() {
   const pickedFaceCount = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.faces.length, 0), [pickedPatches]);
   const pickedFraction = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.fraction, 0), [pickedPatches]);
   const pickedHexes = useMemo(() => [...new Set(pickedPatches.map((patch) => patch.hex))], [pickedPatches]);
-  const pickedExtruders = useMemo(() => {
-    const seen = new Set<string>();
-    const out: Array<{ label: string; rgb: RGB; recipe: string; hex: string }> = [];
-    for (const patch of pickedPatches) {
-      const info = extruderInfoByIndex.get(patch.index);
-      if (!info || seen.has(info.label)) continue;
-      seen.add(info.label);
-      out.push({ ...info, hex: patch.hex });
-    }
-    return out;
-  }, [pickedPatches, extruderInfoByIndex]);
-
   const overlays = useMemo(
     () => [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay].filter((o): o is HighlightOverlay => o !== null),
     [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay],
@@ -2658,21 +2647,22 @@ export default function App() {
     }
     const { faces, whole } = got;
     const rgb = fillRgb(model, chosen);
+    const shown = rgbToHex(rgb);
     const next = model.triangleColors.slice();
     for (let i = 0; i < faces.length; i++) next[faces[i]] = rgb;
-    const grouping = groupingForNew(chosen);
+    const grouping = groupingForNew(rgb);
     keepGroupsFor(model.triangleColors, next, grouping?.also, grouping?.pinned);
     const was = cardHex;
     if (whole) {
-      if (grouping) setSettings((prev) => ({ ...prev, mergeFlags: carryFlags(prev.mergeFlags, was, chosen) }));
-      twinHexes(was, chosen);
-      setSelectedHexes((prev) => prev.map((h) => (h === was ? chosen : h)));
+      if (grouping) setSettings((prev) => ({ ...prev, mergeFlags: carryFlags(prev.mergeFlags, was, shown) }));
+      twinHexes(was, shown);
+      setSelectedHexes((prev) => prev.map((h) => (h === was ? shown : h)));
     }
     endToneSession();
     // The picked pieces keep their faces, now in the new colour: the card follows them there.
     const painted = new Uint8Array(model.triangles.length);
     for (let i = 0; i < faces.length; i++) painted[faces[i]] = 1;
-    setPickedPatches((prev) => prev.map((patch) => (painted[patch.anchor] ? { ...patch, hex: chosen } : patch)));
+    setPickedPatches((prev) => prev.map((patch) => (painted[patch.anchor] ? { ...patch, hex: shown } : patch)));
     applyColours(model, next, { keepSelection: true });
     const n = faces.length.toLocaleString();
     setStatus(whole ? t("status.groupRecoloured", { from: was, to: chosen, n }) : t("status.recoloured", { n, hex: chosen, patches: cardPieces.length }));
@@ -3226,7 +3216,7 @@ export default function App() {
         // made by chance must not leave every later click adding.
         setShownHex(null);
         setPickedPatches([patch]);
-        setStatus(t("status.picked", { index: patch.index, hex: patch.hex, n: patch.faces.length.toLocaleString(), pct: pct(patch.fraction), extruder: extruderText(patch.index) }));
+        setStatus(t("status.picked", { index: patch.index, hex: patch.hex, n: patch.faces.length.toLocaleString(), pct: pct(patch.fraction), extruder: step >= 3 ? ` → ${extruderText(patch.index)}` : "" }));
         focusPatch(patch, info.source, faceIndex);
       }
       // In 03 the picked colour's recipe opens beside the matrix, ready to change.
@@ -3282,12 +3272,33 @@ export default function App() {
     setStatus(t("status.paletteRecoloured", { from: oldHex, to: target, n: n.toLocaleString() }));
   }
 
-  /** A palette colour exactly as the model has it, or a new colour. */
-  function fillRgb(current: MeshModel, targetHex: string): RGB {
+  /**
+   * A palette colour exactly as the model has it, or a new colour of its own.  A new colour
+   * the model already has as a hidden shade inside some group would join that group when the
+   * fill or stroke lands, and show as the group's colour (11-03: orange painted, yellow once
+   * let go): it is taken one step off instead — a colour of its own, the same to the eye.
+   * The step it took before (now its own group's colour) is found again, so every stroke of
+   * the same new colour goes into the same group.
+   */
+  function fillRgb(_current: MeshModel, targetHex: string): RGB {
     // The group's own colour (the shade with the most area, as the palette shows it): filling with it
     // keeps it the most, so the group's colour — and the "change to" colour — stay as they are.
     const position = positionByHex.get(targetHex);
-    return position !== undefined && palette[position] ? palette[position].rgb : hexToRgb(targetHex);
+    if (position !== undefined && palette[position]) return palette[position].rgb;
+    const rgb = hexToRgb(targetHex);
+    if (!stripData) return rgb;
+    const present = new Set<number>();
+    for (const family of stripData.families) for (const colour of family.colours) present.add(colour.key);
+    if (!present.has(stripColourKey(rgb))) return rgb;
+    const clamp = (v: number) => Math.max(0, Math.min(255, v));
+    for (let d = 1; d <= 8; d++)
+      for (const [dr, dg, db] of [[0, 0, d], [0, 0, -d], [0, d, 0], [0, -d, 0], [d, 0, 0], [-d, 0, 0]]) {
+        const near: RGB = [clamp(rgb[0] + dr), clamp(rgb[1] + dg), clamp(rgb[2] + db)];
+        const at = positionByHex.get(rgbToHex(near));
+        if (at !== undefined && palette[at]) return palette[at].rgb;
+        if (!present.has(stripColourKey(near))) return near;
+      }
+    return rgb;
   }
 
   /**
@@ -3297,8 +3308,8 @@ export default function App() {
    * chosen — not the band its lightness happens to fall in (11-03: a new tan went in
    * as VE8).  Undefined for a colour the model has: it stays in its group.
    */
-  function groupingForNew(hex: string): { also: Map<number, string>; pinned: { pins: number[][]; from: Record<string, number> | undefined } } | undefined {
-    const key = stripColourKey(hexToRgb(hex));
+  function groupingForNew(rgb: RGB): { also: Map<number, string>; pinned: { pins: number[][]; from: Record<string, number> | undefined } } | undefined {
+    const key = stripColourKey(rgb);
     for (const group of committedGroups) if (group.colours.some((colour) => colour.key === key)) return undefined;
     const pins = storedStrip?.pins ?? [];
     if (pins.some((keys) => keys.includes(key))) return undefined;
@@ -3321,7 +3332,7 @@ export default function App() {
       for (let i = 0; i < patch.faces.length; i++) next[patch.faces[i]] = rgb;
       count += patch.faces.length;
     }
-    const grouping = groupingForNew(targetHex);
+    const grouping = groupingForNew(rgb);
     keepGroupsFor(model.triangleColors, next, grouping?.also, grouping?.pinned);
     applyColours(model, next);
     setStatus(t("status.recoloured", { n: count.toLocaleString(), hex: targetHex, patches: pickedPatches.length }));
@@ -3570,7 +3581,7 @@ export default function App() {
       setStatus(t("status.fillSame", { hex: brushHex }));
       return;
     }
-    const grouping = groupingForNew(brushHex);
+    const grouping = groupingForNew(rgb);
     keepGroupsFor(model.triangleColors, next, grouping?.also, grouping?.pinned);
     applyColours(model, next, { keepSelection: !inSelection });
     setStatus(
@@ -4368,7 +4379,7 @@ export default function App() {
       setStatus(t("status.healPalette"));
       return false;
     }
-    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly && !healMode ? pickedMask : null, count: 0, rgb: hexToRgb(brushHex), hex: brushHex, changed: [], healed: healMode ? new Uint8Array(current.triangleColors.length) : null };
+    strokeRef.current = { working: current.triangleColors.slice(), mask: brushMaskOnly && !healMode ? pickedMask : null, count: 0, rgb: fillRgb(current, brushHex), hex: brushHex, changed: [], healed: healMode ? new Uint8Array(current.triangleColors.length) : null };
     return true;
   }
 
@@ -4402,7 +4413,7 @@ export default function App() {
       setStatus(t("status.brushNothing"));
       return;
     }
-    const grouping = groupingForNew(stroke.hex);
+    const grouping = groupingForNew(stroke.rgb);
     keepGroupsFor(current.triangleColors, stroke.working, grouping?.also, grouping?.pinned);
     // Only the painted faces changed: buffers, labels and map are patched for them (strokePatchRef).
     strokePatchRef.current = { from: current.triangleColors, to: stroke.working, faces: Int32Array.from(stroke.changed), rgb: stroke.rgb, exact: false };
@@ -6944,7 +6955,8 @@ export default function App() {
                   )}
                 </div>
               )}
-              {model && (pickedPatches.length > 0 || shownHex) && (
+              {/* The pick bar edits colours: 02 only (in 03 and 04 the tag over the patch says where it prints). */}
+              {model && step === 2 && (pickedPatches.length > 0 || shownHex) && (
                 <div className="stage-bar pick-panel">
                     <>
                       <span className="pin-mark" title={t("pick.pinHint")} aria-hidden="true" />
@@ -6957,19 +6969,6 @@ export default function App() {
                         ))}
                         {pickedHexes.length === 1 && <code>{pickedHexes[0]}</code>}
                       </span>
-                      {pickedExtruders.length > 0 && (
-                        <span className="pick-extruders" title={t("pick.extruderHint")}>
-                          <span className="muted">→ {t("pick.extruder")}</span>
-                          {pickedExtruders.slice(0, 4).map((info) => (
-                            <span key={info.label} className="pick-extruder">
-                              <Swatch rgb={info.rgb} size={14} />
-                              <b>{info.label}</b>
-                              {info.recipe && <span className="muted">{info.recipe}</span>}
-                            </span>
-                          ))}
-                          {pickedExtruders.length > 4 && <span className="muted">+{pickedExtruders.length - 4}</span>}
-                        </span>
-                      )}
                       <span className="muted">{t("pick.faces", { n: pickedFaceCount.toLocaleString(), pct: pct(pickedFraction) })}</span>
                       <span className="pick-edge" title={t("pick.edgeHint")}>
                         <span className="muted">{t("pick.edge")}</span>
@@ -7015,6 +7014,8 @@ export default function App() {
                           </button>
                         </span>
                       )}
+                      {/* One "change to" colour: the list (palette colours, or the new colour) and, beside it,
+                          the picker to choose one yourself — one swatch for it, not two. */}
                       <span>{t("pick.changeTo")}</span>
                       <ColourSelect
                         value={pickTarget}
@@ -7025,17 +7026,20 @@ export default function App() {
                             const hex = rgbToHex(entry.rgb);
                             return { value: hex, hex, label: `#${entry.index} ${hex}`, sub: pct(areaByPosition[position] ?? 0), disabled: pickedHexes.length === 1 && hex === pickedHexes[0] };
                           }),
-                          { value: "__new__", hex: pickCustom, label: t("pick.newColour") },
+                          { value: "__new__", hex: pickCustom, label: `${t("pick.newColour")} ${pickCustom}` },
                         ]}
                       />
                       <ColourPicker
                         value={brushHex}
                         before={pickedHexes[0]}
                         commit
+                        applyLabel={t("pick.apply")}
                         title={t("brush.pickHint")}
                         onDraft={setPickPreviewHex}
                         onChange={(hex) => takePickedColour(hex, true)}
-                      />
+                      >
+                        <span>🎨 {t("pick.pickOwn")}</span>
+                      </ColourPicker>
                       {!brushMode && (
                         <button
                           type="button"
@@ -7056,7 +7060,7 @@ export default function App() {
                         title={t("pick.applyHint")}
                         onClick={() => applyPickColour()}
                       >
-                        {t("pick.apply")}
+                        {t("pick.apply")} <span className="key">Enter</span>
                       </button>
                       <button type="button" className="btn small" onClick={clearPick}>
                         {t("pick.clear")}

@@ -85,6 +85,8 @@ export interface ColourPickerProps {
    * popover closes — for a live look at it on the model that goes back on cancel.
    */
   onDraft?: (hex: string | null) => void;
+  /** Commit mode: the Apply button's words (what it does there, e.g. "apply to the picked pieces"). */
+  applyLabel?: string;
   disabled?: boolean;
   title?: string;
   /** Trigger content; defaults to a swatch plus the hex code. */
@@ -93,7 +95,7 @@ export interface ColourPickerProps {
   className?: string;
 }
 
-export function ColourPicker({ value, onChange, commit = false, settle = false, before, onDraft, disabled, title, children, size = 18, className }: ColourPickerProps) {
+export function ColourPicker({ value, onChange, commit = false, settle = false, before, onDraft, applyLabel, disabled, title, children, size = 18, className }: ColourPickerProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(value);
@@ -355,11 +357,12 @@ export function ColourPicker({ value, onChange, commit = false, settle = false, 
           </div>
           {commit && (
             <div className="cp-row cp-actions">
+              <span className="muted cp-keys">{t("picker.keys")}</span>
               <button type="button" className="btn small" onClick={close}>
                 {t("picker.cancel")}
               </button>
               <button type="button" className="btn primary small" disabled={unchanged} title={t("picker.applyHint")} onClick={apply}>
-                {t("picker.apply")}
+                {applyLabel ?? t("picker.apply")}
               </button>
             </div>
           )}
