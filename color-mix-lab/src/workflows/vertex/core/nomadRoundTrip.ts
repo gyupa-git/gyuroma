@@ -4,7 +4,7 @@ import { deltaE2000, rgbToLab } from "./prusaFdmMixer";
 import { majorityVertexLabels } from "./meshAdjacency";
 
 /**
- * Feature C of the Rodin work order: Nomad Sculpt round trip.
+ * Feature C of the work order: Nomad Sculpt round trip.
  *
  * C-1  Export the merged model as a vertex-colour OBJ with exactly N palette
  *      colours.  Vertices are written as they are (no positional welding) so

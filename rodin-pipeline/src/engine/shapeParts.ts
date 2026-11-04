@@ -227,7 +227,7 @@ export interface PartRule {
 /**
  * One colour per part: inside each part, a face of a colour that is neither the
  * part's main colour nor one of its kept details takes the main colour — the baked
- * shading of a Rodin model, a speck — or the kept colour it is a shade of (`near`
+ * shading of an AI-made model, a speck — or the kept colour it is a shade of (`near`
  * says which).  Left as they are: protected colours not named, and, in cells on the
  * edge of another part, the colours that part keeps (the cells do not follow the
  * colour border exactly: a sleeve's cell may hold a little of the hand).

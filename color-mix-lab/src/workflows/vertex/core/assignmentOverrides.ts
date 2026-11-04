@@ -8,7 +8,7 @@ import type {
 /**
  * Manual edits on top of a virtual extruder plan: force a palette colour onto
  * a physical extruder, or merge it into another palette colour's assignment.
- * Shared by the Color Mix Lab UI and the Rodin pipeline app.
+ * Shared by the Color Mix Lab UI and the GYUROMA app.
  */
 export type AssignmentOverride =
   | { kind: "physical"; extruder: number }

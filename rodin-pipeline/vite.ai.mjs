@@ -1,4 +1,4 @@
-// Local Claude for the Rodin Pipeline dev/preview server (plain JS: no node typings needed).
+// Local Claude for the GYUROMA dev/preview server (plain JS: no node typings needed).
 // The app's AI features ask the claude CLI on this computer (the owner's own login), one
 // round trip per question, pictures attached to the question itself.
 //   GET  /__rodin/ai/status -> {"available": true|false}

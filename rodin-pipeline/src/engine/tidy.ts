@@ -124,7 +124,7 @@ export interface TidyMixScore {
 export interface TidyContext {
   modelName: string;
   faces: number;
-  /** Source colours the strip is laid out from (53,490 for a raw Rodin model, a few dozen after a tidy). */
+  /** Source colours the strip is laid out from (53,490 for a raw AI-made model, a few dozen after a tidy). */
   sourceColours: number;
   target: number;
   minBlob: number;

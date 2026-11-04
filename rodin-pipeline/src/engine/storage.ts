@@ -307,7 +307,7 @@ function dataUrl(key: string): string {
   return new URL(`__rodin/data/${key}`, document.baseURI).toString();
 }
 
-/** True when the page is served by the Rodin Pipeline dev/preview server (cached). */
+/** True when the page is served by the GYUROMA dev/preview server (cached). */
 export function localServerAvailable(): Promise<boolean> {
   if (!serverProbe) {
     serverProbe = (async () => {

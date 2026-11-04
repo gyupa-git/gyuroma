@@ -22,7 +22,7 @@ nothing about your model).*
 
 | 단계 / step | 하는 일 / what happens |
 | --- | --- |
-| **01 불러오기** · Load | Rodin 3D Print "Face Color" 3MF, 정점색 OBJ(노마드 · 블렌더), 저장해 둔 `.gyuroma` 작업 파일 |
+| **01 불러오기** · Load | 면 색 "Face Color" 3MF, 정점색 OBJ(노마드 · 블렌더), 저장해 둔 `.gyuroma` 작업 파일 |
 | **02 색 정리** · Colours | 규로마의 중심. 색 띠에서 그룹 나누기 · 합치기, 자동 정돈 프리셋, 브러시 · 채우기 · 스포이드 · 틈새 정리, 색지도, **선 따라 자르기**로 매끈한 경계 |
 | **03 필라멘트 · 혼합** · Filament & mix | FDM일 때. 가진 필라멘트로 슬롯 정하기와 추천, 꽂지 않은 색은 층을 번갈아 쌓아 섞기 |
 | **04 내보내기** · Export | 프린터를 고르면 그 프린터에 맞는 파일로 |

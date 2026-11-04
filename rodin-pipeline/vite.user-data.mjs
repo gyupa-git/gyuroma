@@ -1,4 +1,4 @@
-// Local data store for the Rodin Pipeline dev/preview server (plain JS: no node typings needed).
+// Local data store for the GYUROMA dev/preview server (plain JS: no node typings needed).
 // Settings and the autosaved work are kept as files in rodin-pipeline/user-data/, so they
 // survive browser, profile and port changes.
 //   GET    /__rodin/ping              -> "ok" (header X-Rodin-Started: when this server started, in

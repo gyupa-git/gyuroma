@@ -3905,7 +3905,7 @@ export default function App() {
   async function onModelFile(file: File): Promise<void> {
     if (file.name.toLowerCase().endsWith(WORK_FILE_EXT)) return openWorkFile(file);
     const kind: StoredWorkFile["kind"] = file.name.toLowerCase().endsWith(".3mf") ? "rodin" : "obj";
-    setBusy(kind === "rodin" ? t("busy.readingRodin") : t("busy.readingObj"));
+    setBusy(kind === "rodin" ? t("busy.reading3mf") : t("busy.readingObj"));
     await yieldToUi();
     try {
       const loaded = await parseModelFile(file, kind);
@@ -3914,7 +3914,7 @@ export default function App() {
       countAction(`load/${kind}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setStatus(t("status.error", { message: message === RODIN_TEXTURE_MODE_MESSAGE ? t("load.rodinTextureMode") : message }));
+      setStatus(t("status.error", { message: message === RODIN_TEXTURE_MODE_MESSAGE ? t("load.textureMode3mf") : message }));
     } finally {
       setBusy(null);
     }

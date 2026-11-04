@@ -96,8 +96,8 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 1,
         at: [".dropzone", ".sidebar"],
-        ko: "먼저 여기에 모델을 넣어 줍니다. 노마드·블렌더에서 정점색으로 내보낸 OBJ, 면 색이 든 3MF(Rodin 3D Print 는 **Output Mode = Face Color** 로 받은 것), 저장해 둔 **.gyuroma 작업 파일** 다 됩니다.",
-        en: "First, drop your model here: a vertex-colour OBJ from Nomad or Blender, a 3MF with face colours (from Rodin 3D Print: **Output Mode = Face Color**), or a saved **.gyuroma work file**.",
+        ko: "먼저 여기에 모델을 넣어 줍니다. 노마드·블렌더에서 정점색으로 내보낸 OBJ, 면 색이 든 3MF(**면 색 Face Color** 로 내보낸 것), 저장해 둔 **.gyuroma 작업 파일** 다 됩니다.",
+        en: "First, drop your model here: a vertex-colour OBJ from Nomad or Blender, a 3MF with face colours (exported as **Face Color**), or a saved **.gyuroma work file**.",
       },
       {
         step: 1,

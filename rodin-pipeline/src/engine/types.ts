@@ -222,7 +222,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     fileName: "",
     coordinateMode: "keep",
     scale: 1,
-    // Nomad/Rodin meshes arrive at unit scale (a 2 mm model), which slices into a
+    // Unit-scale meshes (Nomad and the like) arrive (a 2 mm model), which slices into a
     // handful of layers and looks single-coloured. Default every export to 70 mm.
     targetHeight: DEFAULT_TARGET_HEIGHT,
     splitObjects: true,

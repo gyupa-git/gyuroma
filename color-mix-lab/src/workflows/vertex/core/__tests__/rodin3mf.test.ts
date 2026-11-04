@@ -20,7 +20,7 @@ function extrudersForGrid(grid: ReturnType<typeof gridMesh>): number[] {
   });
 }
 
-describe("Feature A: Rodin Face Color 3MF", () => {
+describe("Feature A: face-colour 3MF", () => {
   it("loads geometry, exact palette face colours and majority vertex colours", async () => {
     const grid = gridMesh(12, 6);
     const extruders = extrudersForGrid(grid);
@@ -60,7 +60,7 @@ describe("Feature A: Rodin Face Color 3MF", () => {
     expect([...result.vertexExtruder].every((n) => n >= 1)).toBe(true);
   });
 
-  it("rejects Texture Map exports with the Rodin hint", async () => {
+  it("rejects Texture Map exports with the Face Color hint", async () => {
     const grid = gridMesh(3, 3);
     const bytes = await buildRodin3mf({
       vertices: grid.vertices,

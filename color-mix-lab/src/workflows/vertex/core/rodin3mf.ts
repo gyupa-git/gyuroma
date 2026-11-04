@@ -5,8 +5,8 @@ import { tryDecodePaintCode } from "./paintCodes";
 import { majorityVertexLabels } from "./meshAdjacency";
 
 /**
- * Feature A of the Rodin work order: load a Hyper3D Rodin "3D Print" 3MF
- * (Output Mode: Face Color).  The file is a Bambu Studio project:
+ * Feature A of the work order: load a face-colour 3MF (an AI 3D generator's
+ * "3D Print" export with Output Mode: Face Color).  The file is a Bambu Studio project:
  *
  *   3D/3dmodel.model                  geometry + per-face paint codes
  *   Metadata/project_settings.config  JSON, includes the filament_colour palette
@@ -23,7 +23,7 @@ export const RODIN_PROJECT_SETTINGS_PATH = "Metadata/project_settings.config";
 
 export const RODIN_TEXTURE_MODE_MESSAGE =
   "This 3MF has no face colours (it looks like a Texture Map export). " +
-  "In Rodin, set Output Mode to Face Color and download the 3MF again.";
+  "Export it again with face colours (Face Color).";
 
 export interface Rodin3mfStats {
   vertexCount: number;

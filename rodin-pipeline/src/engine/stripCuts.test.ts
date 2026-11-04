@@ -12,7 +12,7 @@ function groupOf(groups: StripGroup[]): Map<number, string> {
 
 describe("cuts that keep the groups", () => {
   // One family of greens, light to dark, many shades with uneven areas: like a
-  // model straight from Rodin, before any tidy.
+  // model straight from an AI 3D generator, before any tidy.
   const shades: RGB[] = [];
   for (let i = 0; i < 60; i++) shades.push([20 + i, 120 + Math.round(i * 1.5), 40 + i]);
   const faces: RGB[] = [];

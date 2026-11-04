@@ -7,7 +7,7 @@ import {
 import { smoothBorderLines } from "./borderLines";
 
 /**
- * Feature B of the Rodin work order: "merge with shade re-judgement and
+ * Feature B of the work order: "merge with shade re-judgement and
  * cleanup".
  *
  * A plain palette merge ("put #D6C0C3 into skin") recolours every face of the
