@@ -28,8 +28,6 @@ export function CleanupPanel({
   onFlagChange,
   mergeSettings,
   onMergeSettings,
-  targetGroups,
-  onTargetChange,
   onSplitGroup,
   onMergeUp,
   onMergeSelected,
@@ -66,8 +64,6 @@ export function CleanupPanel({
   onFlagChange: (hex: string, patch: Partial<MergeFlag>) => void;
   mergeSettings: MergeSettings;
   onMergeSettings: (next: MergeSettings) => void;
-  targetGroups: number;
-  onTargetChange: (next: number) => void;
   onSplitGroup: (family: number, fraction: number) => void;
   /** Merge group `index` of `family` into the one above it. */
   onMergeUp: (family: number, index: number) => void;
@@ -132,7 +128,6 @@ export function CleanupPanel({
   const partnerDe = focus && partner ? deltaE2000(rgbToLab(focus.rep), rgbToLab(partner.rep)) : 0;
 
   const shownHex = toneHex ?? focusHex ?? "";
-  const presets = [8, 12, 16, 24];
   const hl = (key: string) => (highlight?.has(key) ? "hl-field" : undefined);
 
   return (
@@ -331,34 +326,6 @@ export function CleanupPanel({
         )}
       </section>
 
-      <section className="pane-section" aria-label={t("clean.target")}>
-        <div className="pane-head">
-          <span className="pane-label">
-            {t("clean.target")}
-            <HelpTip text={t("strip.targetHint")} />
-          </span>
-          {strip && <span className="pane-aside">{t("clean.original", { n: strip.colourCount.toLocaleString() })}</span>}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <div className={`stepper${hl("target") ? " hl-field" : ""}`}>
-            <button type="button" aria-label={t("clean.less")} disabled={busy || targetGroups <= 2} onClick={() => onTargetChange(targetGroups - 1)}>
-              −
-            </button>
-            <span className="value">{targetGroups}</span>
-            <button type="button" aria-label={t("clean.more")} disabled={busy || targetGroups >= 64} onClick={() => onTargetChange(targetGroups + 1)}>
-              +
-            </button>
-          </div>
-          <div className="presets">
-            {presets.map((n) => (
-              <button key={n} type="button" aria-pressed={targetGroups === n} disabled={busy} onClick={() => onTargetChange(n)}>
-                {n}
-              </button>
-            ))}
-          </div>
-        </div>
-      </section>
-
       <section className="pane-section" aria-label={t("clean.rules")}>
         <div className="pane-head">
           <span className="pane-label">{t("clean.rules")}</span>
@@ -422,5 +389,44 @@ export function CleanupPanel({
       </section>
       {showAdvanced && advanced}
     </>
+  );
+}
+
+/**
+ * 목표 색 수, at the head of 02 (11-05, the owner: "목표 색수 정하기를 맨 위쪽으로 옮겨 줘"): it is the first thing
+ * to choose — the strip's groups and the 🤖 AI flat paint's palette both keep within it.
+ */
+export function TargetSection({ strip, targetGroups, onTargetChange, busy, highlight }: { strip: ColourStripData | null; targetGroups: number; onTargetChange: (next: number) => void; busy: boolean; highlight?: Set<string> | null }) {
+  const t = useT();
+  const presets = [8, 12, 16, 24];
+  const hl = (key: string) => (highlight?.has(key) ? "hl-field" : undefined);
+  return (
+    <section className="pane-section" aria-label={t("clean.target")}>
+      <div className="pane-head">
+        <span className="pane-label">
+          {t("clean.target")}
+          <HelpTip text={t("strip.targetHint")} />
+        </span>
+        {strip && <span className="pane-aside">{t("clean.original", { n: strip.colourCount.toLocaleString() })}</span>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <div className={`stepper${hl("target") ? " hl-field" : ""}`}>
+          <button type="button" aria-label={t("clean.less")} disabled={busy || targetGroups <= 2} onClick={() => onTargetChange(targetGroups - 1)}>
+            −
+          </button>
+          <span className="value">{targetGroups}</span>
+          <button type="button" aria-label={t("clean.more")} disabled={busy || targetGroups >= 64} onClick={() => onTargetChange(targetGroups + 1)}>
+            +
+          </button>
+        </div>
+        <div className="presets">
+          {presets.map((n) => (
+            <button key={n} type="button" aria-pressed={targetGroups === n} disabled={busy} onClick={() => onTargetChange(n)}>
+              {n}
+            </button>
+          ))}
+        </div>
+      </div>
+    </section>
   );
 }

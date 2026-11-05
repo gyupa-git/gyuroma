@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import type { ViewName } from "../engine/types";
 import { VIEW_DIRECTIONS, type CameraPose } from "./MeshViewer";
+import type { ColourBuffer } from "../engine/mesh";
+import { withSrgbColours } from "./colourShader";
 
 export interface ViewShot {
   /** "now" = from a viewer's camera as it is (what the user is looking at). */
@@ -15,7 +17,7 @@ export interface ViewShot {
  * released afterwards: the viewers' cameras and highlights are left alone.
  * `colours` is the viewers' linear colour buffer (3 corners per face).
  */
-export function renderViews(positions: Float32Array, colours: Float32Array, views: Array<ViewName | CameraPose>, size = 560): ViewShot[] {
+export function renderViews(positions: Float32Array, colours: ColourBuffer, views: Array<ViewName | CameraPose>, size = 560): ViewShot[] {
   // A camera pose keeps its view's proportions (the longer side `size`).
   const pose = views.find((v): v is CameraPose => typeof v !== "string");
   const width = pose && pose.aspect > 1 ? size : Math.round(size * (pose?.aspect ?? 1));
@@ -42,10 +44,11 @@ export function renderViews(positions: Float32Array, colours: Float32Array, view
 
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("color", new THREE.BufferAttribute(colours, 3));
-  geometry.computeVertexNormals();
+  // The view's colour buffer (sRGB RGBA bytes, ui/colourShader.ts); each face lit by its own facing, as in the
+  // viewer — no normals made per picture (on a 4.6 M-face model those were 166 MB each time).
+  geometry.setAttribute("color", new THREE.BufferAttribute(colours, 4, true));
   geometry.computeBoundingSphere();
-  const material = new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide });
+  const material = withSrgbColours(new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide, flatShading: true }));
   scene.add(new THREE.Mesh(geometry, material));
 
   const sphere = geometry.boundingSphere ?? new THREE.Sphere(new THREE.Vector3(), 1);
@@ -117,7 +120,7 @@ export interface NumberedShots {
  */
 export function renderNumberedViews(
   positions: Float32Array,
-  colours: Float32Array,
+  colours: ColourBuffer,
   regionOf: Int32Array,
   regionCount: number,
   views: Array<ViewName | CameraPose>,
@@ -149,10 +152,11 @@ export function renderNumberedViews(
   const position = new THREE.BufferAttribute(positions, 3);
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", position);
-  geometry.setAttribute("color", new THREE.BufferAttribute(colours, 3));
-  geometry.computeVertexNormals();
+  // The view's colour buffer (sRGB RGBA bytes, ui/colourShader.ts); each face lit by its own facing, as in the
+  // viewer — no normals made per picture (on a 4.6 M-face model those were 166 MB each time).
+  geometry.setAttribute("color", new THREE.BufferAttribute(colours, 4, true));
   geometry.computeBoundingSphere();
-  const material = new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide });
+  const material = withSrgbColours(new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide, flatShading: true }));
   scene.add(new THREE.Mesh(geometry, material));
 
   // The code pass: region index + 1 as three bytes (0 = a face of no listed region).
@@ -209,7 +213,7 @@ export function renderNumberedViews(
   };
 
   // Where each region shows in each view: its pixel count and the pixel nearest the middle of them.
-  const spots: Array<Array<{ count: number; x: number; y: number }>> = [];
+  const spots: Array<Array<{ count: number; x: number; y: number; depth: number }>> = [];
   // Each view's codes, top row first (for the borders drawn on its picture).
   const codeViews: Int32Array[] = [];
   const seen: Array<Array<ViewName | "now">> = Array.from({ length: regionCount }, () => []);
@@ -238,19 +242,42 @@ export function renderNumberedViews(
         sx[r] += i % width;
         sy[r] += Math.floor(i / width);
       }
-      const best = new Float64Array(regionCount).fill(Infinity);
-      const at = Array.from({ length: regionCount }, () => ({ count: 0, x: 0, y: 0 }));
+      // The number goes where the region is deepest — furthest from its edges (a chamfer distance in the
+      // picture) — not at the pixel nearest its middle: a ring's middle is the plate it rings, and the number
+      // landed on the plate (11-04 Tkc's collar: the gold trim read as the white plate).
+      const depth = new Float32Array(width * height);
+      const edge = (i: number, j: number, w: number) => (flipped[j] === flipped[i] ? depth[j] + w : w);
+      for (let i = 0; i < width * height; i++) depth[i] = flipped[i] === 0 ? 0 : 1e9;
+      for (let y = 0; y < height; y++)
+        for (let x = 0; x < width; x++) {
+          const i = y * width + x;
+          if (flipped[i] === 0) continue;
+          let d = depth[i];
+          d = Math.min(d, x > 0 ? edge(i, i - 1, 1) : 1, y > 0 ? edge(i, i - width, 1) : 1);
+          if (x > 0 && y > 0) d = Math.min(d, edge(i, i - width - 1, 1.4));
+          if (x < width - 1 && y > 0) d = Math.min(d, edge(i, i - width + 1, 1.4));
+          depth[i] = d;
+        }
+      for (let y = height - 1; y >= 0; y--)
+        for (let x = width - 1; x >= 0; x--) {
+          const i = y * width + x;
+          if (flipped[i] === 0) continue;
+          let d = depth[i];
+          d = Math.min(d, x < width - 1 ? edge(i, i + 1, 1) : 1, y < height - 1 ? edge(i, i + width, 1) : 1);
+          if (x < width - 1 && y < height - 1) d = Math.min(d, edge(i, i + width + 1, 1.4));
+          if (x > 0 && y < height - 1) d = Math.min(d, edge(i, i + width - 1, 1.4));
+          depth[i] = d;
+        }
+      const mid = Array.from({ length: regionCount }, (_, r) => ({ x: count[r] ? sx[r] / count[r] : 0, y: count[r] ? height - 1 - sy[r] / count[r] : 0 }));
+      const at = Array.from({ length: regionCount }, () => ({ count: 0, x: 0, y: 0, depth: -1, off: Infinity }));
       for (let i = 0; i < width * height; i++) {
-        const r = codeAt(i) - 1;
+        const r = flipped[i] - 1;
         if (r < 0 || r >= regionCount) continue;
         const x = i % width;
         const y = Math.floor(i / width);
-        const d = (x - sx[r] / count[r]) ** 2 + (y - sy[r] / count[r]) ** 2;
-        if (d < best[r]) {
-          best[r] = d;
-          // Read bottom-up: the picture's rows run top-down.
-          at[r] = { count: count[r], x, y: height - 1 - y };
-        }
+        const off = (x - mid[r].x) ** 2 + (y - mid[r].y) ** 2;
+        // Deepest first; of the about-as-deep, the one nearest the middle.
+        if (depth[i] > at[r].depth + 0.5 || (depth[i] > at[r].depth - 0.5 && off < at[r].off)) at[r] = { count: count[r], x, y, depth: Math.max(depth[i], at[r].depth), off };
       }
       spots.push(at);
     }
@@ -260,7 +287,8 @@ export function renderNumberedViews(
       const ranked = views.map((_, v) => v).filter((v) => spots[v][r].count >= 12).sort((a, b) => spots[b][r].count - spots[a][r].count);
       for (const v of ranked.slice(0, 2)) {
         if (v !== ranked[0] && spots[v][r].count < 200) continue;
-        marks[v].push({ id: r + 1, x: spots[v][r].x, y: spots[v][r].y, small: spots[v][r].count < 900 });
+        // Too thin to hold its number inside (a trim, a strap): the number beside it, with a line to it.
+        marks[v].push({ id: r + 1, x: spots[v][r].x, y: spots[v][r].y, small: spots[v][r].count < 900 || spots[v][r].depth < 9 });
         const view = views[v];
         seen[r].push(typeof view === "string" ? view : "now");
       }
@@ -359,4 +387,176 @@ export function renderNumberedViews(
     renderer.forceContextLoss();
   }
   return { shots, seen };
+}
+
+/**
+ * How many pixels of each region show from each camera pose (the region's faces drawn in a flat
+ * code colour, everything else in front of them hiding them) — to pick the views a part shows best in.
+ */
+export function regionPixels(positions: Float32Array, regionOf: Int32Array, regionCount: number, poses: CameraPose[], size = 160): Float64Array[] {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(1);
+  renderer.setSize(size, size, false);
+  const faceCount = regionOf.length;
+  const codes = new Uint8Array(faceCount * 9);
+  for (let f = 0; f < faceCount; f++) {
+    const code = regionOf[f] + 1;
+    const r = code & 255, g = (code >> 8) & 255, b = (code >> 16) & 255;
+    for (let c = 0; c < 3; c++) {
+      codes[f * 9 + c * 3] = r;
+      codes[f * 9 + c * 3 + 1] = g;
+      codes[f * 9 + c * 3 + 2] = b;
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(codes, 3, true));
+  geometry.computeBoundingSphere();
+  const material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false });
+  const scene = new THREE.Scene();
+  scene.add(new THREE.Mesh(geometry, material));
+  const target = new THREE.WebGLRenderTarget(size, size, { type: THREE.UnsignedByteType, format: THREE.RGBAFormat, depthBuffer: true });
+  target.texture.colorSpace = THREE.NoColorSpace;
+  const pixels = new Uint8Array(size * size * 4);
+  const radius = Math.max(1e-3, geometry.boundingSphere?.radius ?? 1);
+  const camera = new THREE.PerspectiveCamera(38, 1, radius * 0.01, radius * 10);
+  const out: Float64Array[] = [];
+  try {
+    for (const pose of poses) {
+      const at = new THREE.Vector3(...pose.target);
+      camera.position.set(...pose.position);
+      camera.up.set(...pose.up);
+      camera.fov = pose.fov;
+      camera.aspect = 1;
+      const d = camera.position.distanceTo(at);
+      camera.near = Math.max(radius * 0.002, d - radius * 2);
+      camera.far = d + radius * 2;
+      camera.updateProjectionMatrix();
+      camera.lookAt(at);
+      renderer.setRenderTarget(target);
+      renderer.setClearColor(0x000000, 1);
+      renderer.clear();
+      renderer.render(scene, camera);
+      renderer.readRenderTargetPixels(target, 0, 0, size, size, pixels);
+      renderer.setRenderTarget(null);
+      const count = new Float64Array(regionCount);
+      for (let i = 0; i < size * size; i++) {
+        const r = (pixels[i * 4] | (pixels[i * 4 + 1] << 8) | (pixels[i * 4 + 2] << 16)) - 1;
+        if (r >= 0 && r < regionCount) count[r]++;
+      }
+      out.push(count);
+    }
+  } finally {
+    geometry.dispose();
+    material.dispose();
+    target.dispose();
+    renderer.dispose();
+    renderer.forceContextLoss();
+  }
+  return out;
+}
+
+/**
+ * Which face shows at each pixel of a camera pose (face index, -1 for background), top row first —
+ * a point the AI puts on a picture made with the same pose and size lands on the face under it.
+ */
+export function renderFaceIds(positions: Float32Array, pose: CameraPose, size: number): Int32Array {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(1);
+  renderer.setSize(size, size, false);
+  const faceCount = positions.length / 9;
+  const codes = new Uint8Array(faceCount * 9);
+  for (let f = 0; f < faceCount; f++) {
+    const code = f + 1;
+    const r = code & 255, g = (code >> 8) & 255, b = (code >> 16) & 255;
+    for (let c = 0; c < 3; c++) {
+      codes[f * 9 + c * 3] = r;
+      codes[f * 9 + c * 3 + 1] = g;
+      codes[f * 9 + c * 3 + 2] = b;
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(codes, 3, true));
+  geometry.computeBoundingSphere();
+  const material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false });
+  const scene = new THREE.Scene();
+  scene.add(new THREE.Mesh(geometry, material));
+  const target = new THREE.WebGLRenderTarget(size, size, { type: THREE.UnsignedByteType, format: THREE.RGBAFormat, depthBuffer: true });
+  target.texture.colorSpace = THREE.NoColorSpace;
+  const pixels = new Uint8Array(size * size * 4);
+  const radius = Math.max(1e-3, geometry.boundingSphere?.radius ?? 1);
+  const camera = new THREE.PerspectiveCamera(pose.fov, 1, radius * 0.01, radius * 10);
+  const out = new Int32Array(size * size).fill(-1);
+  try {
+    const at = new THREE.Vector3(...pose.target);
+    camera.position.set(...pose.position);
+    camera.up.set(...pose.up);
+    const d = camera.position.distanceTo(at);
+    camera.near = Math.max(radius * 0.002, d - radius * 2);
+    camera.far = d + radius * 2;
+    camera.updateProjectionMatrix();
+    camera.lookAt(at);
+    renderer.setRenderTarget(target);
+    renderer.setClearColor(0x000000, 1);
+    renderer.clear();
+    renderer.render(scene, camera);
+    renderer.readRenderTargetPixels(target, 0, 0, size, size, pixels);
+    renderer.setRenderTarget(null);
+    for (let row = 0; row < size; row++)
+      for (let x = 0; x < size; x++) {
+        const i = row * size + x;
+        const code = pixels[i * 4] | (pixels[i * 4 + 1] << 8) | (pixels[i * 4 + 2] << 16);
+        // Read bottom-up: the picture's rows run top-down.
+        out[(size - 1 - row) * size + x] = code - 1;
+      }
+  } finally {
+    geometry.dispose();
+    material.dispose();
+    target.dispose();
+    renderer.dispose();
+    renderer.forceContextLoss();
+  }
+  return out;
+}
+
+/** A picture with a light grid every `step` pixels and the pixel numbers along its edges (for pointing at things on it). */
+export async function withGrid(dataUrl: string, step = 60): Promise<string> {
+  const img = new Image();
+  await new Promise<void>((resolve) => {
+    img.onload = () => resolve();
+    img.onerror = () => resolve();
+    img.src = dataUrl;
+  });
+  const canvas = document.createElement("canvas");
+  canvas.width = img.width || 1;
+  canvas.height = img.height || 1;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return dataUrl;
+  ctx.drawImage(img, 0, 0);
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.35)";
+  ctx.lineWidth = 1;
+  ctx.font = "10px sans-serif";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+  for (let x = step; x < canvas.width; x += step) {
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, 0);
+    ctx.lineTo(x + 0.5, canvas.height);
+    ctx.stroke();
+    ctx.fillText(String(x), x + 2, 10);
+  }
+  for (let y = step; y < canvas.height; y += step) {
+    ctx.beginPath();
+    ctx.moveTo(0, y + 0.5);
+    ctx.lineTo(canvas.width, y + 0.5);
+    ctx.stroke();
+    ctx.fillText(String(y), 2, y - 2);
+  }
+  return canvas.toDataURL("image/jpeg", 0.9);
 }

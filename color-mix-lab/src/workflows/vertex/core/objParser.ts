@@ -1,5 +1,6 @@
 import type { MeshModel, RGB, Tri, Vec3 } from './types';
 import { clamp255 } from './colour';
+import { sharedRgb } from './rgbPool';
 
 export interface ObjParseProgress {
   phase: 'reading' | 'parsing';
@@ -97,7 +98,8 @@ class ObjParseState {
             ]
           : [180, 180, 180]);
         this.triangles.push(tri);
-        this.triangleColors.push(rgb);
+        // Faces of one colour share its array (rgbPool).
+        this.triangleColors.push(sharedRgb(rgb));
         this.colourKeys.add(colourKey(rgb));
         this.objectFaceCounts[this.currentObject] = (this.objectFaceCounts[this.currentObject] || 0) + 1;
       }

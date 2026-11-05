@@ -4,7 +4,8 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { RGB } from "@core/types";
 import type { ViewName } from "../engine/types";
 import { pieceAt } from "../engine/cutPick";
-import { srgbToLinear } from "../engine/mesh";
+import { CORNER_BYTES, FACE_BYTES, linearToSrgbByte, SRGB_TO_LINEAR, type ColourBuffer } from "../engine/mesh";
+import { SRGB_LINEAR_GLSL, withSrgbColours } from "./colourShader";
 import { backgroundStyle, DEFAULT_BACKGROUND, type ViewBackground } from "./background";
 
 export interface PickInfo {
@@ -120,7 +121,8 @@ export interface CameraPose {
 
 export interface MeshViewerProps {
   positions: Float32Array | null;
-  colours: Float32Array | null;
+  /** Face colours (engine/mesh.ts ColourBuffer: sRGB RGBA bytes, 3 corners a face). */
+  colours: ColourBuffer | null;
   view: ViewName;
   /** Bump to re-fit the camera to the current view. */
   fitNonce: number;
@@ -134,6 +136,8 @@ export interface MeshViewerProps {
   className?: string;
   /** Unlit rendering: face colours exactly as stored, no shading. */
   flat?: boolean;
+  /** Thin lines where the surface folds, turns away or passes in front (the shape over flat colours; the colours untouched). */
+  formLines?: boolean;
   /** Brush mode: left-drag paints (rotate with the right button, zoom with the wheel). */
   brush?: boolean;
   /** Next click samples a colour instead of picking/painting. */
@@ -191,8 +195,8 @@ export interface MeshViewerProps {
 export interface ViewerCut {
   /** The pieces, 3 corners each (view space, like `positions`). */
   positions: Float32Array;
-  /** Linear colour of every corner (3 per piece corner). */
-  colours: Float32Array;
+  /** The colour of every corner (a colour buffer: sRGB RGBA bytes, 3 corners a piece). */
+  colours: ColourBuffer;
   /** The face of the model each piece comes from; the pieces of one face are listed together. */
   parentFace: Int32Array;
   /** The palette position each piece shows (what a click on it means). */
@@ -484,14 +488,16 @@ type SoftUniforms = Record<"uSoftEdges", { value: number }>;
  * its pieces drawn instead.  The pick pass has its own shader and still takes it.
  */
 const HIDE_MARKED_VERTEX = `#include <project_vertex>
-#ifdef USE_COLOR
-if (color.r < -0.5) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+#if defined( USE_COLOR_ALPHA )
+if (color.a < 0.5) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
 #endif`;
 
 function makeMeshMaterial(flat: boolean, layers?: LayerUniforms | null, soft?: SoftUniforms | null): THREE.Material {
   const material = flat
     ? new THREE.MeshBasicMaterial({ vertexColors: true, color: 0xffffff, side: THREE.DoubleSide })
-    : new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide });
+    : // Each face lit by its own facing, worked out on the GPU from the face itself (11-05: the normals the model's
+      // mesh carried were 36 bytes a face in each view — 330 MB on a 4.6 M-face model, for the same look).
+      new THREE.MeshStandardMaterial({ vertexColors: true, color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide, flatShading: true });
   if (layers) {
     material.onBeforeCompile = (shader) => {
       Object.assign(shader.uniforms, layers);
@@ -509,7 +515,7 @@ function makeMeshMaterial(flat: boolean, layers?: LayerUniforms | null, soft?: S
       Object.assign(shader.uniforms, soft);
       shader.vertexShader = shader.vertexShader
         .replace("#include <common>", "#include <common>\nattribute vec4 softColor;\nvarying vec3 vSoftColor;")
-        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvSoftColor = softColor.rgb;")
+        .replace("#include <begin_vertex>", "#include <begin_vertex>\nvSoftColor = gyuLinear(softColor.rgb);")
         .replace("#include <project_vertex>", HIDE_MARKED_VERTEX);
       shader.fragmentShader = shader.fragmentShader
         .replace("#include <common>", "#include <common>\nuniform float uSoftEdges;\nvarying vec3 vSoftColor;")
@@ -522,7 +528,8 @@ function makeMeshMaterial(flat: boolean, layers?: LayerUniforms | null, soft?: S
     };
     material.customProgramCacheKey = () => "plain";
   }
-  return material;
+  // The colour buffers are sRGB bytes (ui/colourShader.ts).
+  return withSrgbColours(material);
 }
 
 // Each face's colour eased toward the colour averaged at its corners: inside
@@ -536,6 +543,13 @@ const SOFT_COLOUR_FRAGMENT = `
 
 /** How far toward the corner-averaged colour the soft view goes (0 = faces as they are). */
 const SOFT_EDGE_MIX = 1;
+
+/** A colour buffer of mid grey (no colours given). */
+function greyColours(faceCount: number): ColourBuffer {
+  const out = new Uint8Array(faceCount * FACE_BYTES).fill(204);
+  for (let i = 3; i < out.length; i += 4) out[i] = 255;
+  return out;
+}
 
 /** Corners of every vertex (a vertex → corners table), shared by the viewers of one model. */
 interface VertexCorners {
@@ -561,14 +575,15 @@ function vertexCornersFor(cornerVertex: Int32Array): VertexCorners {
 }
 
 /**
- * Soft colours are 16-bit with 4 slots per corner (the 4th unused): 3 × 16-bit
- * is a 6-byte vertex format Metal cannot read, and the driver then converted
- * the whole buffer on every change, which made brush strokes stutter.
+ * Soft colours: RGBA bytes a corner, sRGB like the colour buffer (alpha unused) — the mean is taken in linear
+ * light and stored back as sRGB (11-05: 16-bit linear was 24 bytes a face a view; this is 12). Four bytes a
+ * corner, never three: Metal cannot read a 3-byte vertex format and the driver then converted the whole
+ * buffer on every change, which made brush strokes stutter.
  */
 const SOFT_STRIDE = 4;
 
-/** Writes the mean colour of vertex v's faces into each of its corners (16-bit, 0..1). */
-function softenVertex(table: VertexCorners, v: number, colours: Float32Array, out: Uint16Array): void {
+/** Writes the mean colour of vertex v's faces into each of its corners. */
+function softenVertex(table: VertexCorners, v: number, colours: ColourBuffer, out: Uint8Array): void {
   const start = table.offsets[v];
   const end = table.offsets[v + 1];
   if (end === start) return;
@@ -577,27 +592,28 @@ function softenVertex(table: VertexCorners, v: number, colours: Float32Array, ou
   let b = 0;
   let n = 0;
   for (let i = start; i < end; i++) {
-    const o = table.corners[i] * 3;
-    if (colours[o] < 0) continue; // a face left out of the drawing (cut along a border line)
-    r += colours[o];
-    g += colours[o + 1];
-    b += colours[o + 2];
+    const o = table.corners[i] * CORNER_BYTES;
+    if (colours[o + 3] === 0) continue; // a face left out of the drawing (cut along a border line)
+    r += SRGB_TO_LINEAR[colours[o]];
+    g += SRGB_TO_LINEAR[colours[o + 1]];
+    b += SRGB_TO_LINEAR[colours[o + 2]];
     n++;
   }
   if (n === 0) return;
   const inv = 1 / n;
-  const qr = Math.round(Math.min(1, r * inv) * 65535);
-  const qg = Math.round(Math.min(1, g * inv) * 65535);
-  const qb = Math.round(Math.min(1, b * inv) * 65535);
+  const qr = linearToSrgbByte(r * inv);
+  const qg = linearToSrgbByte(g * inv);
+  const qb = linearToSrgbByte(b * inv);
   for (let i = start; i < end; i++) {
     const o = table.corners[i] * SOFT_STRIDE;
     out[o] = qr;
     out[o + 1] = qg;
     out[o + 2] = qb;
+    out[o + 3] = 255;
   }
 }
 
-function softenAll(table: VertexCorners, colours: Float32Array, out: Uint16Array): void {
+function softenAll(table: VertexCorners, colours: ColourBuffer, out: Uint8Array): void {
   const vertexCount = table.offsets.length - 1;
   for (let v = 0; v < vertexCount; v++) softenVertex(table, v, colours, out);
 }
@@ -662,13 +678,15 @@ const LAYER_FRAGMENT_BODY = `
 
 /** Renders the face index as a colour so a single pixel read identifies the face under the cursor. */
 function makePickMaterial(): THREE.ShaderMaterial {
-  return new THREE.ShaderMaterial({
+  const material = new THREE.ShaderMaterial({
     side: THREE.DoubleSide,
+    // The model's mesh draws its faces in order, three corners each: its face is its vertex's place / 3 (11-05: an
+    // id attribute was 12 bytes a face a view). A part's own mesh (solo) carries its faces' ids, + 1 (0 = none).
     vertexShader: `
       attribute float faceId;
       varying vec3 vId;
       void main() {
-        float id = faceId;
+        float id = faceId > 0.5 ? faceId - 1.0 : float(gl_VertexID / 3);
         float r = mod(id, 256.0);
         float g = mod(floor(id / 256.0), 256.0);
         float b = floor(id / 65536.0);
@@ -681,6 +699,10 @@ function makePickMaterial(): THREE.ShaderMaterial {
       void main() { gl_FragColor = vec4(vId, 1.0); }
     `,
   });
+  // A mesh without the attribute reads 0 (not whatever another program left at that slot).
+  // (three sets any named default at draw time; its type lists only the built-in ones.)
+  (material.defaultAttributeValues as Record<string, number[]>).faceId = [0];
+  return material;
 }
 
 interface OverlayObjects {
@@ -890,6 +912,9 @@ function offsetMaterial(
 }
 
 interface ViewerState {
+  /** Form lines over the flat colours: wanted, and their buffers once first drawn. */
+  formLinesOn: boolean;
+  formLines: FormLines | null;
   /** Uniforms of the layer preview while it is on (shared by the material, updated in place). */
   layerUniforms: LayerUniforms | null;
   softUniforms: SoftUniforms;
@@ -916,7 +941,7 @@ interface ViewerState {
   /** The pieces of the faces cut along the border lines, drawn in their place. */
   cut: CutPieces | null;
   /** The colours the mesh was built with (the colour effect has nothing to do for these). */
-  coloursBuilt: Float32Array | null;
+  coloursBuilt: ColourBuffer | null;
   /** Tags over picked patches, placed after every frame. */
   callouts: PlacedCallout[];
   cursorGroup: THREE.Group;
@@ -1071,7 +1096,7 @@ interface CutPieces {
  * Takes the cut pieces away: the faces they stood for get their colours back
  * from `colours` (the colours as given, without the marks).
  */
-function dropCut(state: ViewerState, colours: Float32Array | null): void {
+function dropCut(state: ViewerState, colours: ColourBuffer | null): void {
   const cut = state.cut;
   if (!cut) return;
   state.scene.remove(cut.mesh);
@@ -1079,43 +1104,16 @@ function dropCut(state: ViewerState, colours: Float32Array | null): void {
   state.cut = null;
   const attribute = state.geometry?.getAttribute("color") as THREE.BufferAttribute | undefined;
   if (!attribute || !colours || attribute.array.length !== colours.length) return;
-  const array = attribute.array as Float32Array;
-  for (const f of cut.hidden) array.set(colours.subarray(f * 9, f * 9 + 9), f * 9);
+  const array = attribute.array as ColourBuffer;
+  for (const f of cut.hidden) array.set(colours.subarray(f * FACE_BYTES, (f + 1) * FACE_BYTES), f * FACE_BYTES);
   attribute.clearUpdateRanges();
   attribute.needsUpdate = true;
   const soft = state.geometry?.getAttribute("softColor") as THREE.BufferAttribute | undefined;
   if (soft && state.softTable && cut.softened.length > 0) {
-    for (const v of cut.softened) softenVertex(state.softTable, v, array, soft.array as Uint16Array);
+    for (const v of cut.softened) softenVertex(state.softTable, v, array, soft.array as Uint8Array);
     soft.clearUpdateRanges();
     soft.needsUpdate = true;
   }
-}
-
-/**
- * Each face's own normal at its three corners (the faces are drawn apart, so
- * this is what three's computeVertexNormals gives) — in one pass over the
- * positions: seven times quicker on a million faces, which a confirmed cut
- * (a new mesh of the same shape) waits for.
- */
-function setFlatNormals(geometry: THREE.BufferGeometry, positions: Float32Array): void {
-  const normals = new Float32Array(positions.length);
-  for (let o = 0; o < positions.length; o += 9) {
-    const ux = positions[o + 3] - positions[o], uy = positions[o + 4] - positions[o + 1], uz = positions[o + 5] - positions[o + 2];
-    const vx = positions[o + 6] - positions[o], vy = positions[o + 7] - positions[o + 1], vz = positions[o + 8] - positions[o + 2];
-    let x = uy * vz - uz * vy;
-    let y = uz * vx - ux * vz;
-    let z = ux * vy - uy * vx;
-    const length = Math.hypot(x, y, z);
-    if (length > 0) {
-      x /= length;
-      y /= length;
-      z /= length;
-    }
-    normals[o] = normals[o + 3] = normals[o + 6] = x;
-    normals[o + 1] = normals[o + 4] = normals[o + 7] = y;
-    normals[o + 2] = normals[o + 5] = normals[o + 8] = z;
-  }
-  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
 }
 
 /** The bounding sphere as three works it out (centre of the box, the farthest point from it), in plain loops. */
@@ -1147,7 +1145,7 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
   const attribute = geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
   if (!attribute) return;
   const pieceCount = cut.parentFace.length;
-  if (cut.positions.length !== pieceCount * 9 || cut.colours.length !== pieceCount * 9) return;
+  if (cut.positions.length !== pieceCount * 9 || cut.colours.length !== pieceCount * FACE_BYTES) return;
   const runs = new Map<number, [number, number]>();
   for (let p = 0; p < pieceCount; p++) {
     const f = cut.parentFace[p];
@@ -1156,23 +1154,23 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
     if (run) run[1]++;
     else runs.set(f, [p, 1]);
   }
-  const array = attribute.array as Float32Array;
+  const array = attribute.array as ColourBuffer;
   const hidden = Int32Array.from(runs.keys());
   for (const f of hidden) {
-    array[f * 9] = -1;
-    array[f * 9 + 3] = -1;
-    array[f * 9 + 6] = -1;
+    array[f * FACE_BYTES + 3] = 0;
+    array[f * FACE_BYTES + 7] = 0;
+    array[f * FACE_BYTES + 11] = 0;
   }
   attribute.clearUpdateRanges();
   attribute.needsUpdate = true;
   const pieces = new THREE.BufferGeometry();
   pieces.setAttribute("position", new THREE.BufferAttribute(cut.positions, 3));
-  pieces.setAttribute("color", new THREE.BufferAttribute(cut.colours.slice(), 3));
+  pieces.setAttribute("color", new THREE.BufferAttribute(cut.colours.slice(), CORNER_BYTES, true));
   let softened = new Int32Array(0);
   const mainSoft = geometry.getAttribute("softColor") as THREE.BufferAttribute | undefined;
   if (mainSoft) {
-    const soft = new Uint16Array(pieceCount * 3 * SOFT_STRIDE);
-    const quantise = (x: number) => Math.round(Math.max(0, Math.min(1, x)) * 65535);
+    const soft = new Uint8Array(pieceCount * 3 * SOFT_STRIDE).fill(255);
+    const quantise = (x: number) => linearToSrgbByte(x);
     const table = state.softTable;
     const corners = cut.corners && cut.corners.length === pieceCount * 3 ? cut.corners : null;
     if (table && corners) {
@@ -1187,11 +1185,11 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
           sums.set(v, s);
           if (v < vertexCount)
             for (let i = table.offsets[v]; i < table.offsets[v + 1]; i++) {
-              const o = table.corners[i] * 3;
-              if (array[o] < 0) continue; // drawn as pieces
-              s[0] += array[o];
-              s[1] += array[o + 1];
-              s[2] += array[o + 2];
+              const o = table.corners[i] * CORNER_BYTES;
+              if (array[o + 3] === 0) continue; // drawn as pieces
+              s[0] += SRGB_TO_LINEAR[array[o]];
+              s[1] += SRGB_TO_LINEAR[array[o + 1]];
+              s[2] += SRGB_TO_LINEAR[array[o + 2]];
               s[3]++;
             }
         }
@@ -1199,9 +1197,9 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
       };
       for (let c = 0; c < pieceCount * 3; c++) {
         const s = sum(corners[c]);
-        s[0] += cut.colours[c * 3];
-        s[1] += cut.colours[c * 3 + 1];
-        s[2] += cut.colours[c * 3 + 2];
+        s[0] += SRGB_TO_LINEAR[cut.colours[c * CORNER_BYTES]];
+        s[1] += SRGB_TO_LINEAR[cut.colours[c * CORNER_BYTES + 1]];
+        s[2] += SRGB_TO_LINEAR[cut.colours[c * CORNER_BYTES + 2]];
         s[3]++;
       }
       const meanOf = (v: number, k: number) => {
@@ -1209,7 +1207,7 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
         return quantise(s[k] / s[3]);
       };
       for (let c = 0; c < pieceCount * 3; c++) for (let k = 0; k < 3; k++) soft[c * SOFT_STRIDE + k] = meanOf(corners[c], k);
-      const out = mainSoft.array as Uint16Array;
+      const out = mainSoft.array as Uint8Array;
       const touched: number[] = [];
       for (const v of sums.keys()) {
         if (v >= vertexCount) continue;
@@ -1224,11 +1222,10 @@ function showCut(state: ViewerState, cut: ViewerCut): void {
       mainSoft.needsUpdate = true;
     } else {
       // No vertex numbers: each piece its own colour at its corners.
-      for (let c = 0; c < pieceCount * 3; c++) for (let k = 0; k < 3; k++) soft[c * SOFT_STRIDE + k] = quantise(cut.colours[c * 3 + k]);
+      for (let c = 0; c < pieceCount * 3; c++) for (let k = 0; k < 3; k++) soft[c * SOFT_STRIDE + k] = cut.colours[c * CORNER_BYTES + k];
     }
     pieces.setAttribute("softColor", new THREE.BufferAttribute(soft, SOFT_STRIDE, true));
   }
-  pieces.computeVertexNormals();
   pieces.boundingSphere = geometry.boundingSphere?.clone() ?? null;
   const mesh = new THREE.Mesh(pieces, state.mesh.material);
   mesh.frustumCulled = false;
@@ -1242,20 +1239,181 @@ function hideCutPieces(state: ViewerState, faces: ArrayLike<number>): void {
   const cut = state.cut;
   if (!cut) return;
   const attribute = cut.mesh.geometry.getAttribute("color") as THREE.BufferAttribute;
-  const array = attribute.array as Float32Array;
+  const array = attribute.array as ColourBuffer;
   let changed = false;
   for (let i = 0; i < faces.length; i++) {
     const run = cut.runs.get(faces[i]);
-    if (!run || array[run[0] * 9] < 0) continue;
+    if (!run || array[run[0] * FACE_BYTES + 3] === 0) continue;
     for (let p = run[0]; p < run[0] + run[1]; p++) {
-      array[p * 9] = -1;
-      array[p * 9 + 3] = -1;
-      array[p * 9 + 6] = -1;
+      array[p * FACE_BYTES + 3] = 0;
+      array[p * FACE_BYTES + 7] = 0;
+      array[p * FACE_BYTES + 11] = 0;
     }
-    attribute.addUpdateRange(run[0] * 9, run[1] * 9);
+    attribute.addUpdateRange(run[0] * FACE_BYTES, run[1] * FACE_BYTES);
     changed = true;
   }
   if (changed) attribute.needsUpdate = true;
+}
+
+/**
+ * Form lines over flat colours (11-05, the owner: "명암 보기를 켠 상태에서 상상해서 칠한다" — flat colours
+ * show no shape, shading changes the colours).  The model is drawn a second time, unseen, into a picture of
+ * which way its surface faces and how far it is; thin lines then go on top where the surface folds, where
+ * it turns away from the eye (a gear tooth's outline, the wall of a sunk ring) and where one thing stands
+ * in front of another.  Between the lines the colours stay exactly as they are: dark lines on light
+ * colours, light ones on dark.
+ */
+const LINE_LAYER = 5;
+/** How squarely (cos) the surface faces the eye where it is said to turn away. */
+const LINE_TURN = 0.22;
+
+interface FormLines {
+  target: THREE.WebGLRenderTarget;
+  surface: THREE.ShaderMaterial;
+  quadScene: THREE.Scene;
+  quadCamera: THREE.OrthographicCamera;
+  composite: THREE.ShaderMaterial;
+}
+
+const FORM_SURFACE_VERTEX = `
+${SRGB_LINEAR_GLSL}
+varying vec3 vView;
+varying float vLight;
+void main() {
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  vView = mv.xyz;
+  vLight = 0.5;
+  gl_Position = projectionMatrix * mv;
+  // The colour buffer: sRGB RGBA bytes, alpha 0 = a face drawn nowhere (its cut pieces show).
+  #if defined( USE_COLOR_ALPHA )
+    vLight = dot(gyuLinear(color.rgb), vec3(0.2126, 0.7152, 0.0722));
+    if (color.a < 0.5) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+  #elif defined( USE_COLOR )
+    vLight = dot(gyuLinear(color), vec3(0.2126, 0.7152, 0.0722));
+  #endif
+}
+`;
+// rgb: the way the surface faces; a: how squarely it faces the eye (0..0.49), + 0.5 on a light colour.
+const FORM_SURFACE_FRAGMENT = `
+varying vec3 vView;
+varying float vLight;
+void main() {
+  // The face's own facing (the mesh carries no normals).
+  vec3 n = normalize(cross(dFdx(vView), dFdy(vView)));
+  float facing = dot(n, normalize(-vView));
+  if (facing < 0.0) {
+    n = -n;
+    facing = -facing;
+  }
+  gl_FragColor = vec4(n * 0.5 + 0.5, min(facing, 1.0) * 0.49 + (vLight > 0.05 ? 0.5 : 0.0));
+}
+`;
+const FORM_LINES_FRAGMENT = `
+#include <packing>
+uniform sampler2D tSurface;
+uniform sampler2D tDepth;
+uniform vec2 uTexel;
+uniform float uNear;
+uniform float uFar;
+varying vec2 vUv;
+// 1 / distance: on a flat surface it runs straight across the picture, so where it bends one thing is in front of another.
+float nearness(float depth) { return -1.0 / perspectiveDepthToViewZ(depth, uNear, uFar); }
+float facingOf(float a) { return (a - (a >= 0.5 ? 0.5 : 0.0)) / 0.49; }
+void main() {
+  float d0 = texture2D(tDepth, vUv).x;
+  if (d0 >= 1.0) discard;
+  vec4 s0 = texture2D(tSurface, vUv);
+  vec3 n0 = s0.rgb * 2.0 - 1.0;
+  float f0 = facingOf(s0.a);
+  float w0 = nearness(d0);
+  float edge = 0.0;
+  float w[4];
+  vec3 n[4];
+  for (int i = 0; i < 4; i++) {
+    // Two pixels out: a rounded edge bends over a few pixels, not in one.
+    vec2 off = 2.0 * (i == 0 ? vec2(uTexel.x, 0.0) : i == 1 ? vec2(-uTexel.x, 0.0) : i == 2 ? vec2(0.0, uTexel.y) : vec2(0.0, -uTexel.y));
+    float di = texture2D(tDepth, vUv + off).x;
+    if (di >= 1.0) {
+      // The outline against the background.
+      edge = 1.0;
+      w[i] = w0;
+      n[i] = n0;
+      continue;
+    }
+    w[i] = nearness(di);
+    vec4 si = texture2D(tSurface, vUv + off);
+    n[i] = si.rgb * 2.0 - 1.0;
+    // Where the surface turns away (drawn on the turned side only).
+    float fi = facingOf(si.a);
+    if (f0 < ${LINE_TURN} && fi >= ${LINE_TURN}) edge = max(edge, 0.85);
+  }
+  // A fold: the surface on one side of this pixel faces another way than on the other side.
+  float fold = max(1.0 - dot(n[0], n[1]), 1.0 - dot(n[2], n[3]));
+  edge = max(edge, smoothstep(0.05, 0.22, fold));
+  // One thing in front of another.
+  float bend = max(abs(w[0] + w[1] - 2.0 * w0), abs(w[2] + w[3] - 2.0 * w0)) / w0;
+  edge = max(edge, smoothstep(0.006, 0.03, bend));
+  if (edge < 0.05) discard;
+  gl_FragColor = s0.a >= 0.5 ? vec4(0.0, 0.0, 0.0, 0.62 * edge) : vec4(1.0, 1.0, 1.0, 0.55 * edge);
+}
+`;
+
+function makeFormLines(): FormLines {
+  const target = new THREE.WebGLRenderTarget(1, 1, { depthTexture: new THREE.DepthTexture(1, 1), minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, generateMipmaps: false });
+  const surface = new THREE.ShaderMaterial({ vertexShader: FORM_SURFACE_VERTEX, fragmentShader: FORM_SURFACE_FRAGMENT, vertexColors: true, side: THREE.DoubleSide });
+  const composite = new THREE.ShaderMaterial({
+    vertexShader: "varying vec2 vUv;\nvoid main() {\n  vUv = uv;\n  gl_Position = vec4(position.xy, 0.0, 1.0);\n}",
+    fragmentShader: FORM_LINES_FRAGMENT,
+    uniforms: { tSurface: { value: null }, tDepth: { value: null }, uTexel: { value: new THREE.Vector2(1, 1) }, uNear: { value: 0.1 }, uFar: { value: 1000 } },
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const quadScene = new THREE.Scene();
+  quadScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), composite));
+  return { target, surface, quadScene, quadCamera: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1), composite };
+}
+
+function disposeFormLines(lines: FormLines): void {
+  lines.target.depthTexture?.dispose();
+  lines.target.dispose();
+  lines.surface.dispose();
+  lines.composite.dispose();
+  for (const child of lines.quadScene.children) (child as THREE.Mesh).geometry.dispose();
+}
+
+/** The unseen picture of the surface: the model meshes only (no highlights or cursors), the part alone when one is shown up close. */
+function drawFormSurface(state: ViewerState, lines: FormLines): void {
+  const { renderer, scene, camera } = state;
+  const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+  if (lines.target.width !== size.x || lines.target.height !== size.y) lines.target.setSize(size.x, size.y);
+  const meshes = (state.focusMesh ? [state.focusMesh, state.stroke?.mesh] : [state.mesh, state.cut?.mesh, state.stroke?.mesh]).filter((m): m is THREE.Mesh => !!m);
+  for (const mesh of meshes) mesh.layers.enable(LINE_LAYER);
+  const mask = camera.layers.mask;
+  camera.layers.set(LINE_LAYER);
+  const background = scene.background;
+  scene.background = null;
+  scene.overrideMaterial = lines.surface;
+  renderer.setRenderTarget(lines.target);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  scene.overrideMaterial = null;
+  scene.background = background;
+  camera.layers.mask = mask;
+  for (const mesh of meshes) mesh.layers.disable(LINE_LAYER);
+}
+
+function drawFormLines(state: ViewerState, lines: FormLines): void {
+  const u = lines.composite.uniforms;
+  u.tSurface.value = lines.target.texture;
+  u.tDepth.value = lines.target.depthTexture;
+  (u.uTexel.value as THREE.Vector2).set(1 / lines.target.width, 1 / lines.target.height);
+  u.uNear.value = state.camera.near;
+  u.uFar.value = state.camera.far;
+  const autoClear = state.renderer.autoClear;
+  state.renderer.autoClear = false;
+  state.renderer.render(lines.quadScene, lines.quadCamera);
+  state.renderer.autoClear = autoClear;
 }
 
 function requestRender(state: ViewerState): void {
@@ -1273,7 +1431,11 @@ function requestRender(state: ViewerState): void {
       state.cut.mesh.visible = state.mesh.visible;
     }
     if (state.pointerMark.visible) fitPointerMark(state);
+    // Not over the layer preview (its layers above the cut are not drawn, the unseen picture would have them).
+    const lines = state.formLinesOn && !state.layerUniforms && (state.mesh || state.focusMesh) ? (state.formLines ??= makeFormLines()) : null;
+    if (lines) drawFormSurface(state, lines);
     state.renderer.render(state.scene, state.camera);
+    if (lines) drawFormLines(state, lines);
     placeCallouts(state);
     // Camera position, readable from outside (debugging / tests).
     const p = state.camera.position;
@@ -1577,8 +1739,8 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   // A face shown cut: the piece the point is on (they lie in the face's plane).
   // (Pieces stepped aside for paint are marked below zero: the face shows as it is.)
   const run = cutShown ? state.cut?.runs.get(id) : undefined;
-  const pieceColours = state.cut ? ((state.cut.mesh.geometry.getAttribute("color") as THREE.BufferAttribute).array as Float32Array) : null;
-  const piece = run && state.cut && pieceColours && pieceColours[run[0] * 9] >= 0 ? pieceAt(state.cut.positions, run[0], run[1], [point.x, point.y, point.z]) : undefined;
+  const pieceColours = state.cut ? ((state.cut.mesh.geometry.getAttribute("color") as THREE.BufferAttribute).array as ColourBuffer) : null;
+  const piece = run && state.cut && pieceColours && pieceColours[run[0] * FACE_BYTES + 3] > 0 ? pieceAt(state.cut.positions, run[0], run[1], [point.x, point.y, point.z]) : undefined;
   return { faceIndex: id, point: [point.x, point.y, point.z], normal: [normal.x, normal.y, normal.z], piece, bary: barycentric(point, a, b, c) };
 }
 
@@ -1628,7 +1790,7 @@ function fitPointerMark(state: ViewerState): void {
 }
 
 export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function MeshViewer(
-  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
+  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, formLines = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
   ref,
 ) {
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1657,20 +1819,22 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
    * paint) but not sent to the GPU: the stroke preview shows these faces until
    * the new colours arrive.
    */
-  function paintFaces(faces: ArrayLike<number>, colourOf: (i: number) => number[]): void {
+  function paintFaces(faces: ArrayLike<number>, colourOf: (i: number) => ArrayLike<number>): void {
     const state = stateRef.current;
     if (!state?.geometry) return;
     const attribute = state.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
     if (!attribute) return;
-    const array = attribute.array as Float32Array;
+    const array = attribute.array as ColourBuffer;
     for (let i = 0; i < faces.length; i++) {
-      const o = faces[i] * 9;
-      if (o + 9 > array.length) continue;
-      const [r, g, b] = colourOf(i);
+      const o = faces[i] * FACE_BYTES;
+      if (o + FACE_BYTES > array.length) continue;
+      const c = colourOf(i);
+      const r = c[0], g = c[1], b = c[2];
       for (let k = 0; k < 3; k++) {
-        array[o + k * 3] = r;
-        array[o + k * 3 + 1] = g;
-        array[o + k * 3 + 2] = b;
+        array[o + k * 4] = r;
+        array[o + k * 4 + 1] = g;
+        array[o + k * 4 + 2] = b;
+        array[o + k * 4 + 3] = 255;
       }
     }
     // The soft borders around the paint, worked out again for the corners
@@ -1680,7 +1844,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const table = state.softTable;
     let shown: ArrayLike<number> = faces;
     if (soft && table) {
-      const out = soft.array as Uint16Array;
+      const out = soft.array as Uint8Array;
       const vertices = new Set<number>();
       for (let i = 0; i < faces.length; i++) {
         const c = faces[i] * 3;
@@ -1707,16 +1871,15 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     ref,
     () => ({
       setFaceColours(faces, rgb) {
-        const linear = [srgbToLinear(rgb[0]), srgbToLinear(rgb[1]), srgbToLinear(rgb[2])];
-        paintFaces(faces, () => linear);
+        paintFaces(faces, () => rgb);
       },
       setFaceColourList(faces, rgbs) {
-        const linear = [0, 0, 0];
+        const one = [0, 0, 0];
         paintFaces(faces, (i) => {
-          linear[0] = srgbToLinear(rgbs[i * 3]);
-          linear[1] = srgbToLinear(rgbs[i * 3 + 1]);
-          linear[2] = srgbToLinear(rgbs[i * 3 + 2]);
-          return linear;
+          one[0] = rgbs[i * 3];
+          one[1] = rgbs[i * 3 + 1];
+          one[2] = rgbs[i * 3 + 2];
+          return one;
         });
       },
       setBrushCursor(cursor) {
@@ -1848,6 +2011,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     controls.enableDamping = false;
 
     const state: ViewerState = {
+      formLinesOn: false,
+      formLines: null,
       renderer,
       scene,
       camera,
@@ -2047,6 +2212,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         state.focusMesh.geometry.dispose();
         (state.focusMesh.material as THREE.Material).dispose();
       }
+      if (state.formLines) disposeFormLines(state.formLines);
       renderer.dispose();
       renderer.domElement.remove();
       stateRef.current = null;
@@ -2103,28 +2269,20 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     // A copy: later colour changes are written into this array in place, and it
     // must not be the caller's own buffer (that would overwrite, say, the
     // palette colours with a drag preview and leave them that way).
-    const colourArray = colours && colours.length === positions.length ? colours.slice() : new Float32Array(positions.length).fill(0.6);
+    const colourArray = colours && colours.length === faceCount * FACE_BYTES ? colours.slice() : greyColours(faceCount);
     // Only for the colour effect of this same commit (it runs right after, in the same task).
     state.coloursBuilt = colours;
     queueMicrotask(() => {
       if (state.coloursBuilt === colours) state.coloursBuilt = null;
     });
-    geometry.setAttribute("color", new THREE.BufferAttribute(colourArray, 3));
-    const ids = new Float32Array(faceCount * 3);
-    for (let i = 0; i < faceCount; i++) {
-      ids[i * 3] = i;
-      ids[i * 3 + 1] = i;
-      ids[i * 3 + 2] = i;
-    }
-    geometry.setAttribute("faceId", new THREE.BufferAttribute(ids, 1));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colourArray, CORNER_BYTES, true));
     const corners = cornerVertexRef.current;
     state.softTable = corners && corners.length * 3 === positions.length ? vertexCornersFor(corners) : null;
     if (state.softTable) {
-      const soft = new Uint16Array((positions.length / 3) * SOFT_STRIDE);
+      const soft = new Uint8Array((positions.length / 3) * SOFT_STRIDE);
       softenAll(state.softTable, colourArray, soft);
       geometry.setAttribute("softColor", new THREE.BufferAttribute(soft, SOFT_STRIDE, true));
     }
-    setFlatNormals(geometry, positions);
     setBoundingSphere(geometry, positions);
     const sphere = geometry.boundingSphere;
     state.bounds = sphere ? { center: sphere.center.clone(), radius: Math.max(1e-3, sphere.radius) } : null;
@@ -2203,6 +2361,13 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     requestRender(state);
   }, [softEdges]);
 
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    state.formLinesOn = formLines;
+    requestRender(state);
+  }, [formLines]);
+
   // Flat (unlit) vs shaded material.
   useEffect(() => {
     const state = stateRef.current;
@@ -2242,29 +2407,27 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       let count = 0;
       for (let f = 0; f < mask.length; f++) if (mask[f]) count++;
       const pos = new Float32Array(count * 9);
-      const col = new Float32Array(count * 9);
       const ids = new Float32Array(count * 3);
-      const source = colours && colours.length === positions.length ? colours : null;
-      const softSource = (state.geometry?.getAttribute("softColor") as THREE.BufferAttribute | undefined)?.array as Uint16Array | undefined;
-      const softCol = softSource && softSource.length === (positions.length / 3) * SOFT_STRIDE ? new Uint16Array(count * 3 * SOFT_STRIDE) : null;
+      const source = colours && colours.length === (positions.length / 9) * FACE_BYTES ? colours : null;
+      const col = source ? new Uint8Array(count * FACE_BYTES) : greyColours(count);
+      const softSource = (state.geometry?.getAttribute("softColor") as THREE.BufferAttribute | undefined)?.array as Uint8Array | undefined;
+      const softCol = softSource && softSource.length === (positions.length / 3) * SOFT_STRIDE ? new Uint8Array(count * 3 * SOFT_STRIDE) : null;
       let p = 0;
       for (let f = 0; f < mask.length; f++) {
         if (!mask[f]) continue;
         const o = f * 9;
-        for (let k = 0; k < 9; k++) {
-          pos[p + k] = positions[o + k];
-          col[p + k] = source ? source[o + k] : 0.6;
-        }
+        for (let k = 0; k < 9; k++) pos[p + k] = positions[o + k];
+        if (source) col.set(source.subarray(f * FACE_BYTES, (f + 1) * FACE_BYTES), (p / 9) * FACE_BYTES);
         if (softCol && softSource) softCol.set(softSource.subarray((o / 9) * 3 * SOFT_STRIDE, (o / 9 + 1) * 3 * SOFT_STRIDE), (p / 9) * 3 * SOFT_STRIDE);
-        ids.fill(f, p / 3, p / 3 + 3);
+        // + 1: 0 means "no id, use the vertex's place" (makePickMaterial).
+        ids.fill(f + 1, p / 3, p / 3 + 3);
         p += 9;
       }
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-      geometry.setAttribute("color", new THREE.BufferAttribute(col, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(col, CORNER_BYTES, true));
       geometry.setAttribute("faceId", new THREE.BufferAttribute(ids, 1));
       if (softCol) geometry.setAttribute("softColor", new THREE.BufferAttribute(softCol, SOFT_STRIDE, true));
-      geometry.computeVertexNormals();
       const focusMesh = new THREE.Mesh(geometry, makeMeshMaterial(flat, null, softCol ? state.softUniforms : null));
       focusMesh.renderOrder = 1;
       state.scene.add(focusMesh);
@@ -2319,15 +2482,15 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     state.coloursBuilt = null;
     const attribute = state.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
     if (attribute && attribute.array.length === colours.length) {
-      (attribute.array as Float32Array).set(colours);
+      (attribute.array as ColourBuffer).set(colours);
       attribute.clearUpdateRanges();
       attribute.needsUpdate = true;
     } else {
-      state.geometry.setAttribute("color", new THREE.BufferAttribute(colours.slice(), 3));
+      state.geometry.setAttribute("color", new THREE.BufferAttribute(colours.slice(), CORNER_BYTES, true));
     }
     const soft = state.geometry.getAttribute("softColor") as THREE.BufferAttribute | undefined;
-    if (soft && state.softTable && soft.array.length === (colours.length / 3) * SOFT_STRIDE) {
-      softenAll(state.softTable, colours, soft.array as Uint16Array);
+    if (soft && state.softTable && soft.array.length === (colours.length / CORNER_BYTES) * SOFT_STRIDE) {
+      softenAll(state.softTable, colours, soft.array as Uint8Array);
       soft.clearUpdateRanges();
       soft.needsUpdate = true;
     }

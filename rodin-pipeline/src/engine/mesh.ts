@@ -51,25 +51,58 @@ export function srgbToLinear(v: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-/** Non-indexed linear colour buffer for the viewer (3 corners per face). */
-export function buildColourBuffer(faceCount: number, colourOfFace: (index: number) => RGB): Float32Array {
-  const out = new Float32Array(faceCount * 9);
-  const cache = new Map<number, [number, number, number]>();
+/**
+ * A view's face colours (non-indexed: each face's three corners), as RGBA bytes — the file's own sRGB values, made
+ * linear in the shader (ui/colourShader.ts).  Alpha 0 marks a face drawn nowhere (its cut pieces show instead).
+ * 12 bytes a face where linear floats took 36 (11-05: four such buffers were 664 MB on a 4.6 M-face model).
+ */
+export type ColourBuffer = Uint8Array;
+/** Bytes a corner, and a face, in a colour buffer. */
+export const CORNER_BYTES = 4;
+export const FACE_BYTES = 12;
+
+/** sRGB byte → linear, for averaging colours (soft borders) and dimming. */
+export const SRGB_TO_LINEAR = (() => {
+  const out = new Float32Array(256);
+  for (let i = 0; i < 256; i++) out[i] = srgbToLinear(i);
+  return out;
+})();
+/** Linear (0..1, 4096 steps) → sRGB byte. */
+const LINEAR_TO_SRGB = (() => {
+  const out = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) {
+    const c = i / 4096;
+    const v = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+    out[i] = Math.round(Math.max(0, Math.min(1, v)) * 255);
+  }
+  return out;
+})();
+export function linearToSrgbByte(v: number): number {
+  return LINEAR_TO_SRGB[Math.round(Math.max(0, Math.min(1, v)) * 4096)];
+}
+
+/** The colour buffer for the viewer (3 corners per face, RGBA bytes). */
+export function buildColourBuffer(faceCount: number, colourOfFace: (index: number) => RGB): ColourBuffer {
+  const out = new Uint8Array(faceCount * FACE_BYTES);
   let p = 0;
   for (let i = 0; i < faceCount; i++) {
     const rgb = colourOfFace(i);
-    const key = colourKey(rgb);
-    let lin = cache.get(key);
-    if (!lin) {
-      lin = [srgbToLinear(rgb[0]), srgbToLinear(rgb[1]), srgbToLinear(rgb[2])];
-      cache.set(key, lin);
-    }
+    const r = rgb[0], g = rgb[1], b = rgb[2];
     for (let k = 0; k < 3; k++) {
-      out[p++] = lin[0];
-      out[p++] = lin[1];
-      out[p++] = lin[2];
+      out[p++] = r;
+      out[p++] = g;
+      out[p++] = b;
+      out[p++] = 255;
     }
   }
+  return out;
+}
+
+/** Each face's colour in a colour buffer as one number (its first corner): enough to tell which faces changed. */
+export function packedFaceColours(buffer: ColourBuffer): Uint32Array {
+  const n = Math.floor(buffer.length / FACE_BYTES);
+  const out = new Uint32Array(n);
+  for (let f = 0, o = 0; f < n; f++, o += FACE_BYTES) out[f] = (buffer[o] << 16) | (buffer[o + 1] << 8) | buffer[o + 2];
   return out;
 }
 
@@ -140,14 +173,15 @@ export function representativeColoursByPosition(
 }
 
 /** Writes one colour into a colour buffer for these faces (a brush stroke's faces); the buffer stays the same object. */
-export function patchColourBuffer(buffer: Float32Array, faces: ArrayLike<number>, rgb: RGB): Float32Array {
-  const r = srgbToLinear(rgb[0]), g = srgbToLinear(rgb[1]), b = srgbToLinear(rgb[2]);
+export function patchColourBuffer(buffer: ColourBuffer, faces: ArrayLike<number>, rgb: RGB): ColourBuffer {
+  const r = rgb[0], g = rgb[1], b = rgb[2];
   for (let i = 0; i < faces.length; i++) {
-    let p = faces[i] * 9;
+    let p = faces[i] * FACE_BYTES;
     for (let k = 0; k < 3; k++) {
       buffer[p++] = r;
       buffer[p++] = g;
       buffer[p++] = b;
+      buffer[p++] = 255;
     }
   }
   return buffer;
@@ -534,6 +568,22 @@ export interface FaceGeometry {
   normals: Float32Array;
   /** Half of the largest bounding-box extent: a size reference for brush radii. */
   radius: number;
+}
+
+/** Half the model's largest extent (as faceGeometry's radius), from its vertices alone. */
+export function modelRadius(model: MeshModel): number {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (const v of model.vertices) {
+    if (v[0] < minX) minX = v[0];
+    if (v[0] > maxX) maxX = v[0];
+    if (v[1] < minY) minY = v[1];
+    if (v[1] > maxY) maxY = v[1];
+    if (v[2] < minZ) minZ = v[2];
+    if (v[2] > maxZ) maxZ = v[2];
+  }
+  const extent = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
+  return Number.isFinite(extent) ? extent / 2 : 1;
 }
 
 export function faceGeometry(model: MeshModel): FaceGeometry {

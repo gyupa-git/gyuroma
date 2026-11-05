@@ -59,6 +59,23 @@ export interface TidyChanges {
   creaseSnap?: number;
   /** A part up close: its blobs (by number) grouped into pieces, each one colour. */
   pieces?: Array<{ name: string; blobs: number[]; colour: string }>;
+  /**
+   * 🤖 every part up close: each part's blobs (by number, its own numbering) in a colour of the
+   * model's palette.  What a part leaves out (a blob blurred across two things) takes the colour
+   * of the side next to it that is cheapest to reach.
+   */
+  assign?: Array<{ part: string; blobs: number[]; colour: string; what?: string; mine?: boolean }>;
+  /**
+   * 🤖 a thing pointed at on a picture (a bag's stripe, a brooch's dot): the face under the point, spread
+   * over the model's own colour of that thing (a magic wand), in this colour — over what the votes gave.
+   */
+  marks?: Array<{ part: string; seed: number; colour: string; what?: string; shaded?: boolean }>;
+  /**
+   * 💬 a thing to paint that no blob or cell holds alone (a thin white rim round an eye): the app asks again with
+   * a grid on the part's original pictures, the AI points at it, and the points become `marks` (11-05, the owner:
+   * "색이 안 잡힌다는 이유로 아무것도 안 했어 — 직접 영역을 잡아서 칠해야지").  Never left in a plan that is applied.
+   */
+  fix?: Array<{ part: string; what: string; colour: string; problem: string }>;
   /** A group's colour changed (every face of it, the group stays). */
   recolour?: Array<{ hex: string; to: string }>;
   mix?: TidyMixChanges;
@@ -245,7 +262,7 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
   const mix = scope === "mix" || scope === "both";
   const exporting = scope === "export";
 
-  const cleanKeys = ["target", "minBlob", "smoothing", "smoothProtected", "trimTeeth", "lineSmooth", "protect", "unprotect", "merge", "parts", "partTidy", "paint", "pits", "creaseSnap", "pieces", "recolour"];
+  const cleanKeys = ["target", "minBlob", "smoothing", "smoothProtected", "trimTeeth", "lineSmooth", "protect", "unprotect", "merge", "parts", "partTidy", "paint", "pits", "creaseSnap", "pieces", "assign", "marks", "fix", "recolour"];
   if (!clean && cleanKeys.some((k) => r[k] !== undefined && !(Array.isArray(r[k]) && (r[k] as unknown[]).length === 0))) dropped.push(t(exporting ? "tidy.drop.cleanElsewhere" : "tidy.drop.cleanInMix"));
   if (clean) {
     const target = num(r.target);
@@ -295,6 +312,26 @@ export function sanitizeChanges(raw: unknown, context: TidyContext, scope: TidyS
     const pieces = piecesRaw.filter((m) => m.blobs.length > 0 && HEX.test(m.colour));
     if (pieces.length < piecesRaw.length) dropped.push(t("tidy.drop.badPiece"));
     if (pieces.length) changes.pieces = pieces;
+    // 🤖 every part up close: blobs by each part's own numbering (the part's blob map checks the numbers).
+    const assign = objects(r.assign)
+      .map((m) => ({
+        part: String(m.part ?? "").trim(),
+        blobs: Array.isArray(m.blobs) ? [...new Set(m.blobs.map((v) => Math.round(Number(v))).filter((id) => id >= 1))] : [],
+        colour: String(m.colour ?? "").toUpperCase(),
+        what: m.what === undefined ? undefined : String(m.what).slice(0, 20),
+        ...(m.mine === false ? { mine: false } : {}),
+      }))
+      .filter((m) => partNames.has(m.part) && m.blobs.length > 0 && HEX.test(m.colour));
+    if (assign.length) changes.assign = assign;
+    const marks = objects(r.marks)
+      .map((m) => ({ part: String(m.part ?? "").trim(), seed: Math.round(Number(m.seed)), colour: String(m.colour ?? "").toUpperCase(), what: m.what === undefined ? undefined : String(m.what).slice(0, 20), ...(m.shaded === true ? { shaded: true } : {}) }))
+      .filter((m) => partNames.has(m.part) && m.seed >= 0 && HEX.test(m.colour));
+    if (marks.length) changes.marks = marks;
+    const fix = objects(r.fix)
+      .map((m) => ({ part: String(m.part ?? "").trim(), what: String(m.what ?? "").trim().slice(0, 30), colour: String(m.colour ?? "").toUpperCase(), problem: String(m.problem ?? "").trim().slice(0, 200) }))
+      .filter((m) => partNames.has(m.part) && m.what && HEX.test(m.colour))
+      .slice(0, 6);
+    if (fix.length) changes.fix = fix;
     if (relayout && (protect.length || unprotect.length || merge.length || partTidyRaw.length || paintRaw.length || recolourRaw.length)) {
       dropped.push(t("tidy.drop.relayout"));
     } else {
@@ -479,11 +516,29 @@ export function describeChanges(changes: TidyChanges, context: TidyContext, t: T
   for (const m of changes.paint ?? [])
     lines.push({ key: "paint", label: t("tidy.line.paint", { cells: m.cells.join("·") }), from: m.from?.length ? m.from.join(" ") : t("tidy.val.allColours"), to: m.into });
   for (const m of changes.pieces ?? []) lines.push({ key: "pieces", label: t("tidy.line.piece", { name: m.name || "?", blobs: m.blobs.join("·") }), from: m.blobs.map((id) => context.focus?.blobs[id - 1]?.mean).filter(Boolean).slice(0, 2).join(" ") || "—", to: m.colour });
+  // 🤖 every part up close: one line a part (the colours its blobs got, biggest first).
+  const assignedBy = new Map<string, Map<string, number>>();
+  for (const m of changes.assign ?? []) {
+    const row = assignedBy.get(m.part) ?? new Map<string, number>();
+    row.set(m.colour, (row.get(m.colour) ?? 0) + m.blobs.length);
+    assignedBy.set(m.part, row);
+  }
+  for (const [part, row] of assignedBy) {
+    const now = shapePart.get(part);
+    lines.push({
+      key: "assign",
+      label: t("tidy.line.assign", { part }),
+      from: now ? t("tidy.val.coloursN", { n: now.colours.filter((c) => c.pct >= 0.5).length }) : "—",
+      to: [...row].sort((a, b) => b[1] - a[1]).map(([hex]) => hex).join(" "),
+    });
+  }
+  for (const m of changes.marks ?? []) lines.push({ key: "marks", label: t("tidy.line.mark", { part: m.part, what: m.what || "?" }), from: "—", to: m.colour });
+  for (const m of changes.fix ?? []) lines.push({ key: "fix", label: t("tidy.line.fix", { part: m.part, what: m.what }), from: "—", to: m.colour });
   for (const m of changes.pits ?? []) {
     const pits = m.ids.map((id) => context.pits?.[id - 1]).filter(Boolean);
     lines.push({ key: "pits", label: t("tidy.line.pits", { ids: m.ids.join("·") }), from: pits.map((p) => p?.own).filter(Boolean).slice(0, 2).join(" ") || "—", to: m.into });
   }
-  if (changes.creaseSnap !== undefined) lines.push({ key: "creaseSnap", label: t("tidy.line.creaseSnap"), from: t("tidy.val.off"), to: changes.creaseSnap > 0 ? t("tidy.val.rings", { n: changes.creaseSnap }) : t("tidy.val.off") });
+  if (changes.creaseSnap) lines.push({ key: "creaseSnap", label: t("tidy.line.creaseSnap"), from: t("tidy.val.off"), to: changes.creaseSnap > 0 ? t("tidy.val.rings", { n: changes.creaseSnap }) : t("tidy.val.off") });
   for (const m of changes.recolour ?? []) lines.push({ key: "recolour", label: t("tidy.line.recolour"), from: m.hex, to: m.to });
   const colourOf = new Map(context.palette.map((c) => [c.hex, c]));
   const nowRecipe = (hex: string) => colourOf.get(hex)?.recipe ?? t("tidy.val.auto");
@@ -517,7 +572,7 @@ const EXPORT_LABEL: Record<keyof TidyExportChanges, Key> = {
 
 /** Colours painted before any bake: regions painted, group colours changed. */
 export function hasColourEdits(changes: TidyChanges): boolean {
-  return Boolean(changes.partTidy?.length || changes.paint?.length || changes.pits?.length || changes.pieces?.length || changes.recolour?.length || (changes.creaseSnap ?? 0) > 0);
+  return Boolean(changes.partTidy?.length || changes.paint?.length || changes.pits?.length || changes.pieces?.length || changes.assign?.length || changes.marks?.length || changes.fix?.length || changes.recolour?.length || (changes.creaseSnap ?? 0) > 0);
 }
 
 /** 03's hand choices per colour. */
@@ -552,6 +607,8 @@ export interface TidyLogEntry {
   /** preview = done, waiting for the owner's ✅ (↩ takes it back); suggested = a plan not tried yet. */
   status?: "applied" | "preview" | "suggested" | "undone" | "none";
   dropped?: string[];
+  /** The owner's message: thumbnails of the pictures that went with it. */
+  images?: string[];
 }
 
 export const SCOPE_LABEL: Record<TidyScope, string> = { clean: "색정리(02)", mix: "혼합(03)", both: "색정리 + 혼합", export: "내보내기(04)" };
@@ -588,13 +645,18 @@ export const TIDY_SCHEMA = {
           description: "(02) 구멍 디테일 목록의 번호(P1→1)로: 그 구멍들을 into 색으로(예: 해골 단추의 눈 구멍 → 진한 갈색). 그대로 둘 구멍은 넣지 않는다",
           items: { type: "object", properties: { ids: { type: "array", items: { type: "integer" } }, into: { type: "string" } } },
         },
+        fix: {
+          type: "array",
+          description: "(02) 덩어리·칸으로 따로 안 잡히는 물건(눈알 둘레의 얇은 흰 테, 가는 줄, 작은 점)을 칠하기: [{part: 부위 이름, what: 흰 테, colour: #FFFFFF, problem: 눈알을 두른 흰 테가 피부색이 됐다}]. 앱이 그 부위 원본 사진에 격자를 깔아 다시 물어 점을 찍게 하고, 점 아래에서 원본 색 경계를 따라 그 물건만 잡아 칠한다",
+          items: { type: "object", properties: { part: { type: "string" }, what: { type: "string" }, colour: { type: "string" }, problem: { type: "string" } }, required: ["part", "what", "colour"] },
+        },
         pieces: {
           type: "array",
           description: "(02, 부위 확대 상의에서만) 덩어리 번호(사진의 숫자)를 묶어 조각을 만들고 조각마다 한 색: [{name: 테, blobs: [1,4], colour: #E69D3D}]. 안 넣은 덩어리는 그대로",
           items: { type: "object", properties: { name: { type: "string" }, blobs: { type: "array", items: { type: "integer" } }, colour: { type: "string" } } },
         },
         creaseSnap: { type: "integer", minimum: 0, maximum: 8, description: "(02) 색 경계를 근처의 가장 깊은 홈으로 옮기기(경계 양쪽 면 몇 줄 안에서). 부위 정리 때 앱이 기본 3을 쓴다. 0 = 끔" },
-        recolour: { type: "array", description: "(02) 그룹 색 자체를 바꾸기: hex 그룹의 모든 면을 to 로. 기본은 원본 대표색 그대로 — 회색빛 흰색만 밝게, 크게(ΔE 15 넘게) 바꾸는 건 규파가 말할 때만", items: { type: "object", properties: { hex: { type: "string" }, to: { type: "string" } } } },
+        recolour: { type: "array", description: "(02) 그룹 색 자체를 바꾸기: hex 그룹의 모든 면을 to 로. 원본이 맑으면 그대로, 구운 조명에 칙칙해진 색만 그 계열의 맑은 색으로(규칙의 Tkc 예). 색상 자체를 바꾸는 건 규파가 말할 때만", items: { type: "object", properties: { hex: { type: "string" }, to: { type: "string" } } } },
         target: { type: "integer", minimum: 2, maximum: 64, description: "(02) 목표 색 수 — 바꾸면 팔레트가 새로 나뉘어 같은 답에서 색 이름(hex)을 쓰는 칸은 못 쓴다" },
         minBlob: { type: "integer", minimum: 0, maximum: 5000, description: "(02) 이 면 수보다 작은 조각은 주변 색으로 흡수" },
         smoothing: { type: "integer", minimum: 0, maximum: 20, description: "(02) 경계 톱니 다듬기 횟수" },
@@ -666,7 +728,7 @@ const OWNER_RULES = `■ 규파식 색 정리 (규파가 직접 정리한 모델
 - 부위 하나 = 색 하나: AI 모델에 구워진 그림자·하이라이트(한 부위 안의 명암)는 그 부위의 색으로 합친다. 넓은 몸통 색이 한 덩어리로 이어지게. 결과는 보통 7~8색, 옷·무늬가 많으면 16색까지.
 - 맞닿은 다른 물건은 구분되게: 원본 색이 거의 같아도(고글 테와 렌즈) 출력에서 형태가 보이게 서로 다른 색(선명한 색 + 밝은 색)으로.
 - 작은 디테일은 지킨다: 눈·눈동자 하이라이트·입·볼·작은 무늬(면적 0.02~1%)는 그 부위의 keep 색으로 남기고 protect.
-- 색은 원본 대표색이 기본: 규파는 빨강·파랑·갈색을 원본 대표색 그대로 두거나 살짝(ΔE 10 안) 밝혔다(Bvc 갈색 #845E2D→#976F3D). 회색빛 흰색만 밝게(#B6B4A7→#DCDFDA). 크게 바꾸는 recolour(ΔE 15 넘게, 예: 피부를 노랑으로)는 규파가 말할 때만.
+- 색은 그 물건이 원래 뜻한 맑은 색: 원본이 이미 맑으면(Slc·Apvc·Mnc — 흰색 L95, 파랑·초록·노랑이 또렷) 원본 대표색 그대로(ΔE 3 안). 원본이 구운 조명에 눌려 칙칙하면 그 계열의 맑은 색으로 크게 밝힌다 — 규파 Tkc: 회색빛 흰색→#FFFFFF, 황토색 머리→연노랑 #F4DB88, 황갈색 고글 테·챙·지팡이·머리 줄→주황 #E69D3D, 분홍빛 갈색 피부 #94715B→#B98660 (ΔE 25~35). Bvc: 갈색 #845E2D→#976F3D, 회색 흰색 #B6B4A7→#DCDFDA. 진한 갈색·검정은 그대로(ΔE 5 안). 맑게 하는 건 회색이 낀 탁한 색(회색빛 흰색, 황토·올리브·황갈색, 칙칙한 피부)만이다 — 또렷한 원색(Bvc 진한 빨강 #8B0303·파랑 #1E618C·하늘색 #40A1C6, Mnc 파랑들)은 어두워도 원본 그대로 둔다. 색상 자체(빨강→노랑, 피부→노랑)를 바꾸는 건 규파가 말할 때만.
 - 경계는 홈에서: 색이 다른 파츠가 맞닿는 곳(아이싱·단추·손에 쥔 소품)은 가장 쏙 들어간 홈을 기점으로 색을 나눈다 — 앱이 부위 경계와 색 경계를 홈과 원본 색이 바뀌는 곳에 맞춘다(creaseSnap).
 - 구멍 디테일: 단추의 눈 구멍·콧구멍처럼 파이고 원본에서 어두운 곳은 디테일이다. 구멍 목록을 보고 pits 로 색을 정한다(보통 둘레 색보다 진한 색, 몸통 계열이면 몸통보다 진한 갈색).
 - 점·얼룩은 없앤다: 보호하지 않은 색의 20면 이하 조각.
@@ -696,6 +758,7 @@ ${OWNER_RULES}
 - minBlob(작은 조각 흡수, 면 수): 이보다 작은 같은 색 조각은 주변 색이 된다. 얼룩·점이 많으면 키우고(300~800), 눈·입이 사라지면 줄인다(20~60).
 - smoothing(경계 톱니 다듬기 0~20) · trimTeeth(톱니 깎기 0~10, 보통 2~3) · lineSmooth(경계 선 펴기 0~40칸, 보통 16) · smoothProtected(보호 색도 다듬기).
 - protect / unprotect: 지금 팔레트 색(hex)을 흡수·합치기에서 지킨다. merge [{from, into}]: 모델 전체에서 from 색을 into 로.
+- fix [{part, what, colour, problem}]: 덩어리·칸으로 따로 안 잡히는 물건(얇은 테·가는 줄·작은 점)은 이걸로 칠한다 — 앱이 원본 사진에 격자를 깔아 다시 묻고, 점을 찍으면 원본 색 경계를 따라 그 물건만 잡는다. '안 잡혀서 못 한다'·'직접 칠하세요'로 끝내지 않는다. 원본에 정말 그런 물건이 없을 때만 그렇다고 말한다.
 - 한계: 색은 삼각형 단위다. 선 굵기가 삼각형 서너 개뿐이면 다듬어도 지그재그가 남는다 — 그렇다고 말하고 할 수 있는 것만 한다.
 - 손잡이를 바꾸면 앱이 '정리 실행'(면 색 확정 + 다듬기 + 흡수)까지 한다.
 
@@ -746,7 +809,10 @@ export function focusPrompt(context: TidyContext, history: TidyLogEntry[], messa
   return `■ 부위 확대: ${f?.part ?? "?"} ${context.shape?.subject ? `(${context.shape.subject})` : ""}
 이 부위와 그 둘레만 크게 본다. 사진의 흰 네모 숫자 = 덩어리 번호 — 모델의 원래 색을 계열로 크게 나눠 보고(색 수 적게) 잘게도 나눠 본 뒤(색 수 많게), 경계가 홈이 아니고 색이 살짝만 바뀌는 곳(명암)은 이미 한 덩어리로 묶었다.
 할 일: 형태를 보고 덩어리들이 무엇인지(테·렌즈·끈·톱니·바늘·나선·피부·모자 띠 …) 알아본 뒤, 같은 물건인 덩어리를 묶어 pieces 로 낸다 — 조각마다 한 색(colour). 같은 재질은 같은 색(왼쪽·오른쪽 렌즈 둘 다 연노랑처럼).
-- 색은 규파식: 원본 대표색이 기본, 회색빛 흰색은 밝게. 이 부위가 둘레와 같은 물건(모자 띠 = 모자)이면 둘레 색과 같게 한다. 팔레트 색을 쓰면 그 그룹에 들어가고, 새 hex 면 새 그룹이 된다.
+- 조각 색은 그 조각의 **원본 평균색**(목록의 색)에서 정한다 — '지금 결과' 사진의 색은 전체 정리에서 잘못 묶였을 수 있으니 따라가지 않는다(원본이 분홍빛 갈색인 얼굴을 주황으로 칠하지 않는다).
+- 한 덩어리 안에 서로 다른 물건이 섞여 보이면(평균색이 두 색의 중간, 사진에서 흰 판과 피부가 한 번호) 그 덩어리는 pieces 에 넣지 않는다.
+- 덩어리로 따로 안 잡히는 물건(눈알 둘레의 얇은 흰 테, 가는 줄, 작은 점, 위처럼 섞인 덩어리 속 물건)은 fix [{part, what, colour, problem}] 로 낸다 — 앱이 원본 사진에 격자를 깔아 다시 물어 점을 찍게 하고, 원본 색 경계를 따라 그 물건만 잡아 칠한다. '안 잡혀서 못 한다'·'직접 칠하세요'로 끝내지 않는다.
+- 색은 규파식: 원본이 맑으면 원본 대표색, 칙칙하면 그 계열의 맑은 색(규칙의 Tkc 예). 이 부위가 둘레와 같은 물건(모자 띠 = 모자)이면 둘레 색과 같게 한다. 팔레트 색을 쓰면 그 그룹에 들어가고, 새 hex 면 새 그룹이 된다.
 - 맞닿은 다른 물건은 구분되게: 원본에서 색이 거의 같아도(테와 렌즈, 톱니와 모자 챙) 출력에서 형태가 보이도록 서로 다른 색으로 — 하나는 그 계열의 선명한 색, 하나는 밝은 색(예: 황갈색 고글이면 테는 주황, 렌즈는 연노랑, 바늘은 검정).
 - 둘레(이 부위가 아닌 모자·얼굴 등)의 덩어리는 건드리지 않아도 된다 — 넣지 않은 덩어리는 그대로.
 - 경계는 앱이 홈에 맞춘다(creaseSnap 기본 3).
@@ -761,6 +827,335 @@ ${pictures.map((p, i) => `${i + 1}. ${p}`).join("\n")}
 
 ■ 지금까지 주고받은 말
 ${past || "(처음)"}
+
+■ 규파의 말
+${message}`;
+}
+
+/** 🤖 step 1 after the shape: the model's final palette — a few clean colours — and each part's main one. */
+export const PALETTE_SCHEMA = {
+  type: "object",
+  properties: {
+    reply: { type: "string", description: "규파에게 하는 말(한국어, 3문장 안): 몇 색으로, 원본이 맑아서 그대로인지 칙칙해서 밝혔는지" },
+    observations: { type: "array", items: { type: "string" }, description: "2~4줄: 원본 색이 맑은지 칙칙한지, 헷갈리는 부위·무늬" },
+    palette: {
+      type: "array",
+      description: "이 모델의 최종 색 — 규파가 정한 목표 색 수를 넘지 않게(보통 6~10개). 번호는 1부터. 같은 물감은 한 번만(모자와 치마가 같은 진갈색이면 한 번호)",
+      items: {
+        type: "object",
+        properties: { id: { type: "integer" }, name: { type: "string", description: "짧은 이름(진갈색·주황·연노랑·흰색·검정·피부 …)" }, hex: { type: "string" } },
+        required: ["id", "name", "hex"],
+      },
+    },
+    parts: {
+      type: "array",
+      description: "부위마다 주 색(main)과 그 부위에 나올 다른 색(also) — 팔레트 번호 — 그리고 그 안의 물건과 색(looks)",
+      items: {
+        type: "object",
+        properties: {
+          part: { type: "string" },
+          main: { type: "integer" },
+          also: { type: "array", items: { type: "integer" } },
+          looks: { type: "string", description: "전체 사진에서 본 이 부위 안의 물건과 색, 한 줄(예: 크라운 진갈색 · 챙 윗면 주황 · 챙 밑면 진갈색). 다음 단계의 확대 사진은 각도가 낯설어서 이 줄이 길잡이가 된다" },
+        },
+        required: ["part", "main", "looks"],
+      },
+    },
+    pits: {
+      type: "array",
+      description: "구멍 디테일(P 번호)에 칠할 팔레트 번호. 그대로 둘 구멍은 넣지 않는다",
+      items: { type: "object", properties: { ids: { type: "array", items: { type: "integer" } }, colour: { type: "integer" } } },
+    },
+  },
+  required: ["reply", "palette", "parts"],
+};
+
+export interface TidyPaletteColour {
+  id: number;
+  name: string;
+  hex: string;
+}
+
+export interface TidyPalettePlan {
+  reply: string;
+  observations: string[];
+  palette: TidyPaletteColour[];
+  /** Part name → its main colour, the others that may show in it (palette ids), and what is in it as seen whole. */
+  parts: Map<string, { main: number; also: number[]; looks: string }>;
+  pits: Array<{ ids: number[]; colour: number }>;
+}
+
+const HEX_RE = /^#[0-9A-Fa-f]{6}$/;
+
+/** The palette answer as the app can use it (unknown parts, bad colours and numbers left out); null without a palette. */
+/** The palette's answer held to the owner's target colour count (11-05, the owner: "AI 색정리가 목표 색수에 맞춰서 하니?"). */
+export function paletteSchemaFor(target: number) {
+  return { ...PALETTE_SCHEMA, properties: { ...PALETTE_SCHEMA.properties, palette: { ...PALETTE_SCHEMA.properties.palette, maxItems: Math.max(2, Math.round(target)) } } };
+}
+
+export function sanitizePalette(raw: unknown, partNames: string[], pitCount: number): TidyPalettePlan | null {
+  const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => Boolean(x) && typeof x === "object") : []);
+  const palette: TidyPaletteColour[] = [];
+  for (const m of list(r.palette)) {
+    const id = Math.round(Number(m.id));
+    const hex = String(m.hex ?? "").trim();
+    if (!(id >= 1) || !HEX_RE.test(hex) || palette.some((c) => c.id === id)) continue;
+    palette.push({ id, name: String(m.name ?? "").trim().slice(0, 16) || hex, hex: hex.toUpperCase() });
+  }
+  if (palette.length === 0) return null;
+  const ids = new Set(palette.map((c) => c.id));
+  const known = new Set(partNames);
+  const parts = new Map<string, { main: number; also: number[]; looks: string }>();
+  for (const m of list(r.parts)) {
+    const part = String(m.part ?? "").trim();
+    const main = Math.round(Number(m.main));
+    if (!known.has(part) || !ids.has(main)) continue;
+    const also = (Array.isArray(m.also) ? m.also : []).map((v) => Math.round(Number(v))).filter((v) => ids.has(v) && v !== main);
+    parts.set(part, { main, also: [...new Set(also)], looks: String(m.looks ?? "").trim().slice(0, 200) });
+  }
+  const pits = list(r.pits)
+    .map((m) => ({ ids: (Array.isArray(m.ids) ? m.ids : []).map((v) => Math.round(Number(v))).filter((v) => v >= 1 && v <= pitCount), colour: Math.round(Number(m.colour)) }))
+    .filter((m) => m.ids.length > 0 && ids.has(m.colour));
+  return {
+    reply: String(r.reply ?? "").trim(),
+    observations: Array.isArray(r.observations) ? r.observations.map(String).filter(Boolean).slice(0, 5) : [],
+    palette,
+    parts,
+    pits,
+  };
+}
+
+const paletteLine = (palette: TidyPaletteColour[]) => palette.map((c) => `${c.id} ${c.name} ${c.hex}`).join(" · ");
+
+/** 🤖 step 1's question: the part map as it is, the holes, and the owner's colour rule. */
+export function palettePrompt(context: TidyContext, pictures: string[], message: string): string {
+  const shape = context.shape;
+  const parts = shape
+    ? shape.parts
+        .map((part) => `${part.name} ${part.areaPct.toFixed(1)}%: ${part.colours.filter((c) => c.pct >= 0.5).slice(0, 7).map((c) => `${c.hex} ${c.pct.toFixed(0)}%`).join(" · ")}`)
+        .join("\n")
+    : "(부위 지도 없음)";
+  const pits = context.pits?.length
+    ? context.pits.map((p) => `P${p.id} ${p.part ? `${p.part}의 ` : ""}구멍 · 원본 ${p.own} · 둘레 ${[p.inside, ...p.around].join("·")} · ${p.faces}면`).join("\n")
+    : "(없음)";
+  return `■ 🤖 자동 색정리 1단계 — 최종 팔레트 (${shape?.subject ?? "?"})
+이 모델을 출력할 최종 색을 정한다: palette(번호·이름·hex)와 부위마다 주 색. 다음 단계에서 앱이 부위마다 확대 사진의 덩어리를 보여 주면, 덩어리마다 이 팔레트 색을 하나씩 고른다 — 그러니 무늬·디테일에 필요한 색(눈·입·줄무늬·테두리·단추)도 팔레트에 넣는다.
+- 색 수: 규파가 정한 목표 색 수 ${context.target}가지를 넘지 않는다 — 그 안에서 출력에서 서로 다른 물건으로 보여야 할 만큼만(보통 6~10). 같은 물감은 하나로(모자와 치마가 둘 다 진갈색이면 한 번호).
+- 색은 규칙의 '맑은 색'대로: 원본이 맑으면 그대로, 구운 조명에 칙칙하면 그 계열의 맑은 색으로 크게 밝힌다. 진한 갈색·검정은 그대로.
+- 칙칙한 색을 맑게 바꿨으면 그 칙칙한 원래 색(황갈색·황토색)은 팔레트에 따로 남기지 않는다 — 한 계열에 맑은 색 하나(규파 Tkc: 황갈색 띠·챙·테는 모두 주황 하나).
+- 아래 부위 줄의 hex 는 원본 색을 그룹으로 묶은 대표색이다 — 구운 명암이 섞여 실제 물건 색보다 탁할 수 있다. 사진의 원본을 보고 정한다.
+- parts 의 also 에는 그 부위 안에 실제로 나오는 다른 색(눈·입·줄무늬·옆 물건)을 넣는다.
+- parts 의 looks 에는 그 부위 안의 물건과 색을 한 줄로(예: 크라운 진갈색 · 챙 윗면 주황 · 챙 밑면 진갈색). 다음 단계의 확대 사진은 각도가 낯설어 넓은 면(챙·망토)을 다른 물건으로 착각하기 쉽다 — 이 줄이 길잡이다. 테 안에 들어앉은 판(고글·안경 렌즈, 시계판, 단추 가운데)은 테와 원본 색이 같아도 따로 적는다(예: 고글 테 주황 · 렌즈 연노랑 · 바늘 검정). 그 부위 위에 붙은 작은 소품(가방·단추·꽃 장식)과 그 위 무늬(줄·가운데 점)도 빠뜨리지 않는다(예: 코트 검정 · 가방 검정 · 가방 줄 2개 연노랑).
+
+■ 부위 지도
+${parts}
+
+■ 구멍 디테일 (파이고 원본이 어두운 곳)
+${pits}
+
+■ 사진 (이 순서로 붙어 있음)
+${pictures.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+
+■ 규파의 말
+${message}`;
+}
+
+/** 🤖 step 2, one part up close: each blob given a colour of the palette. */
+export const ASSIGN_SCHEMA = {
+  type: "object",
+  properties: {
+    observations: { type: "array", items: { type: "string" }, description: "1~3줄: 이 부위에서 알아본 물건들과 헷갈린 곳" },
+    assign: {
+      type: "array",
+      description: "덩어리 번호를 물건별로 묶어 팔레트 색 번호 하나씩: [{what: 테, blobs: [1,4], colour: 2}]. 모든 덩어리를 한 번씩 넣는다(못 고른 것은 unsure)",
+      items: {
+        type: "object",
+        properties: {
+          what: { type: "string" },
+          blobs: { type: "array", items: { type: "integer" } },
+          colour: { type: "integer" },
+          mine: { type: "boolean", description: "이 부위의 물건이면 true, 옆 부위의 물건(사진에 같이 걸친 것)이면 false — 둘 다 색은 고른다" },
+        },
+        required: ["blobs", "colour", "mine"],
+      },
+    },
+    unsure: { type: "array", items: { type: "integer" }, description: "두 물건이 섞여 보여 못 고른 덩어리 — 앱이 맞닿은 색으로 홈·색 경계에서 나눠 채운다" },
+  },
+  required: ["assign"],
+};
+
+export interface TidyAssignment {
+  observations: string[];
+  assign: Array<{ what: string; blobs: number[]; colour: number; mine: boolean }>;
+  unsure: number[];
+}
+
+/** A part's answer as the app can use it: blobs that exist, colours of the palette, each blob once. */
+export function sanitizeAssign(raw: unknown, blobCount: number, paletteIds: Set<number>): TidyAssignment {
+  const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const seen = new Set<number>();
+  const assign: TidyAssignment["assign"] = [];
+  for (const m of Array.isArray(r.assign) ? r.assign : []) {
+    if (!m || typeof m !== "object") continue;
+    const row = m as Record<string, unknown>;
+    const colour = Math.round(Number(row.colour));
+    if (!paletteIds.has(colour)) continue;
+    const blobs = (Array.isArray(row.blobs) ? row.blobs : []).map((v) => Math.round(Number(v))).filter((v) => v >= 1 && v <= blobCount && !seen.has(v));
+    blobs.forEach((v) => seen.add(v));
+    if (blobs.length) assign.push({ what: String(row.what ?? "").trim().slice(0, 20), blobs, colour, mine: row.mine !== false });
+  }
+  const unsure = (Array.isArray(r.unsure) ? r.unsure : []).map((v) => Math.round(Number(v))).filter((v) => v >= 1 && v <= blobCount && !seen.has(v));
+  return { observations: Array.isArray(r.observations) ? r.observations.map(String).filter(Boolean).slice(0, 4) : [], assign, unsure };
+}
+
+/** 🤖 step 2's question for one part. */
+export function assignPrompt(
+  context: TidyContext,
+  part: { name: string; subject: string; main: TidyPaletteColour | null; also: TidyPaletteColour[]; looks: string; neighbours: Array<{ name: string; looks: string }> },
+  palette: TidyPaletteColour[],
+  blobs: Array<{ id: number; areaPct: number; mean: string; family: string }>,
+  pictures: string[],
+  message: string,
+): string {
+  return `■ 🤖 자동 색정리 2단계 — 부위 확대: ${part.name} (${part.subject || context.modelName})
+이 부위와 그 둘레를 크게 본 사진이다. 흰 네모 숫자 = 덩어리 번호(이 사진에서만 센 번호). 번호 사진에서 어둡게 눌린 곳은 이 부위 밖(둘레 부위)이다 — 부위 지도는 칸 단위라 거칠어서, 둘레 부위의 물건도 같이 번호를 받는다. 덩어리는 원본 색을 계열(색 수 적게)과 명암(색 수 많게)으로 나눠 본 뒤, 홈 없이 색이 살짝만 바뀌는 곳(구운 명암)은 이미 한 덩어리로 묶은 것이다.
+'색 지도' 사진은 같은 덩어리들을 겉면째 펼쳐 놓은 것이다(같은 번호) — 3D 사진에서 가려졌거나 작은 덩어리(뒤쪽, 가방 줄, 단추 점)는 거기서 확인한다. 형태는 3D 사진으로, 빠진 것은 지도로.
+할 일: 형태를 보고 덩어리가 무엇인지(테·렌즈·줄무늬·머리카락 결·그림자·옆 물건 …) 알아본 뒤, 물건별로 묶어 팔레트 색 번호를 하나씩 고른다(assign). 모든 덩어리를 한 번씩 넣는다.
+- mine: 그 묶음이 '${part.name}'의 물건이면 true, 둘레 부위의 물건이면 false(색은 그래도 고른다). 앱은 같은 곳을 여러 부위가 칠하면 mine 이라고 한 부위 중 가장 작은 부위의 답을 쓴다 — 렌즈가 모자 칸에 걸쳐 있어도 '모자 톱니'가 렌즈라고 하면 렌즈 색이 된다.
+- 전체 사진에서 본 이 부위: ${part.looks || "(메모 없음)"}
+- 둘레 부위: ${part.neighbours.length ? part.neighbours.map((n) => `${n.name}${n.looks ? ` — ${n.looks}` : ""}`).join(" / ") : "없음"}
+- 이 부위의 주 색: ${part.main ? `${part.main.id} ${part.main.name}` : "?"}${part.also.length ? ` · 나올 수 있는 다른 색: ${part.also.map((c) => `${c.id} ${c.name}`).join(", ")}` : ""}. 팔레트 밖의 색은 못 쓴다.
+- 같은 물건인데 구워진 그림자·하이라이트·얼룩으로 어둡거나 밝은 덩어리는 그 물건의 색으로 — 얼룩을 남기지 않는다.
+- 무늬·디테일(줄무늬·테두리·눈·입·단추)은 원본에서 형태가 또렷하면 그 색으로 살린다.
+- 맞닿은 다른 물건(옆 부위가 걸친 덩어리 포함)은 그 물건의 색으로. 원본 색이 비슷해도 다른 물건이면 구분되는 색으로(테와 렌즈).
+- 테·고리 안에 홈으로 갈라져 들어앉은 판(렌즈·시계판·단추 가운데)은 '구멍 안쪽 그림자'가 아니라 따로 된 물건이다 — 테와 원본 색이 같아도 다른 색(보통 밝은 계열)으로. 진짜 뚫린 구멍(뒤가 보이거나 아주 어두움)만 그림자 색.
+- 두 물건이 반씩 섞여 보이는 덩어리는 unsure 에 — 앱이 맞닿은 색으로 홈·색이 바뀌는 곳에서 나눠 채운다.
+
+덩어리(번호 · 이 부위 안 면적 · 원본 평균색 · 계열):
+${blobs.map((b) => `B${b.id} ${b.areaPct.toFixed(1)}% ${b.mean} ${b.family}`).join("\n")}
+
+팔레트: ${paletteLine(palette)}
+
+■ 사진 (이 순서로 붙어 있음)
+${pictures.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+
+■ 규파의 말
+${message}`;
+}
+
+/** 🤖 passes 2 and 3: the result so far next to the original — what is still wrong, part by part. */
+export const REVIEW_SCHEMA = {
+  type: "object",
+  properties: {
+    observations: { type: "array", items: { type: "string" }, description: "1~3줄: 결과 전체에서 본 것" },
+    problems: {
+      type: "array",
+      description: "아직 틀린 곳(많아야 6): 부위 이름(목록 그대로)과 무엇이 틀렸는지 한 줄. 고칠 게 없으면 []",
+      items: { type: "object", properties: { part: { type: "string" }, problem: { type: "string" } }, required: ["part", "problem"] },
+    },
+  },
+  required: ["problems"],
+};
+
+/** The review's answer: known parts only, one line each, six at most. */
+export function sanitizeReview(raw: unknown, partNames: string[]): Array<{ part: string; problem: string }> {
+  const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const known = new Set(partNames);
+  const out: Array<{ part: string; problem: string }> = [];
+  for (const m of Array.isArray(r.problems) ? r.problems : []) {
+    if (!m || typeof m !== "object") continue;
+    const row = m as Record<string, unknown>;
+    const part = String(row.part ?? "").trim();
+    const problem = String(row.problem ?? "").trim().slice(0, 200);
+    if (!known.has(part) || !problem) continue;
+    const same = out.find((x) => x.part === part);
+    if (same) same.problem = `${same.problem} / ${problem}`.slice(0, 300);
+    else out.push({ part, problem });
+  }
+  return out.slice(0, 6);
+}
+
+export function reviewPrompt(context: TidyContext, pass: number, parts: Array<{ name: string; looks: string }>, palette: TidyPaletteColour[], pictures: string[], message: string): string {
+  return `■ 🤖 자동 색정리 ${pass}차 검토 (${context.shape?.subject ?? context.modelName})
+${pass - 1}차까지 칠한 결과를 원본과 견준다. 틀린 곳을 부위별로 짚으면, 앱이 그 부위만 결과 확대 사진과 함께 다시 물어 고친다.
+기준은 원본 사진이다(아래 부위 메모는 1단계의 짐작일 뿐, 원본과 다르면 원본이 맞다). 원본에서 서로 다른 색으로 칠해진 면은 결과에서도 구분되는 게 맞다 — 칙칙한 색이 맑게 바뀐 것(황갈색 → 주황, 회색 → 흰색)은 규칙대로라 틀린 게 아니다.
+틀린 것으로 칠 것:
+- 원본에 또렷하던 무늬·디테일이 결과에서 사라짐(가방 줄·단추·꽃 가운데 점·테두리·눈·입) — '원본 | 결과' 나란히 확대 사진에서 본다
+- 원본에서 한 색이던 물건이 결과에서 두세 색으로 갈림, 얼룩·조각이 남음
+- 원본에서 다른 색이던 면이 결과에서 한 색에 묻힘(테와 렌즈, 챙 끝과 챙)
+- 원본에서 밝은 면이 결과에서 어둡게 칠해짐, 엉뚱한 색
+- 테 안에 들어앉은 판(렌즈·시계판)은 원본에서 테와 같은 색이어도 구멍이 아니다 — 판을 구멍 그림자 색으로 칠하라고 짚지 않는다
+치지 않을 것: 경계의 작은 톱니, 그림자 쪽의 아주 작은 점, 사진에 안 보이는 곳. 다 맞으면 problems 를 비운다 — 억지로 찾지 않는다.
+
+■ 부위와 메모(1단계 짐작 — 참고만)
+${parts.map((part) => `${part.name}: ${part.looks || "(메모 없음)"}`).join("\n")}
+
+팔레트: ${paletteLine(palette)}
+
+■ 사진 (이 순서로 붙어 있음)
+${pictures.map((p, i) => `${i + 1}. ${p}`).join("\n")}
+
+■ 규파의 말
+${message}`;
+}
+
+/** 🤖 passes 2 and 3, a part named in the review: the things to fix pointed at on its pictures. */
+export const POINT_SCHEMA = {
+  type: "object",
+  properties: {
+    observations: { type: "array", items: { type: "string" }, description: "1~2줄: 무엇을 어디에 찍었는지" },
+    points: {
+      type: "array",
+      description: "고칠 물건마다(조각마다) 점 하나: 사진 번호, 픽셀 x·y(왼쪽 위가 0,0), 무엇, 칠할 팔레트 번호. 고칠 게 없으면 []",
+      items: {
+        type: "object",
+        properties: {
+          picture: { type: "integer" },
+          x: { type: "number" },
+          y: { type: "number" },
+          what: { type: "string" },
+          colour: { type: "integer" },
+          source: { type: "string", description: "원본 사진에서 그 물건이 보이는 색(대략 hex, 예: 황갈색 줄이면 #B89B62). 앱이 점 둘레에서 이 색의 면을 골라 시작한다" },
+          shaded: { type: "boolean", description: "넓은 면(옷깃·주름 천·소매)이라 접힌 곳·그늘에 명암이 있으면 true — 앱이 밝기 차이는 덜 따져 한 물건으로 잡는다. 가는 선·테·점(입 선·눈 테·단추 점)이면 false" },
+        },
+        required: ["picture", "x", "y", "colour", "source"],
+      },
+    },
+  },
+  required: ["points"],
+};
+
+export function sanitizePoints(raw: unknown, pictures: number[], size: number, paletteIds: Set<number>): Array<{ picture: number; x: number; y: number; what: string; colour: number; source: string | null; shaded: boolean }> {
+  const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const out: Array<{ picture: number; x: number; y: number; what: string; colour: number; source: string | null; shaded: boolean }> = [];
+  for (const m of Array.isArray(r.points) ? r.points : []) {
+    if (!m || typeof m !== "object") continue;
+    const row = m as Record<string, unknown>;
+    const picture = Math.round(Number(row.picture));
+    const x = Number(row.x), y = Number(row.y), colour = Math.round(Number(row.colour));
+    if (!pictures.includes(picture) || !(x >= 0 && x < size && y >= 0 && y < size) || !paletteIds.has(colour)) continue;
+    const source = String(row.source ?? "").trim().toUpperCase();
+    out.push({ picture, x, y, what: String(row.what ?? "").trim().slice(0, 30), colour, source: HEX_RE.test(source) ? source : null, shaded: row.shaded === true });
+  }
+  return out.slice(0, 12);
+}
+
+export function pointPrompt(context: TidyContext, pass: number, part: string, subject: string, problem: string, palette: TidyPaletteColour[], pick: number[], resultPicture: number, size: number, pictures: string[], message: string): string {
+  // pass 0: the consult's own fix (what the owner asked for), not a review's.
+  return `■ ${pass > 0 ? `🤖 ${pass}차 고치기` : "💬 상의 고치기"} — 점 찍기: ${part} (${subject || context.modelName})
+${pass > 0 ? "검토에서 지적" : "고칠 것"}: ${problem}
+사진 ${pick.join("·")} = 원본 색 확대, 사진 ${resultPicture} = 지금 결과(사진 ${pick[0]}과 같은 각도). 모두 ${size}×${size} 픽셀, 격자는 60픽셀마다(가장자리 숫자 = 픽셀 위치).
+지적된 것을 고칠 물건마다 원본 사진(${pick.join("·")}) 위에 점을 찍는다: {picture, x, y, what, colour(팔레트 번호)}. 앱이 점 아래 면에서 시작해 원본 색이 같은 곳까지 넓혀(홈에서 멈춤) 그 물건을 정확히 잡고 그 색으로 칠한다 — 경계는 앱이 잡으니 점만 정확하면 된다.
+- 점은 물건 한가운데 깊숙이(가장자리·경계 말고). 작은 점·가는 줄도 그 위에 정확히.
+- shaded: 넓은 면(옷깃·주름 천·소매)이라 접힌 곳·그늘에 명암이 있으면 true(앱이 밝기는 덜 따져 한 물건으로 잡는다). 가는 선·테·점이면 false(밝기까지 따져 둘레로 번지지 않게). source 에 원본에서 그 물건이 보이는 색을 적는다 — 점이 조금 빗나가면 앱이 둘레에서 그 색의 면을 찾아 시작하고, 없으면 그 점은 버린다(옆 물건으로 번지지 않게).
+- 한 물건이 여러 조각이면(줄 두 개, 양쪽 렌즈) 조각마다 점 하나.
+- 지적과 상관없는 곳은 찍지 않는다. 사진에 안 보이면 찍지 않는다.
+
+팔레트: ${paletteLine(palette)}
+
+■ 사진 (이 순서로 붙어 있음)
+${pictures.map((p, i) => `${i + 1}. ${p}`).join("\n")}
 
 ■ 규파의 말
 ${message}`;

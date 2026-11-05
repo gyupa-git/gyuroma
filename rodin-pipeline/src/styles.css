@@ -123,8 +123,10 @@ code { color: var(--text-2); }
 .main { display: grid; grid-template-columns: var(--left-w) 5px minmax(0, 1fr) 5px var(--right-w); min-height: 0; }
 .main.no-right { grid-template-columns: var(--left-w) 5px minmax(0, 1fr); }
 .sidebar { min-height: 0; overflow-y: auto; background: var(--panel); display: flex; flex-direction: column; min-width: 0; }
-.sidebar-scroll { flex: 1 1 auto; min-height: 0; }
-.sidebar-foot { flex: 0 0 auto; position: sticky; bottom: 0; padding: 12px 14px 14px; border-top: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; gap: 6px; }
+/* Its full height, never squeezed (squeezed, its content ran on over the run button below it — 11-04). */
+.sidebar-scroll { flex: 1 0 auto; }
+/* At the end of the panel, after everything (sticky, it covered the consult log scrolling under it — 11-04). */
+.sidebar-foot { flex: 0 0 auto; margin-top: auto; padding: 12px 14px 14px; border-top: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; gap: 6px; }
 .sidebar-foot .hint { color: var(--muted); font-size: 11px; text-align: center; }
 .splitter { cursor: col-resize; background: var(--panel); border-right: 1px solid var(--border); touch-action: none; }
 .splitter:hover, .splitter.dragging { background: rgba(var(--iris-rgb), 0.35); }
@@ -707,7 +709,7 @@ table.grid td .colour-select-trigger { min-width: 140px; }
 .chip.button { cursor: pointer; }
 .chip.button:hover { border-color: var(--border-strong); }
 .text-link { border: 0; background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; padding: 0; }
-.text-link:hover { color: var(--text); }
+.text-link:hover:not(:disabled) { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
 .empty-note { color: var(--muted); font-size: 11px; line-height: 1.5; padding: 6px 0; }
 
 /* ---------------------------------------------------------------------------
@@ -803,6 +805,7 @@ select.compact { height: 22px; padding: 0 4px; font-size: 11px; border-color: va
 .de-bad { color: var(--danger); }
 .view-chip { position: absolute; right: 12px; top: 10px; z-index: 3; display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 6px; background: rgba(20, 20, 21, 0.86); border: 1px solid var(--border); font-size: 11px; pointer-events: none; }
 .view-chip.passing { animation: chip-pass 6s ease forwards; }
+.view-chip.passing.long { animation-duration: 10s; }
 @keyframes chip-pass { 0% { opacity: 0; } 5% { opacity: 1; } 80% { opacity: 1; } 100% { opacity: 0; visibility: hidden; } }
 .view-chip .sw { width: 12px; height: 12px; border-radius: 3px; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2); }
 
@@ -851,7 +854,89 @@ select.compact { height: 22px; padding: 0 4px; font-size: 11px; border-color: va
 mark.hl { background: #ffe066; color: #1b1b1d; border-radius: 3px; padding: 0 3px; }
 .tidy-legend { margin: 0; font-size: 11px; color: var(--muted); }
 .hl-field { background: rgba(255, 214, 10, 0.16); box-shadow: 0 0 0 1px rgba(255, 214, 10, 0.6); border-radius: 6px; }
-.tidy-consult { display: grid; gap: 7px; border-top: 1px solid var(--border); padding-top: 9px; }
+/* 💬 The consult with Claude, one box with a living edge (11-04, the owner: "시리처럼 약간 빛나는 선이 외곽에 잡히고
+   무지개 밝기가 돌아가는 — 아이리스 계열 무지개 · 안쪽으로 돌게, 바깥은 앱 최외곽이라"): an iris-rainbow line round
+   its glow spreading inwards (the box clips it).  It turns only while Claude is thinking and rests, softly lit, otherwise
+   (11-05, the owner: "생각 중일 때만 무지개가 돌아가고 그렇지 않을 땐 은은히 빛나고만") — paused where it stopped, no jump.
+   Each layer turns its own angle (a ring built once on the box would not turn).  Still for those who ask for less motion. */
+@property --consult-spin { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
+.tidy-consult {
+  --consult-stops: #9aa0ff, #b78cff, #f08ad6, #ffb98a, #f6dd8a, #7fe0cf, #72c2ff, #9aa0ff;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  margin: 10px 0 4px;
+  padding: 12px 12px 10px;
+  border-radius: 14px;
+  background: rgba(var(--iris-rgb), 0.04);
+}
+.tidy-consult::before,
+.consult-glow > span { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: conic-gradient(from var(--consult-spin), var(--consult-stops)); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude; animation: consult-spin 2.4s linear infinite paused; }
+/* The line. */
+.tidy-consult::before { padding: 1.5px; z-index: 1; }
+.tidy-consult > * { min-width: 0; }
+/* The glow: a wider ring, blurred, under everything in the box — only its inner half shows. */
+.consult-glow { position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: -1; filter: blur(12px); opacity: 0.5; transition: opacity 0.6s; }
+.consult-glow > span { padding: 9px; }
+.tidy-consult.working::before,
+.tidy-consult.working .consult-glow > span { animation-play-state: running; }
+.tidy-consult.working .consult-glow { opacity: 1; filter: blur(15px); }
+.tidy-consult.working .consult-glow > span { padding: 12px; }
+@keyframes consult-spin { to { --consult-spin: 360deg; } }
+@media (prefers-reduced-motion: reduce) {
+  .tidy-consult::before,
+  .consult-glow > span { animation: none; }
+}
+/* The consult's parts, each its own look (11-04, the owner: "어디가 네가 말하는 거고 어디가 툴팁이고 어디가 누를 수 있는
+   버튼이고 어디가 입력창인지 너무 섞여 있어"): a head with where Claude comes from · the one big button and one line
+   on it (the rest folded) · the part map as a thin info strip · the conversation, Claude's words plain text, the
+   owner's in bubbles on the right · one writing box with its quick asks, words, pictures and tools inside. */
+.consult-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.consult-title { font-size: 13px; }
+.consult-head .tidy-connection { margin: 0; font-size: 10.5px; color: var(--muted); }
+.consult-head .tidy-connection::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-right: 5px; vertical-align: 1px; }
+.consult-auto-row { display: grid; gap: 4px; }
+.consult-note { margin: 0; font-size: 11px; line-height: 1.45; color: var(--muted); }
+.consult-more { font-size: 11px; color: var(--muted); }
+.consult-more summary { cursor: pointer; color: var(--iris-300); list-style: none; width: max-content; }
+.consult-more summary::-webkit-details-marker { display: none; }
+.consult-more summary::before { content: "ⓘ "; }
+.consult-more[open] summary { margin-bottom: 4px; }
+.consult-more p { margin: 0; line-height: 1.5; }
+.tidy-consult .tidy-parts { background: transparent; border: 0; border-left: 2px solid rgba(var(--iris-rgb), 0.55); border-radius: 0; padding: 1px 0 1px 9px; }
+.tidy-consult .tidy-msg.ai { background: transparent; border: 0; padding: 2px 0; max-width: 100%; color: var(--text); }
+.tidy-consult .tidy-msg.working { background: transparent; border: 0; padding: 2px 0; color: var(--text-2); }
+/* A new answer, lit a moment. */
+.tidy-consult .tidy-msg.arrived { animation: consult-arrived 3.2s ease-out; border-radius: 6px; }
+@keyframes consult-arrived { 0%, 30% { background: rgba(255, 214, 10, 0.14); box-shadow: inset 3px 0 0 #ffd60a; } 100% { background: transparent; box-shadow: inset 3px 0 0 transparent; } }
+/* The writing field reads as one: a step lighter than the panel, a clear edge, the text cursor anywhere on it. */
+.consult-composer { display: grid; gap: 6px; padding: 9px 9px 6px; border-radius: 12px; background: #29292e; border: 1px solid #5a5a66; cursor: text; transition: border-color 0.15s, box-shadow 0.15s; }
+.consult-composer:hover { border-color: #6c6c78; }
+.consult-composer:focus-within { border-color: rgba(var(--iris-rgb), 0.7); box-shadow: 0 0 0 3px rgba(var(--iris-rgb), 0.14); }
+.consult-composer.dragging { border-style: dashed; border-color: var(--iris-300); }
+.tidy-consult.dragging { box-shadow: inset 0 0 0 2px rgba(var(--iris-rgb), 0.7); }
+/* All in sight, wrapped (11-04, the owner: a sideways line hid every ask but the first — "다 사라졌네"). */
+.consult-quick { display: flex; flex-wrap: wrap; gap: 5px; }
+.consult-chip,
+.consult-quick .tidy-preset { display: inline-flex; align-items: center; gap: 5px; min-height: 0; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); background: transparent; color: var(--text-2); font: inherit; font-size: 11.5px; line-height: 1.4; cursor: pointer; flex: 0 1 auto; width: auto; max-width: 100%; }
+.consult-chip:hover,
+.consult-quick .tidy-preset:hover:not(:disabled) { border-color: rgba(var(--iris-rgb), 0.6); color: var(--text); background: transparent; }
+/* A quick ask that goes to Claude at once (not into the box): tinted, with an arrow. */
+.consult-quick .tidy-consult-presets { display: contents; }
+.consult-quick .tidy-preset { background: rgba(var(--iris-rgb), 0.13); border-color: rgba(var(--iris-rgb), 0.4); color: var(--text); }
+.consult-quick .tidy-preset .icon { width: auto; }
+.consult-quick .tidy-preset-sub { display: none; }
+.consult-quick .tidy-preset::after { content: "↗"; color: var(--iris-300); }
+.consult-input { width: 100%; min-height: 64px; resize: vertical; border: 0; outline: none; background: transparent; color: var(--text); font: inherit; font-size: 15px; line-height: 1.45; padding: 2px 3px; cursor: text; }
+.consult-input::placeholder { color: var(--muted); }
+.consult-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; border-top: 1px solid var(--border-strong); padding-top: 6px; cursor: default; }
+.consult-tool { border: 0; background: transparent; color: var(--text-2); font: inherit; font-size: 11.5px; white-space: nowrap; padding: 4px 7px; border-radius: 6px; cursor: pointer; }
+.consult-tool:hover:not(:disabled) { background: var(--raised); color: var(--text); }
+.consult-tool:disabled { opacity: 0.45; cursor: not-allowed; }
+.consult-tools-gap { flex: 1 1 auto; }
 /* The consult's 🤖 (the step's whole job at once), the part map line, a preview's buttons. */
 .consult-auto { width: 100%; justify-content: center; }
 .consult-auto-hint { margin: -2px 0 0; font-size: 11px; line-height: 1.45; }
@@ -862,13 +947,29 @@ mark.hl { background: #ffe066; color: #1b1b1d; border-radius: 3px; padding: 0 3p
 .tidy-part { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; border: 1px solid var(--border); border-radius: 999px; background: var(--raised); color: var(--text); font-size: 11.5px; padding: 1px 8px; cursor: pointer; }
 .tidy-part:hover:not(:disabled) { border-color: rgba(var(--iris-rgb), 0.6); }
 .tidy-part:disabled { opacity: 0.55; cursor: default; }
+.tidy-part.working, .tidy-part.working:disabled { opacity: 1; border-color: rgba(var(--iris-rgb), 0.8); background: rgba(var(--iris-rgb), 0.16); }
 .tidy-parts-hint { width: 100%; font-size: 10.5px; }
 .tidy-part i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; border: 1px solid rgba(0, 0, 0, 0.35); }
-.tidy-parts-actions { display: flex; gap: 12px; margin-left: auto; }
+.tidy-parts-actions { display: flex; gap: 6px; margin-left: auto; }
+/* A small action that reads as one at a glance, and plainly on hover (11-05, the owner: "버튼처럼 안 보여도 클릭커블될 것 같이는 변해야지"). */
+.link-btn { border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text-2); font: inherit; font-size: 11px; padding: 2px 8px; cursor: pointer; transition: background 0.12s, border-color 0.12s, color 0.12s; }
+.link-btn:hover:not(:disabled) { background: var(--raised); border-color: rgba(var(--iris-rgb), 0.6); color: var(--text); }
+.link-btn[aria-pressed="true"] { border-color: rgba(var(--iris-rgb), 0.7); color: var(--iris-200); background: rgba(var(--iris-rgb), 0.12); }
+.link-btn:disabled { opacity: 0.45; cursor: default; }
 .consult-preview-actions { display: inline-flex; gap: 6px; flex-wrap: wrap; }
 .tidy-proposal.preview { border-color: rgba(var(--iris-rgb), 0.55); }
 /* An AI change shown over the views until it is kept or taken back. */
-.ai-preview-banner { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 9; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; max-width: calc(100% - 24px); padding: 7px 10px 7px 12px; border-radius: 10px; background: var(--well); border: 1px solid rgba(var(--iris-rgb), 0.55); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45); font-size: 12.5px; color: var(--text); animation: cut-notice-in 0.18s ease-out; }
+/* In the views, bottom centre just over the tool dock (11-05, the owner: at the top they sat on the selection bar and
+   hid it and themselves), one over another: Claude at work · an answer that came · a preview waiting for ✅. */
+.view-notices { position: absolute; left: 50%; bottom: 110px; transform: translateX(-50%); z-index: 9; display: flex; flex-direction: column-reverse; align-items: center; gap: 8px; max-width: calc(100% - 24px); pointer-events: none; }
+.view-notices > * { pointer-events: auto; }
+.view-working { display: flex; align-items: center; gap: 11px; padding: 8px 8px 8px 14px; border-radius: 999px; background: rgba(23, 23, 26, 0.94); border: 1.5px solid rgba(var(--iris-rgb), 0.85); font-size: 14px; font-weight: 600; color: var(--text); animation: cut-notice-in 0.18s ease-out, view-working-glow 2.2s ease-in-out infinite; }
+/* A slow iris breath round it while Claude works: it is alive, not stuck. */
+@keyframes view-working-glow { 0%, 100% { box-shadow: 0 0 0 3px rgba(var(--iris-rgb), 0.12), 0 10px 28px rgba(0, 0, 0, 0.45); } 50% { box-shadow: 0 0 0 7px rgba(var(--iris-rgb), 0.22), 0 0 26px rgba(var(--iris-rgb), 0.35), 0 10px 28px rgba(0, 0, 0, 0.45); } }
+@media (prefers-reduced-motion: reduce) { .view-working { animation: none; } }
+.view-arrived { padding: 7px 14px; border-radius: 999px; background: #2a2510; border: 1px solid #ffd60a; color: #fff3b8; font-size: 14px; font-weight: 600; box-shadow: 0 0 0 4px rgba(255, 214, 10, 0.16), 0 10px 28px rgba(0, 0, 0, 0.45); animation: view-arrived 6s ease-out forwards; }
+@keyframes view-arrived { 0% { opacity: 0; transform: translateY(6px) scale(0.96); } 5% { opacity: 1; transform: none; } 85% { opacity: 1; } 100% { opacity: 0; } }
+.ai-preview-banner { position: static; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; max-width: calc(100% - 24px); padding: 7px 10px 7px 12px; border-radius: 10px; background: var(--well); border: 1px solid rgba(var(--iris-rgb), 0.55); box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45); font-size: 12.5px; color: var(--text); animation: cut-notice-in 0.18s ease-out; }
 .tidy-consult-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 12px; }
 .tidy-log { display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow-y: auto; padding: 2px; }
 .tidy-msg { max-width: 92%; border-radius: 9px; padding: 6px 9px; font-size: 12px; line-height: 1.5; }
@@ -894,6 +995,14 @@ mark.hl { background: #ffe066; color: #1b1b1d; border-radius: 3px; padding: 0 3p
 .tidy-apikey-input { flex: 1; min-width: 0; font-size: 16px; padding: 5px 8px; border-radius: 6px; font-family: var(--mono, monospace); }
 .tidy-apikey-error { color: var(--danger, #ff8a8a); font-size: 11px; margin: 0; }
 .tidy-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+/* 💬 pictures with the words: pasted, dropped on the box, or 📎 */
+.consult-drop { display: grid; gap: 6px; border-radius: 9px; }
+.consult-drop.dragging { outline: 2px dashed var(--iris-300); outline-offset: 3px; }
+.consult-attached { display: flex; gap: 6px; flex-wrap: wrap; }
+.consult-attached-item { position: relative; display: inline-block; }
+.consult-attached img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); display: block; }
+.consult-attached.in-log img { width: 56px; height: 56px; }
+.consult-attached-x { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--border); background: var(--panel); color: var(--text); font-size: 13px; line-height: 1; padding: 0; cursor: pointer; }
 .spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(var(--iris-rgb), 0.25); border-top-color: var(--iris-300); animation: spin 0.9s linear infinite; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .text-link.iris:hover { color: var(--iris-200); }
@@ -1171,3 +1280,8 @@ span + span > .gyupa-spin-swirl { animation-direction: normal, reverse; }
 .slot-check-item { display: inline-flex; align-items: center; gap: 4px; }
 .slot-check-item i { width: 12px; height: 12px; border-radius: 3px; border: 1px solid rgba(0, 0, 0, 0.4); display: inline-block; }
 .slot-check-warn { width: 100%; color: var(--text-2); line-height: 1.45; }
+/* 🧩 Work over the colour map (a pick being unfolded): the working face and a line, top centre. */
+.colour-map-busy { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); z-index: 3; display: flex; align-items: center; gap: 8px; padding: 5px 12px 5px 8px; border-radius: 999px; background: rgba(23, 23, 26, 0.9); border: 1px solid rgba(var(--iris-rgb), 0.55); font-size: 12px; color: var(--text); pointer-events: none; }
+/* The tab's memory, on the status line (amber past 2.5 GB). */
+.statusbar .memory-use { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.statusbar .memory-use.warn { color: #f3c25b; }

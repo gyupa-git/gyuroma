@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DEFAULT_SETTINGS } from "./types";
 import { translate, type Key, type Params } from "../i18n";
-import { describeChanges, hasCleanChanges, presetChanges, sanitizeChanges, type TidyContext } from "./tidy";
+import { describeChanges, hasCleanChanges, presetChanges, sanitizeAssign, sanitizeChanges, sanitizePalette, sanitizeReview, type TidyContext } from "./tidy";
 import { pickedOnly, pickedValueLines } from "./tidyArea";
 
 const ko = (key: Key, params?: Params) => translate("ko", key, params);
@@ -117,5 +117,55 @@ describe("AI changes", () => {
     expect(lines.filter((l) => l.label === "Mix up to").map((l) => `${l.from} → ${l.to}`)).toEqual(["None → 3 colours"]);
     // A hidden count changed while the row shows "single only": no line.
     expect(describeChanges({ mix: { maxComponents: 3 } }, single, en).filter((l) => l.label === "Mix up to")).toEqual([]);
+  });
+});
+
+describe("🤖 palette and part answers", () => {
+  it("keeps the palette's good colours and the known parts' numbers", () => {
+    const plan = sanitizePalette(
+      {
+        reply: "7색",
+        palette: [
+          { id: 1, name: "진갈색", hex: "#291608" },
+          { id: 2, name: "주황", hex: "#e69d3d" },
+          { id: 2, name: "겹침", hex: "#000000" },
+          { id: 3, name: "나쁨", hex: "orange" },
+        ],
+        parts: [
+          { part: "모자", main: 1, also: [2, 9, 1] },
+          { part: "없는 부위", main: 1 },
+          { part: "얼굴", main: 7 },
+        ],
+        pits: [{ ids: [1, 5], colour: 1 }],
+      },
+      ["모자", "얼굴"],
+      2,
+    );
+    expect(plan?.palette.map((c) => c.hex)).toEqual(["#291608", "#E69D3D"]);
+    expect([...(plan?.parts.keys() ?? [])]).toEqual(["모자"]);
+    expect(plan?.parts.get("모자")).toEqual({ main: 1, also: [2], looks: "" });
+    expect(plan?.pits).toEqual([{ ids: [1], colour: 1 }]);
+    expect(sanitizePalette({ palette: [] }, ["모자"], 0)).toBeNull();
+  });
+
+  it("gives each blob one colour of the palette, once", () => {
+    const got = sanitizeAssign(
+      { assign: [{ what: "테", blobs: [1, 2, 9], colour: 2, mine: true }, { blobs: [2, 3], colour: 1, mine: false }, { blobs: [4], colour: 5 }], unsure: [3, 4, 6] },
+      6,
+      new Set([1, 2]),
+    );
+    expect(got.assign).toEqual([
+      { what: "테", blobs: [1, 2], colour: 2, mine: true },
+      { what: "", blobs: [3], colour: 1, mine: false },
+    ]);
+    expect(got.unsure).toEqual([4, 6]);
+  });
+
+  it("keeps the review's known parts, one line each", () => {
+    const got = sanitizeReview(
+      { problems: [{ part: "가방", problem: "줄무늬가 사라짐" }, { part: "없는 부위", problem: "?" }, { part: "가방", problem: "단추 점" }, { part: "모자", problem: "" }] },
+      ["가방", "모자"],
+    );
+    expect(got).toEqual([{ part: "가방", problem: "줄무늬가 사라짐 / 단추 점" }]);
   });
 });

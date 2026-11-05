@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildFaceAdjacency } from "@core/meshAdjacency";
 import type { Tri, Vec3 } from "@core/types";
-import { creaseGeometry, snapToCreases } from "./creases";
+import { creaseGeometry, fillUnlabelled, snapToCreases } from "./creases";
 
 /** A w×h grid of cells (two triangles each) with height z = h(x), faces wound to face +z. */
 function surface(w: number, h: number, height: (x: number) => number) {
@@ -52,5 +52,19 @@ describe("snapToCreases", () => {
       if (x === 5) expect(out[f]).toBe(3);
     });
     expect(line).toBeGreaterThan(0);
+  });
+});
+
+describe("fillUnlabelled", () => {
+  it("an unplaced strip between two sides is split at the groove in it", () => {
+    // Side 0 up to x = 5, side 1 from x = 18; between them nothing, with a valley at x = 9.
+    const s = surface(24, 6, (x) => Math.abs(x - 9) * 0.8);
+    const labels = Int32Array.from(s.cellX.map((x) => (x <= 5 ? 0 : x >= 18 ? 1 : -1)));
+    const out = fillUnlabelled(labels, s.adjacency, s.geometry);
+    s.cellX.forEach((x, f) => {
+      expect(out[f]).toBeGreaterThanOrEqual(0);
+      if (x <= 7) expect(out[f]).toBe(0);
+      if (x >= 10) expect(out[f]).toBe(1);
+    });
   });
 });

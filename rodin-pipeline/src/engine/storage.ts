@@ -1,5 +1,6 @@
 import { DEFAULT_SETTINGS, DEFAULT_TARGET_HEIGHT, MAX_PHYSICAL, MIN_PHYSICAL, type PipelineSettings } from "./types";
 import type { RGB } from "@core/types";
+import { sharedRgbOf } from "@core/rgbPool";
 
 const STORAGE_KEY = "rodin-pipeline-settings-v1";
 
@@ -274,7 +275,8 @@ export function packColours(colours: ArrayLike<RGB>): Uint8Array {
 export function unpackColours(packed: Uint8Array, faceCount: number): RGB[] | null {
   if (packed.length !== faceCount * 3) return null;
   const out: RGB[] = new Array(faceCount);
-  for (let i = 0; i < faceCount; i++) out[i] = [packed[i * 3], packed[i * 3 + 1], packed[i * 3 + 2]];
+  // Faces of one colour share its array (rgbPool).
+  for (let i = 0; i < faceCount; i++) out[i] = sharedRgbOf(packed[i * 3], packed[i * 3 + 1], packed[i * 3 + 2]);
   return out;
 }
 
@@ -390,6 +392,17 @@ export function serialiseRecord(value: unknown): Uint8Array | null {
   return null;
 }
 
+/**
+ * Plain data (the part maps, the consult's conversation) as JSON — named keys only, so a large record that
+ * fails its own check can never turn into a JSON of millions of numbers.  These used to go to the browser's
+ * store only, never read back while the server is up, so a reload lost them (11-05, the owner:
+ * "새로고침하니까 부위 지도가 사라지는데?").
+ */
+export const JSON_KEYS = new Set(["part-maps", "tidy-chat"]);
+export function serialiseJson(value: unknown): Uint8Array {
+  return packRecord({ type: "json" }, new TextEncoder().encode(JSON.stringify(value)));
+}
+
 export function deserialiseRecord(buffer: ArrayBuffer): unknown {
   const record = unpackRecord(buffer);
   if (!record) return null;
@@ -435,6 +448,13 @@ export function deserialiseRecord(buffer: ArrayBuffer): unknown {
   if (header.type === "template") {
     return { name: String(header.name), buffer: payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) };
   }
+  if (header.type === "json") {
+    try {
+      return JSON.parse(new TextDecoder().decode(payload)) as unknown;
+    } catch {
+      return null;
+    }
+  }
   return null;
 }
 
@@ -447,12 +467,20 @@ export function deserialiseRecord(buffer: ArrayBuffer): unknown {
  * browser into the folder every window shares, right after another window
  * had cleared it.  An empty folder now means empty.
  */
+/** Keys that only ever reached the browser's store (see JSON_KEYS): their copy there is moved up once. */
+const BROWSER_ONLY_BEFORE = JSON_KEYS;
+
 export async function dataGet<T>(key: string): Promise<T | null> {
   if (await localServerAvailable()) {
     try {
       const res = await fetch(dataUrl(key), { cache: "no-store" });
       const missing = res.status === 204 || res.status === 404;
       if (res.ok && !missing) return deserialiseRecord(await res.arrayBuffer()) as T | null;
+      if (missing && BROWSER_ONLY_BEFORE.has(key)) {
+        const kept = await idbGet<T>(key);
+        if (kept !== null) await dataSet(key, kept);
+        return kept;
+      }
       if (missing) return null;
     } catch {
       // fall through to the browser store
@@ -476,7 +504,7 @@ export function dataSet(key: string, value: unknown): Promise<boolean> {
 
 async function writeRecord(key: string, value: unknown): Promise<boolean> {
   if (await localServerAvailable()) {
-    const bytes = serialiseRecord(value);
+    const bytes = JSON_KEYS.has(key) ? serialiseJson(value) : serialiseRecord(value);
     if (bytes) {
       // With the server up it is the only place read from: a write that fails there
       // has failed (the browser's store would never be read back).

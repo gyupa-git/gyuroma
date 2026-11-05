@@ -58,6 +58,12 @@ import {
   representativeColoursByPosition,
   sameLabelComponent,
   triangleAreaWeights,
+  modelRadius,
+  packedFaceColours,
+  linearToSrgbByte,
+  SRGB_TO_LINEAR,
+  FACE_BYTES,
+  type ColourBuffer,
 } from "./engine/mesh";
 import {
   clearStoredWorkEverywhere,
@@ -87,19 +93,20 @@ import {
   type StoredWorkCuts,
   type StoredWorkFile,
 } from "./engine/storage";
-import { MeshViewer, type Callout, type FocusMode, type HighlightOverlay, type LayerPreview, type MeshViewerHandle, type PickInfo, type ViewerCut, type ViewerHit } from "./ui/MeshViewer";
+import { MeshViewer, VIEW_DIRECTIONS, type CameraPose, type Callout, type FocusMode, type HighlightOverlay, type LayerPreview, type MeshViewerHandle, type PickInfo, type ViewerCut, type ViewerHit } from "./ui/MeshViewer";
 import { meshWithCut, type BorderCut } from "@core/borderCut";
 import { fillSmallHoles } from "@core/meshHoles";
 import { cutBorders, CutSuperseded } from "./engine/borderCutClient";
 import { ColourStrip, type StripOutput } from "./ui/ColourStrip";
-import { CleanupPanel } from "./ui/CleanupPanel";
+import { CleanupPanel, TargetSection } from "./ui/CleanupPanel";
 import { ColourMap, type ColourMapHandle } from "./ui/ColourMap";
 import { loadStoredBackground, storeBackground, type ViewBackground } from "./ui/background";
 import { blendRecipeText } from "./engine/plan";
-import { atlasPointOnFace, buildFaceAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
+import { atlasPointOnFace, buildFaceAtlas, buildPatchAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
+import { cancelUnfold, unfoldInWorker, UnfoldSuperseded } from "./engine/unfoldClient";
 import { specksIn } from "./engine/specks";
 import { HelpTip } from "./ui/HelpTip";
-import { GyupaLoader } from "./ui/GyupaLoader";
+import { GyupaLoader, GyupaSpin } from "./ui/GyupaLoader";
 import { LoadSection, type SourceInfo } from "./ui/LoadSection";
 import { FilamentSection } from "./ui/FilamentSection";
 import { MergeSection, type MergeReportData } from "./ui/MergeSection";
@@ -113,12 +120,15 @@ import { cleanGaps, discDiameter, piecesOf as placesOf } from "./engine/gapClean
 import { NO_TONE, isNoTone, sameTone, toneColours, type Tone, type ToneColour, type ToneWalls } from "./engine/groupTone";
 import { cutsKeepingGroups } from "./engine/stripCuts";
 import { faceOfGroupNear } from "./engine/cutPick";
-import { packWorkFile, readWorkFile, WORK_FILE_EXT, WorkFileError, workFileName } from "./engine/workFile";
+import { packWorkFile, readWorkFile, WORK_FILE_EXT, WorkFileError, workFileName, type WorkFileContents } from "./engine/workFile";
 import { WITH_CLAUDE } from "./features";
-import { renderNumberedViews, renderViews } from "./ui/snapshot";
+import { regionPixels, renderFaceIds, renderNumberedViews, renderViews, withGrid } from "./ui/snapshot";
+import { markRegion } from "./engine/wand";
+import { mapPicture, numberedMapPicture, regionAtlas } from "./ui/mapShots";
+import type { AttachedImage } from "./ui/attachImage";
 import { cellParts, faceCentroids, facePartsOf, partsBySpill, shapeCells, summariseParts, tidyByParts, type ShapeCells, type ShapePart } from "./engine/shapeParts";
 import { findRegions } from "./engine/regions";
-import { creaseGeometry, faceConcavity, findPits, snapToCreases, type CreaseGeometry, type Pit } from "./engine/creases";
+import { creaseGeometry, faceConcavity, fillUnlabelled, findPits, snapToCreases, type CreaseGeometry, type Pit } from "./engine/creases";
 import { regionBlobs, type BlobMap } from "./engine/blobs";
 import { ConnectionLine, KeyForm } from "./ui/TidyPanel";
 import { ConsultBox } from "./ui/ConsultBox";
@@ -135,6 +145,19 @@ import {
   focusPrompt,
   shapePrompt,
   SHAPE_SCHEMA,
+  ASSIGN_SCHEMA,
+  assignPrompt,
+  REVIEW_SCHEMA,
+  reviewPrompt,
+  sanitizeReview,
+  POINT_SCHEMA,
+  pointPrompt,
+  sanitizePoints,
+  type TidyAssignment,
+  paletteSchemaFor,
+  palettePrompt,
+  sanitizeAssign,
+  sanitizePalette,
   tidyStablePrompt,
   tidyTurnPrompt,
   TIDY_SCHEMA,
@@ -151,6 +174,7 @@ import {
 } from "./engine/tidy";
 import { pickedOnly, pickedValueLines, type TidyArea } from "./engine/tidyArea";
 import { findPrintPreset } from "@core/printPresets";
+import { shareNewColours } from "@core/rgbPool";
 import { limitTidyToPicked } from "./engine/tidyArea";
 import { ExportSection, faceOnBed, type ExportCheck } from "./ui/ExportSection";
 import { NumberField, Swatch, pct, pctNumber } from "./ui/common";
@@ -215,6 +239,58 @@ function loadPaneLook(): PaneLook {
     return { flat: [false, false], soft: [true, true] };
   }
 }
+/**
+ * The face a point on a picture means: round the point (a few pixels off is usual), a face of the region whose own
+ * colour is the thing's as the AI saw it; none like it near → -1, the point dropped rather than spread over a
+ * neighbour (11-04 Tkc: a point meant for a bag's stripe fell on the skirt, and the skirt went yellow).
+ */
+function seedUnderPoint(ids: Int32Array, size: number, x: number, y: number, inRegion: Uint8Array | null, lab: Float32Array, source: string | null): number {
+  const want = source ? rgbToLab(hexToRgb(source)) : null;
+  let seed = -1;
+  let bestScore = Infinity;
+  for (let dy = -12; dy <= 12; dy++)
+    for (let dx = -12; dx <= 12; dx++) {
+      const px = Math.round(x) + dx, py = Math.round(y) + dy;
+      if (px < 0 || py < 0 || px >= size || py >= size) continue;
+      const f = ids[py * size + px];
+      if (f < 0 || (inRegion && !inRegion[f])) continue;
+      const off = Math.hypot(dx, dy);
+      const de = want ? Math.hypot(lab[f * 3] - want.L, lab[f * 3 + 1] - want.a, lab[f * 3 + 2] - want.b) : 0;
+      if (want && de > 22) continue;
+      const score = de + off * 0.8;
+      if (score < bestScore) {
+        bestScore = score;
+        seed = f;
+      }
+    }
+  return seed;
+}
+
+/**
+ * A part's cells and the cells two steps round them: what a thing pointed at in that part may spread over.
+ * The part map is rough — Tkc's 'face' was one cell of a face several cells big, and a white rim round the
+ * eye came out as a dotted line along the one cell (11-05).
+ */
+function partNeighbourhood(cells: { count: number; cellOf: ArrayLike<number>; touching: Array<Map<number, number>> }, partCells: number[], faceCount: number): Uint8Array {
+  const near = new Uint8Array(cells.count);
+  for (const c of partCells) near[c] = 1;
+  for (let ring = 0; ring < 2; ring++) {
+    const now = near.slice();
+    for (let c = 0; c < cells.count; c++) if (now[c]) for (const d of cells.touching[c].keys()) near[d] = 1;
+  }
+  const within = new Uint8Array(faceCount);
+  for (let f = 0; f < faceCount; f++) if (near[cells.cellOf[f]]) within[f] = 1;
+  return within;
+}
+
+/** Most faces the colour map unfolds in one go (the solver's time grows with them; a whole body is not one piece anyway). */
+const UNFOLD_MAX_FACES = 800_000;
+
+/** A share in per cent, short: 0.04 → "0.04", 3.2 → "3.2", 41 → "41". */
+function formatPct(pct: number): string {
+  return pct >= 10 ? pct.toFixed(0) : pct >= 1 ? pct.toFixed(1) : pct.toFixed(2);
+}
+
 /** A toolbar toggle over both views: on, off, or "mixed" when they differ. */
 function pairPressed(pair: [boolean, boolean]): boolean | "mixed" {
   return pair[0] === pair[1] ? pair[0] : "mixed";
@@ -231,6 +307,10 @@ const SHAPE_CELL_COUNT = 90;
 /** Tints of the part map in 3D (one a part, in order). */
 const PART_TINTS = ["#E6194B", "#3CB44B", "#FFE119", "#4363D8", "#F58231", "#911EB4", "#42D4F4", "#F032E6", "#BFEF45", "#FABED4", "#469990", "#DCBEFF", "#9A6324", "#FFFAC8", "#800000", "#AAFFC3", "#808000", "#FFD8B1", "#000075", "#A9A9A9"];
 const SIX_VIEWS: ViewName[] = ["front", "back", "left", "right", "top", "iso"];
+/** 🤖 every part up close: this many parts asked at once (each answer takes half a minute or so). */
+const AUTO_PARALLEL = 4;
+/** 🤖 after the first pass, this many more: the result looked at next to the original, what is wrong asked again. */
+const AUTO_REVIEWS = 2;
 
 /** The part map kept for a model: its cells (0-based) per part, for the mesh it was made on. */
 interface StoredPartMap {
@@ -270,6 +350,8 @@ const GAP_PICK_ASK_SHARE = 0.02;
 const GAP_BIG_DIAMETER_MM = 1;
 /** Outline shapes kept per model (bytes): every colour of a million-face model fits. */
 const OVERLAY_SHAPE_BUDGET = 160 * 1024 * 1024;
+/** On a big model the outlines kept are fewer, and none is worked out ahead (11-05: the cache filled 160 MB there). */
+const OVERLAY_SHAPE_BUDGET_BIG = 40 * 1024 * 1024;
 type UndoKind = "strip" | "colours" | "mesh";
 
 /** A confirmed cut as an undo step: the model before and after it, and the original colours of each. */
@@ -598,6 +680,8 @@ export default function App() {
   const [tidyLog, setTidyLog] = useState<TidyLogEntry[]>([]);
   const tidyLogLoaded = useRef(false);
   const [tidyBusy, setTidyBusy] = useState<string | null>(null);
+  /** The part 🎯 is working on (its chip shows the working face). */
+  const [focusBusyPart, setFocusBusyPart] = useState<string | null>(null);
   const [tidyElapsed, setTidyElapsed] = useState(0);
   const tidyAbortRef = useRef<AbortController | null>(null);
   /** This computer's Claude login through the app's server (null while checking). */
@@ -633,6 +717,8 @@ export default function App() {
       /** Colours a picked-patch tidy left (it bakes outside the tidy chain), and how many faces it changed. */
       result?: RGB[];
       faces?: number;
+      /** The colour history's newest entry when the tidy started (null: it was empty): the tidy's own steps come after it. */
+      historyTop?: RGB[] | null;
     }>
   >([]);
   /** How many tidies ↩ can still take back (shown on the button). */
@@ -681,8 +767,41 @@ export default function App() {
     }
   };
   const [atlas, setAtlas] = useState<FaceAtlas | null>(null);
+  // About what the app holds for this model, on the status line (11-05, the owner: "메모리 처리는 어떻게 되고
+  // 있는 거야?"). Worked out from the face count — Chrome gives a page only a rounded count, minutes old
+  // (0.01 GB right after a 734 k-face load); the line fits what was measured with its exact count:
+  // Bvc 0.73 M faces 322 MB, Slc 2.37 M 678 MB, Tkc 4.62 M 1,295 MB (11-05, docs/메모리-2026-11-05.md).
+  const memoryMb = model ? Math.round(140 + (model.triangles.length * 250) / 1e6) : null;
   const [atlasBuilding, setAtlasBuilding] = useState(false);
   const atlasRef = useRef<{ triangles: MeshModel["triangles"]; atlas: FaceAtlas } | null>(null);
+  // 🧩 The picked patches unfolded in one piece on the colour map (11-05, the owner: "이 한 조각을 눌렀을 때 그 한 조각이
+  // 그대로 펼쳐진 느낌으로") — on unless turned off; the whole map comes back with nothing picked or the switch off.
+  const [unfoldOn, setUnfoldOnState] = useState(() => {
+    try {
+      return window.localStorage.getItem("rodin-pipeline-unfold") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const setUnfoldOn = (on: boolean) => {
+    setUnfoldOnState(on);
+    try {
+      window.localStorage.setItem("rodin-pipeline-unfold", on ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  };
+  const [unfolded, setUnfolded] = useState<{ key: string; atlas: FaceAtlas; pieces: number } | null>(null);
+  const unfoldedRef = useRef(unfolded);
+  unfoldedRef.current = unfolded;
+  /** How far the unfold has gone (0..1) while it runs. */
+  const [unfolding, setUnfolding] = useState<number | null>(null);
+  /** Why the pick is not unfolded (too big, failed) — said on the map itself, not only on the status line. */
+  const [unfoldNote, setUnfoldNote] = useState<string | null>(null);
+  const unfoldRunningKeyRef = useRef<string | null>(null);
+  const shownAtlas = unfolded?.atlas ?? atlas;
+  /** The colour map as shown: the picked patches unfolded, else the whole model's. */
+  const mapAtlasNow = (): FaceAtlas | null => unfoldedRef.current?.atlas ?? atlasRef.current?.atlas ?? null;
   const faceGeometryRef = useRef<{ triangles: MeshModel["triangles"]; geometry: FaceGeometry } | null>(null);
   const [brushMode, setBrushMode] = useState(false);
   /** The healing brush: the brush, but it turns only the specks of other colours lying in the brush colour, never past its outline. */
@@ -762,6 +881,22 @@ export default function App() {
   // two can be compared; the toolbar buttons set both.  Display only,
   // remembered per browser.
   const [paneLook, setPaneLookState] = useState<PaneLook>(loadPaneLook);
+  // Form lines over flat colours (both views; on unless turned off).
+  const [formLines, setFormLinesState] = useState(() => {
+    try {
+      return window.localStorage.getItem("rodin-pipeline-form-lines") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const setFormLines = (on: boolean) => {
+    setFormLinesState(on);
+    try {
+      window.localStorage.setItem("rodin-pipeline-form-lines", on ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  };
   const setPaneLook = (key: keyof PaneLook, pane: 0 | 1 | "both", value: boolean) => {
     setPaneLookState((prev) => {
       const pair: [boolean, boolean] = pane === "both" ? [value, value] : pane === 0 ? [value, prev[key][1]] : [prev[key][0], value];
@@ -1669,7 +1804,7 @@ export default function App() {
   // brush stroke patches the buffer it was built on for the painted faces and keeps
   // the same object: the views painted those faces as the stroke went, so nothing is
   // uploaded again.
-  const sourceBufferRef = useRef<{ colours: RGB[]; buffer: Float32Array } | null>(null);
+  const sourceBufferRef = useRef<{ colours: RGB[]; buffer: ColourBuffer } | null>(null);
   /**
    * "원본 색": the file's own colours, as it was loaded — what painting, filling and tidying
    * changed is not in it (11-04: it showed the faces as they are now, painted bits and all,
@@ -1680,26 +1815,33 @@ export default function App() {
     const own = originalColoursRef.current;
     const colours = own && own.length === model.triangles.length ? own : model.triangleColors;
     const prev = sourceBufferRef.current;
-    if (prev && prev.colours === colours && prev.buffer.length === model.triangles.length * 9) return prev.buffer;
+    if (prev && prev.colours === colours && prev.buffer.length === model.triangles.length * FACE_BYTES) return prev.buffer;
     const buffer = buildColourBuffer(model.triangles.length, (i) => colours[i]);
     sourceBufferRef.current = { colours, buffer };
     return buffer;
   }, [model]);
   const paletteHexKey = useMemo(() => palette.map((entry) => rgbToHex(entry.rgb)).join(","), [palette]);
-  const paletteBufferRef = useRef<{ colours: RGB[]; paletteKey: string; buffer: Float32Array } | null>(null);
+  const paletteBufferRef = useRef<{ colours: RGB[]; paletteKey: string; buffer: ColourBuffer } | null>(null);
   const paletteColours = useMemo(() => {
     if (!model || palette.length === 0) return sourceColours;
     const prev = paletteBufferRef.current;
     const patch = strokePatchFor(prev?.colours, model.triangleColors);
     const buffer =
-      patch && patch.exact && prev && prev.paletteKey === paletteHexKey && prev.buffer.length === model.triangles.length * 9
+      patch && patch.exact && prev && prev.paletteKey === paletteHexKey && prev.buffer.length === model.triangles.length * FACE_BYTES
         ? patchColourBuffer(prev.buffer, patch.faces, patch.rgb)
         : buildColourBuffer(model.triangles.length, (i) => palette[labels[i]]?.rgb ?? model.triangleColors[i]);
     paletteBufferRef.current = { colours: model.triangleColors, paletteKey: paletteHexKey, buffer };
     return buffer;
   }, [model, palette, labels, sourceColours, paletteHexKey]);
-  const printBufferRef = useRef<{ colours: RGB[]; paletteKey: string; effective: Map<number, RGB>; buffer: Float32Array } | null>(null);
+  const printBufferRef = useRef<{ colours: RGB[]; paletteKey: string; effective: Map<number, RGB>; buffer: ColourBuffer } | null>(null);
+  // Only while a view shows the print (11-05: built always, it was 36 bytes a face for nothing — 166 MB on a
+  // 4.6 M-face model in 02, where the result shows the palette).
+  const wantPrint = step <= 2 ? previewMode === "print" : step === 4 || singleMode === "print";
   const printColours = useMemo(() => {
+    if (!wantPrint) {
+      printBufferRef.current = null;
+      return null;
+    }
     if (!model || palette.length === 0 || effectiveByIndex.size === 0) return paletteColours;
     const prev = printBufferRef.current;
     const patch = strokePatchFor(prev?.colours, model.triangleColors);
@@ -1707,8 +1849,8 @@ export default function App() {
       const entry = palette[labels[i]];
       return (entry && effectiveByIndex.get(entry.index)) ?? entry?.rgb ?? model.triangleColors[i];
     };
-    let buffer: Float32Array;
-    if (patch && patch.exact && prev && prev.paletteKey === paletteHexKey && prev.effective === effectiveByIndex && prev.buffer.length === model.triangles.length * 9) {
+    let buffer: ColourBuffer;
+    if (patch && patch.exact && prev && prev.paletteKey === paletteHexKey && prev.effective === effectiveByIndex && prev.buffer.length === model.triangles.length * FACE_BYTES) {
       // The painted faces all print alike: one colour for all of them.
       buffer = patchColourBuffer(prev.buffer, patch.faces, printed(patch.faces[0]));
     } else {
@@ -1716,7 +1858,7 @@ export default function App() {
     }
     printBufferRef.current = { colours: model.triangleColors, paletteKey: paletteHexKey, effective: effectiveByIndex, buffer };
     return buffer;
-  }, [model, palette, labels, effectiveByIndex, paletteColours, paletteHexKey]);
+  }, [model, palette, labels, effectiveByIndex, paletteColours, paletteHexKey, wantPrint]);
   // While a cut is dragged the result shows the groups as they would be —
   // one colour buffer, nothing in the plan recomputed until the drag ends.
   // Each face's original colour as an index, worked out once per model, so a
@@ -1738,30 +1880,29 @@ export default function App() {
     }
     return { index, keys };
   }, [model]);
-  /** Two buffers taken in turn, so a drag does not allocate (and collect) 36 MB per move. */
-  const dragBuffers = useRef<Float32Array[]>([]);
+  /** Two buffers taken in turn, so a drag does not allocate (and collect) a buffer per move; let go once it ends. */
+  const dragBuffers = useRef<ColourBuffer[]>([]);
   const dragTurn = useRef(0);
   const dragColours = useMemo(() => {
-    if (!model || !stripData || !previewCuts || !faceColourIndex) return null;
+    if (!model || !stripData || !previewCuts || !faceColourIndex) {
+      dragBuffers.current = [];
+      return null;
+    }
     const built = stripPalette(liveGroups);
-    const linear = (v: number) => {
-      const c = v / 255;
-      return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
-    };
     const { index, keys } = faceColourIndex;
-    const colourOf = new Float32Array(keys.length * 3);
+    const colourOf = new Uint8Array(keys.length * 3);
     for (let u = 0; u < keys.length; u++) {
       const key = keys[u];
       const rgb = built.palette[built.groupOfKey.get(key) ?? 0]?.rgb ?? [(key >> 16) & 255, (key >> 8) & 255, key & 255];
-      colourOf[u * 3] = linear(rgb[0]);
-      colourOf[u * 3 + 1] = linear(rgb[1]);
-      colourOf[u * 3 + 2] = linear(rgb[2]);
+      colourOf[u * 3] = rgb[0];
+      colourOf[u * 3 + 1] = rgb[1];
+      colourOf[u * 3 + 2] = rgb[2];
     }
-    const size = model.triangles.length * 9;
+    const size = model.triangles.length * FACE_BYTES;
     dragTurn.current = 1 - dragTurn.current;
     let out = dragBuffers.current[dragTurn.current];
     if (!out || out.length !== size) {
-      out = new Float32Array(size);
+      out = new Uint8Array(size);
       dragBuffers.current[dragTurn.current] = out;
     }
     for (let f = 0, p = 0; f < index.length; f++) {
@@ -1769,14 +1910,14 @@ export default function App() {
       const r = colourOf[o];
       const g = colourOf[o + 1];
       const b = colourOf[o + 2];
-      out[p++] = r; out[p++] = g; out[p++] = b;
-      out[p++] = r; out[p++] = g; out[p++] = b;
-      out[p++] = r; out[p++] = g; out[p++] = b;
+      out[p++] = r; out[p++] = g; out[p++] = b; out[p++] = 255;
+      out[p++] = r; out[p++] = g; out[p++] = b; out[p++] = 255;
+      out[p++] = r; out[p++] = g; out[p++] = b; out[p++] = 255;
     }
     return out;
   }, [model, stripData, previewCuts, liveGroups, faceColourIndex]);
   const coloursForMode = (mode: PreviewMode) =>
-    mode === "source" ? sourceColours : (dragColours ?? (mode === "palette" ? paletteColours : printColours));
+    mode === "source" ? sourceColours : (dragColours ?? (mode === "palette" ? paletteColours : (printColours ?? paletteColours)));
 
   const defaultFileName = model ? `${baseName(model.name)}_colormix.3mf` : "model_colormix.3mf";
 
@@ -2277,7 +2418,7 @@ export default function App() {
           let bytes = 0;
           for (const kept of overlayShapes.values()) bytes += kept.fill.byteLength * 2 + kept.edges.byteLength * 2;
           for (const [oldKey, kept] of overlayShapes) {
-            if (bytes <= OVERLAY_SHAPE_BUDGET || oldKey === key) break;
+            if (bytes <= (model.triangles.length >= BIG_MODEL_FACES ? OVERLAY_SHAPE_BUDGET_BIG : OVERLAY_SHAPE_BUDGET) || oldKey === key) break;
             bytes -= kept.fill.byteLength * 2 + kept.edges.byteLength * 2;
             overlayShapes.delete(oldKey);
           }
@@ -2299,7 +2440,7 @@ export default function App() {
   const stripDragging = useRef(false);
   stripDragging.current = previewCuts !== null;
   useEffect(() => {
-    if (!model || labels.length !== model.triangles.length || palette.length === 0) return;
+    if (!model || labels.length !== model.triangles.length || palette.length === 0 || model.triangles.length >= BIG_MODEL_FACES) return;
     const order = palette.map((_, position) => position).sort((a, b) => (areaByPosition[b] ?? 0) - (areaByPosition[a] ?? 0));
     const idle = (run: () => void): number =>
       typeof window.requestIdleCallback === "function" ? window.requestIdleCallback(run, { timeout: 3000 }) : window.setTimeout(run, 200);
@@ -2375,9 +2516,22 @@ export default function App() {
   const pickedFaceCount = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.faces.length, 0), [pickedPatches]);
   const pickedFraction = useMemo(() => pickedPatches.reduce((sum, patch) => sum + patch.fraction, 0), [pickedPatches]);
   const pickedHexes = useMemo(() => [...new Set(pickedPatches.map((patch) => patch.hex))], [pickedPatches]);
+  // What an AI answer changed (set once the answer is in — see the ✨ below), flashing yellow (twice, then the outline a moment).
+  const flashArmRef = useRef<Uint32Array | null>(null);
+  /** The marks the last plan could not paint (see markFaces). */
+  const floodedRef = useRef<string[]>([]);
+  const [changeFlash, setChangeFlash] = useState<{ mask: Uint8Array; faces: number; total: number; at: number } | null>(null);
+  const flashOverlay = useMemo<HighlightOverlay | null>(
+    () =>
+      changeFlash
+        ? // Most of the model changed (a whole 🤖 paint): a light flash, the model still to be seen through it.
+          overlayFor(`flash-${changeFlash.at}`, changeFlash.mask, { colour: "#ffd60a", line: "#ffd60a", rim: "#0d0d0e", opacity: changeFlash.faces > changeFlash.total * 0.4 ? 0.3 : 0.7, lineOpacity: 1, pulse: true })
+        : null,
+    [changeFlash, overlayFor],
+  );
   const overlays = useMemo(
-    () => [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay].filter((o): o is HighlightOverlay => o !== null),
-    [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay],
+    () => [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay, flashOverlay].filter((o): o is HighlightOverlay => o !== null),
+    [selectedOverlay, hoverOverlay, pickedOverlay, hoverPatchOverlay, pickPreviewOverlay, flashOverlay],
   );
 
   function handleHover(hex: string | null): void {
@@ -3154,7 +3308,8 @@ export default function App() {
       const point = pointToView([geometry.centroids[f * 3], geometry.centroids[f * 3 + 1], geometry.centroids[f * 3 + 2]]);
       for (const handle of viewerHandles()) handle.focusOn(point);
     }
-    const current2d = atlasRef.current?.atlas;
+    // With the picked patches unfolded the map is laid out again for the new pick (and fits itself to it).
+    const current2d = unfoldOn ? null : atlasRef.current?.atlas;
     if (current2d && mapRef.current && source !== "map") {
       const chart = current2d.chartOf[clickedFace] ?? -1;
       let x0 = Infinity;
@@ -3858,6 +4013,9 @@ export default function App() {
   ): void {
     // Work put back (the autosave, a work file) keeps its hand-set print choices and orientation.
     const sameWork = options?.restored || options?.sameWork;
+    // Faces of one colour share its array, whatever read the model (rgbPool: a third of a big model's memory).
+    shareNewColours(next.triangleColors, null);
+    if (options?.original && options.original !== next.triangleColors) shareNewColours(options.original, null);
     loadGenerationRef.current += 1;
     modelFileRef.current = source;
     adjacencyRef.current = null;
@@ -4169,6 +4327,8 @@ export default function App() {
         colours: ownColours ? null : { faceCount: current.triangleColors.length, colours: packColours(current.triangleColors), savedAt: now, cuts: cuts.length },
         cuts: cuts.length > 0 ? { fileName: source.file.name, cuts, savedAt: now } : null,
         settings,
+        // The AI's part map and the consult go with the work: reopened, it goes on where it was.
+        ai: { partMap: partMaps[tidyModelName] ?? null, chat: tidyLog.filter((entry) => entry.model === tidyModelName).slice(-200) },
         app: `GYUROMA ${APP_VERSION}`,
         savedAt: now,
       });
@@ -4198,6 +4358,7 @@ export default function App() {
       const back = await putBackWork(work.file, work.colours, work.cuts, "file");
       if (!back) return;
       takeWorkSettings(work.settings, work.file.name);
+      takeWorkAi(work.ai, work.file.name);
       setStatus(t("status.workFileOpened", { name: file.name, at: new Date(work.savedAt).toLocaleString(lang === "ko" ? "ko-KR" : "en-GB") }));
       countAction("load/work");
       if (!rememberWorkRef.current) {
@@ -4241,6 +4402,20 @@ export default function App() {
         export: { ...prev.export, coordinateMode: saved.export.coordinateMode },
         ...(takeWorkshop ? { filaments: saved.filaments, mix: saved.mix } : {}),
       };
+    });
+  }
+
+  /** A work file's part map and consult, back (a preview then is on the colours already: it counts as applied). */
+  function takeWorkAi(ai: WorkFileContents["ai"], modelName: string): void {
+    if (!ai) return;
+    const map = ai.partMap as StoredPartMap | null;
+    if (map && typeof map === "object" && Array.isArray(map.parts) && typeof map.faces === "number") setPartMaps((prev) => ({ ...prev, [modelName]: map }));
+    const chat = (ai.chat as TidyLogEntry[]).filter((entry) => entry && typeof entry.id === "string" && typeof entry.text === "string");
+    if (chat.length === 0) return;
+    setTidyLog((prev) => {
+      const have = new Set(prev.map((entry) => entry.id));
+      const back = chat.filter((entry) => !have.has(entry.id)).map((entry) => ({ ...entry, model: modelName, status: entry.status === "preview" ? ("applied" as const) : entry.status }));
+      return [...prev, ...back].slice(-200);
     });
   }
 
@@ -4325,6 +4500,8 @@ export default function App() {
   }
 
   function applyColours(current: MeshModel, next: RGB[], options?: { keepSelection?: boolean; uniqueFaceColors?: number }): void {
+    // What an edit painted shares the colour arrays too (only the faces whose array is new are looked up).
+    shareNewColours(next, current.triangleColors);
     if (history.length >= 20) forgetOldestUndo("colours");
     setHistory((prev) => [...prev.slice(-19), current.triangleColors]);
     pushUndo("colours");
@@ -4405,6 +4582,94 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showMap, geometryTriangles]);
+
+  // A file dropped where nothing takes it is not opened by the browser (it would leave the app, and the work on
+  // screen with it — 11-05: a picture let go beside the consult's field opened in a new tab).
+  useEffect(() => {
+    const keep = (event: DragEvent) => {
+      if (event.dataTransfer && [...event.dataTransfer.types].includes("Files")) event.preventDefault();
+    };
+    window.addEventListener("dragover", keep);
+    window.addEventListener("drop", keep);
+    return () => {
+      window.removeEventListener("dragover", keep);
+      window.removeEventListener("drop", keep);
+    };
+  }, []);
+
+  // 🧩 The picked patches unfolded (unfold.ts, in a worker): a new pick lays them out again.  Keyed by what is
+  // picked, not by the list's identity — a list made again for the same patches must not start the solve over
+  // (11-05 Tkc: it never came to an end).
+  const pickKey = model ? `${model.triangles.length}|${pickedPatches.map((patch) => `${patch.id}:${patch.faces.length}`).join(",")}` : "";
+  const pickedForUnfoldRef = useRef(pickedPatches);
+  pickedForUnfoldRef.current = pickedPatches;
+  useEffect(() => {
+    const picked = pickedForUnfoldRef.current;
+    const total = picked.reduce((n, patch) => n + patch.faces.length, 0);
+    if (!showMap || !unfoldOn || !model || total === 0 || total > UNFOLD_MAX_FACES) {
+      cancelUnfold();
+      unfoldRunningKeyRef.current = null;
+      setUnfolding(null);
+      setUnfolded(null);
+      setUnfoldNote(showMap && unfoldOn && total > UNFOLD_MAX_FACES ? t("map.unfoldTooBig", { n: total.toLocaleString(), max: UNFOLD_MAX_FACES.toLocaleString() }) : null);
+      return;
+    }
+    const key = pickKey;
+    if (unfoldedRef.current?.key === key || unfoldRunningKeyRef.current === key) return;
+    setUnfoldNote(null);
+    const timer = window.setTimeout(() => {
+      // The patches' faces, and their corners numbered afresh (positions of those vertices only).
+      const mark = new Uint8Array(model.triangles.length);
+      for (const patch of picked) for (const f of patch.faces) mark[f] = 1;
+      const faces = new Int32Array(total);
+      let count = 0;
+      for (let f = 0; f < mark.length; f++) if (mark[f]) faces[count++] = f;
+      const used = faces.subarray(0, count);
+      const localOf = new Int32Array(model.vertices.length).fill(-1);
+      const triangles = new Int32Array(count * 3);
+      const order: number[] = [];
+      for (let i = 0; i < count; i++) {
+        const tri = model.triangles[used[i]];
+        for (let k = 0; k < 3; k++) {
+          let local = localOf[tri[k]];
+          if (local < 0) {
+            local = localOf[tri[k]] = order.length;
+            order.push(tri[k]);
+          }
+          triangles[i * 3 + k] = local;
+        }
+      }
+      const positions = new Float64Array(order.length * 3);
+      order.forEach((g, i) => positions.set(model.vertices[g], i * 3));
+      const facesKept = used.slice();
+      unfoldRunningKeyRef.current = key;
+      setUnfolding(0);
+      const started = performance.now();
+      unfoldInWorker(positions, triangles, (share) => {
+        if (unfoldRunningKeyRef.current === key) setUnfolding(share);
+      })
+        .then((out) => {
+          if (unfoldRunningKeyRef.current !== key) return;
+          unfoldRunningKeyRef.current = null;
+          const size = facesKept.length > 300_000 ? 3072 : 2048;
+          try {
+            setUnfolded({ key, atlas: buildPatchAtlas(model, faceGeometryFor(model), facesKept, out, size), pieces: out.pieces });
+            setStatus(t("status.unfolded", { faces: facesKept.length.toLocaleString(), pieces: out.pieces, s: ((performance.now() - started) / 1000).toFixed(1) }));
+          } catch (err) {
+            setUnfoldNote(t("map.unfoldFailed", { message: err instanceof Error ? err.message : String(err) }));
+          }
+          setUnfolding(null);
+        })
+        .catch((err) => {
+          if (err instanceof UnfoldSuperseded || unfoldRunningKeyRef.current !== key) return;
+          unfoldRunningKeyRef.current = null;
+          setUnfolding(null);
+          setUnfoldNote(t("map.unfoldFailed", { message: err instanceof Error ? err.message : String(err) }));
+        });
+    }, 180);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showMap, unfoldOn, pickKey]);
 
   /** What the result view shows a face as, for the colour map (its group's colour, or the print's). */
   const mapLookRef = useRef<{ palette: PaletteEntry[]; labels: Int32Array; mode: PreviewMode; effective: Map<number, RGB> } | null>(null);
@@ -4505,8 +4770,8 @@ export default function App() {
 
   function brushHover3D(hit: ViewerHit | null): void {
     showBrushCursorAt(hit);
-    const current = atlasRef.current?.atlas ?? null;
-    mapRef.current?.setRemoteCursor(hit && current ? faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS) : null);
+    const current = mapAtlasNow();
+    mapRef.current?.setRemoteCursor(hit && current && current.chartOf[hit.faceIndex] >= 0 ? faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS) : null);
   }
 
   /**
@@ -4516,8 +4781,13 @@ export default function App() {
    */
   function hoverHit3D(hit: ViewerHit | null): void {
     if (!hit) return;
-    const current = atlasRef.current?.atlas ?? null;
+    const current = mapAtlasNow();
     if (!current) return;
+    // Off the map (the map shows the picked patches unfolded, this face is not among them).
+    if (current.chartOf[hit.faceIndex] < 0) {
+      mapRef.current?.setPointer(null);
+      return;
+    }
     // The pointer is on the model now: the model's own mark (the map's last spot) goes.
     for (const handle of viewerHandles()) handle.setPointerMark(null);
     mapRef.current?.setPointer(faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS), true);
@@ -4526,7 +4796,7 @@ export default function App() {
   /** The map's brush: the surface under the circle, as the 3D brush paints it (faces the map shows thin or not at all included). */
   function paintAtMap(x: number, y: number): void {
     const current = modelRef.current;
-    const built = atlasRef.current?.atlas ?? null;
+    const built = mapAtlasNow();
     if (!current || !built || !strokeRef.current) return;
     const geometry = faceGeometryFor(current);
     const reach = facesUnderMapBrush(built, current, geometry, x, y, brushRadius);
@@ -4640,7 +4910,7 @@ export default function App() {
       // The spot under the map's pointer, marked on the model (it stays where the pointer last touched the
       // map); the map's own mark goes, the pointer is here now.
       const current = modelRef.current;
-      const built = atlasRef.current?.atlas ?? null;
+      const built = mapAtlasNow();
       if (face !== null && face >= 0 && at && current && built) {
         const geometry = faceGeometryFor(current);
         const mark = {
@@ -4667,7 +4937,8 @@ export default function App() {
 
   // Brush size bounds follow the model size; the slider is logarithmic.
   const brushBounds = useMemo(() => {
-    const radius = model ? faceGeometryFor(model).radius : 1;
+    // The size alone (11-05: the whole face geometry, 110 MB on a 4.6 M-face model, was built here just for it).
+    const radius = model ? modelRadius(model) : 1;
     return { min: radius * 0.003, max: radius * 0.6 };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [geometryTriangles]);
@@ -5136,6 +5407,65 @@ export default function App() {
     return null;
   }, [tidyLog, tidyModelName]);
 
+  /**
+   * ✨ An answer that came (11-05, the owner: "클로드가 최종 답을 줄 때 뭔가 줬다는 표시를 해 줘 — 팝업이 뜨든 바뀐 부분이
+   * 번쩍하든, 뭐가 바뀐지 모르겠잖아"): a word over the views, and the faces it changed flashing yellow on the model.
+   * The faces' colours are noted when the first plan of an ask goes in and compared once everything has settled
+   * (the AI done, the bake done), so a three-pass 🤖 flashes all it changed.
+   */
+  const paletteColoursRef = useRef(paletteColours);
+  paletteColoursRef.current = paletteColours;
+  const [aiArrived, setAiArrived] = useState<number | null>(null);
+  useEffect(() => {
+    if (!flashArmRef.current || busy !== null || pendingPlan || tidyBusy !== null) return;
+    const timer = window.setTimeout(() => {
+      const before = flashArmRef.current;
+      const now = paletteColoursRef.current;
+      flashArmRef.current = null;
+      if (!before || !now || now.length / FACE_BYTES !== before.length) return;
+      const after = packedFaceColours(now);
+      const mask = new Uint8Array(before.length);
+      let faces = 0;
+      for (let f = 0; f < before.length; f++)
+        if (after[f] !== before[f]) {
+          mask[f] = 1;
+          faces++;
+        }
+      if (faces > 0) setChangeFlash({ mask, faces, total: before.length, at: Date.now() });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [paletteColours, busy, pendingPlan, tidyBusy]);
+  useEffect(() => {
+    if (!changeFlash) return;
+    // A small change stays outlined while its preview waits for ✅ or ↩ (11-05, the owner: the view turned to
+    // look at it, and the mark had gone); a whole paint only flashes.
+    const small = changeFlash.faces <= changeFlash.total * 0.4;
+    if (small && aiPreview) return;
+    const timer = window.setTimeout(() => setChangeFlash(null), small ? 300 : 4500);
+    return () => window.clearTimeout(timer);
+  }, [changeFlash, aiPreview]);
+  const tidyBusyWasRef = useRef<string | null>(null);
+  /** The newest entry when the AI started: an answer is any AI entry after it (a note may follow the answer). */
+  const tidyLogAtStartRef = useRef<string | null>(null);
+  useEffect(() => {
+    const was = tidyBusyWasRef.current;
+    tidyBusyWasRef.current = tidyBusy;
+    if (was === null && tidyBusy !== null) {
+      tidyLogAtStartRef.current = tidyLog.length ? tidyLog[tidyLog.length - 1].id : null;
+      return;
+    }
+    if (was === null || tidyBusy !== null) return;
+    const from = tidyLogAtStartRef.current ? tidyLog.findIndex((entry) => entry.id === tidyLogAtStartRef.current) + 1 : 0;
+    if (tidyLog.slice(from).some((entry) => entry.model === tidyModelName && entry.role === "ai")) setAiArrived(Date.now());
+    // Only when the AI starts or stops working.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tidyBusy]);
+  useEffect(() => {
+    if (aiArrived === null) return;
+    const timer = window.setTimeout(() => setAiArrived(null), 6000);
+    return () => window.clearTimeout(timer);
+  }, [aiArrived]);
+
   /** How the consults reach Claude (the same in 02, 03 and 04). */
   const aiConnection = {
     route: aiRoute,
@@ -5303,6 +5633,11 @@ export default function App() {
 
   /** The part looked at up close: its faces and blobs, for the colours they were made on. */
   const focusRef = useRef<{ triangles: MeshModel["triangles"]; colours: RGB[]; part: string; map: BlobMap; mask: Uint8Array } | null>(null);
+  /** Each close-up answer's blobs, so a proposal tried later (👀) paints the blobs it was made for. */
+  const focusByEntryRef = useRef(new Map<string, NonNullable<typeof focusRef.current>>());
+  /** 🤖 every part up close: each part's blobs, and which part each face is (a part paints its own faces only). */
+  const autoFocusRef = useRef<{ triangles: MeshModel["triangles"]; partOfFace: Int32Array; parts: Map<string, { index: number; map: BlobMap; share: number }> } | null>(null);
+  const autoFocusByEntryRef = useRef(new Map<string, NonNullable<typeof autoFocusRef.current>>());
 
   /** The dark holes and dents of the sculpt (eye holes of a button), for the colours as they are. */
   const pitsRef = useRef<{ colours: RGB[]; pits: Pit[] } | null>(null);
@@ -5481,7 +5816,7 @@ export default function App() {
     const printPics = printColours ?? palettePics;
     const current: string[] = [];
     const currentLabels: string[] = [];
-    const add = (colours: Float32Array | null, views: ViewName[], what: string) => {
+    const add = (colours: ColourBuffer | null, views: ViewName[], what: string) => {
       if (!colours) return;
       for (const shot of renderViews(positions, colours, views)) {
         current.push(shot.dataUrl);
@@ -5569,6 +5904,7 @@ export default function App() {
         entryId,
         title,
         lines,
+        historyTop: history[history.length - 1] ?? null,
         settings: { palette: settings.palette, merge: settings.merge, mergeFlags: settings.mergeFlags, stripByModel: settings.stripByModel, mix: settings.mix },
         colours: model.triangleColors,
         chain: chain ? { ...chain } : null,
@@ -5632,7 +5968,10 @@ export default function App() {
     current: MeshModel,
     changes: TidyChanges,
     mapNow?: StoredPartMap | null,
-  ): { next: RGB[]; also: Map<number, string>; pinned: { pins: number[][] | undefined; from: Record<string, number> | undefined } | undefined; faces: number; moved: Array<[string, string]>; pitHexes: string[] } | null {
+  ): { next: RGB[]; also: Map<number, string>; pinned: { pins: number[][] | undefined; from: Record<string, number> | undefined } | undefined; faces: number; moved: Array<[string, string]>; pitHexes: string[]; flooded: string[] } | null {
+    // Things pointed at that were not painted (the wand ran over their part): said after the plan goes in.
+    const flooded: string[] = [];
+    floodedRef.current = flooded;
     if (labels.length !== current.triangles.length) return null;
     const before = current.triangleColors;
     const next = before.slice();
@@ -5716,7 +6055,8 @@ export default function App() {
     }
     // A part up close: its pieces (blobs grouped by the AI), each one colour.
     const focus = focusRef.current;
-    const focusUsable = Boolean(changes.pieces?.length && focus && focus.triangles === current.triangles && focus.colours === current.triangleColors);
+    // The blobs come from the model's own colours: they hold as long as the mesh does (other parts may have been painted since).
+    const focusUsable = Boolean(changes.pieces?.length && focus && focus.triangles === current.triangles);
     if (focusUsable && focus) {
       for (const piece of changes.pieces ?? []) {
         const rgb = rgbOf(piece.colour);
@@ -5725,6 +6065,147 @@ export default function App() {
           if (!blob) continue;
           for (let k = 0; k < blob.members.length; k++) paintFace(focus.map.faces[blob.members[k]], rgb);
         }
+      }
+    }
+    // 🤖 every part up close: each part's own faces in the colours its blobs were given; what no answer placed
+    // (a blob blurred across two things, a part with no answer) takes the side cheapest to reach.
+    const auto = autoFocusRef.current;
+    const autoUsable = Boolean(changes.assign?.length && auto && auto.triangles === current.triangles);
+    if (autoUsable && auto) {
+      const colourIds: RGB[] = [];
+      const idOfHex = new Map<string, number>();
+      const idOf = (rgb: RGB) => {
+        const key = rgbToHex(rgb);
+        let id = idOfHex.get(key);
+        if (id === undefined) {
+          id = colourIds.length;
+          idOfHex.set(key, id);
+          colourIds.push(rgb);
+        }
+        return id;
+      };
+      const looked = new Uint8Array(auto.parts.size ? Math.max(...[...auto.parts.values()].map((p) => p.index)) + 1 : 0);
+      for (const info of auto.parts.values()) looked[info.index] = 1;
+      // The answers' colours first (they are what is voted on), then the colours of faces no part looked at.
+      const assignIds = (changes.assign ?? []).map((m) => idOf(rgbOf(m.colour)));
+      const width = colourIds.length;
+      const ids = new Int32Array(next.length);
+      for (let f = 0; f < next.length; f++) {
+        const p = auto.partOfFace[f];
+        ids[f] = p >= 0 && p < looked.length && looked[p] ? -1 : idOf(next[f]);
+      }
+      const inParts = ids.map((id) => (id === -1 ? 1 : 0));
+      // Each part saw its own faces and the cells round them, so most faces were looked at by a few parts: they vote.
+      // A part calling a thing its own counts most (more still on its own faces), a part naming a neighbour's
+      // thing counts once — one part getting it wrong is outvoted (11-04 Tkc: the hat took its brim's lip for
+      // hair; six neighbours said brim → orange).  The goggles saying "my lens" beats the hat calling it gear.
+      const votes = new Uint8Array(next.length * width);
+      // The colour a small thing named on this face got (it is not overruled by its blob's majority afterwards).
+      const pinned = new Int32Array(next.length).fill(-1);
+      for (let a = 0; a < (changes.assign ?? []).length; a++) {
+        const m = (changes.assign ?? [])[a];
+        const info: { index: number; map: BlobMap; share: number } | undefined = auto.parts.get(m.part);
+        if (!info) continue;
+        const id = assignIds[a];
+        const mine = m.mine !== false;
+        // A small thing named as one's own (a brooch's gold dot, a bag's stripe — under 0.05 % of the model) is the
+        // surest answer there is: it outvotes a part calling the whole flower its own black (11-04 Tkc).
+        let groupFaces = 0;
+        for (const b of m.blobs) groupFaces += info.map.blobs[b - 1]?.members.length ?? 0;
+        const pinpoint = mine && groupFaces < next.length * 0.0005 ? 2 : 0;
+        for (const b of m.blobs) {
+          const blob: BlobMap["blobs"][number] | undefined = info.map.blobs[b - 1];
+          if (!blob) continue;
+          for (let k = 0; k < blob.members.length; k++) {
+            const face: number = info.map.faces[blob.members[k]];
+            if (!inParts[face]) continue;
+            const own = auto.partOfFace[face] === info.index;
+            const weight = mine ? (own ? 5 : 4) + pinpoint : 1;
+            const slot = face * width + id;
+            votes[slot] = Math.min(255, votes[slot] + weight);
+            if (pinpoint) pinned[face] = id;
+          }
+        }
+      }
+      // A face's own vote, kept where it wins clearly (twice the runner-up: "my lens" against the hat's "gear").
+      const clear = new Uint8Array(next.length);
+      for (let f = 0; f < next.length; f++) {
+        if (!inParts[f]) continue;
+        let best = -1;
+        let most = 0;
+        let second = 0;
+        for (let c = 0; c < width; c++) {
+          const v = votes[f * width + c];
+          if (v > most) {
+            second = most;
+            most = v;
+            best = c;
+          } else if (v > second) second = v;
+        }
+        ids[f] = best;
+        if ((most >= 2 * second && most >= 2) || (best >= 0 && pinned[f] === best)) clear[f] = 1;
+      }
+      // Where the vote is close, the face goes with its blob (as its own part cut it): one thing stays one colour,
+      // not a patchwork of neighbours' guesses (11-04 Tkc: a brim in three colours).
+      for (const info of auto.parts.values()) {
+        const tally = new Float64Array(width);
+        for (const blob of info.map.blobs) {
+          tally.fill(0);
+          let any = false;
+          for (let k = 0; k < blob.members.length; k++) {
+            const face: number = info.map.faces[blob.members[k]];
+            if (auto.partOfFace[face] !== info.index) continue;
+            for (let c = 0; c < width; c++) tally[c] += votes[face * width + c];
+            any = true;
+          }
+          if (!any) continue;
+          let major = -1;
+          let top = 0;
+          for (let c = 0; c < width; c++) if (tally[c] > top) {
+            top = tally[c];
+            major = c;
+          }
+          if (major < 0) continue;
+          for (let k = 0; k < blob.members.length; k++) {
+            const face: number = info.map.faces[blob.members[k]];
+            if (auto.partOfFace[face] === info.index && !clear[face]) ids[face] = major;
+          }
+        }
+      }
+      const filled = fillUnlabelled(ids, adjacencyFor(current), creasesFor(current).geometry, { lab: ownLabOf(current), grooveCost: 60, colourCost: 0.6 });
+      for (let f = 0; f < next.length; f++) if (inParts[f] && filled[f] >= 0) paintFace(f, colourIds[filled[f]]);
+      // Things pointed at (a bag's stripe, a brooch's dot): from the face under the point over that thing's own
+      // colour (a magic wand on the surface, stopping at folds), over whatever the votes gave.
+      for (const m of changes.marks ?? []) {
+        const info: { index: number; map: BlobMap; share: number } | undefined = auto.parts.get(m.part);
+        let within: Uint8Array | null = null;
+        if (info) {
+          within = new Uint8Array(next.length);
+          for (let i = 0; i < info.map.faces.length; i++) within[info.map.faces[i]] = 1;
+        }
+        const region = markRegion(m.seed, ownLabOf(current), adjacencyFor(current), creasesFor(current).geometry, within, next.length, m.shaded === true);
+        if (!region) {
+          flooded.push(m.what || m.part);
+          continue;
+        }
+        const rgb = rgbOf(m.colour);
+        for (const f of region) paintFace(f, rgb);
+      }
+    }
+    // Things pointed at from a consult (no 🤖 run round them): the same wand, inside the part and the cells round it.
+    if (!autoUsable && changes.marks?.length) {
+      const marksMap = mapNow === undefined ? partMapFor(current) : mapNow;
+      const cells = cellsFor(current);
+      for (const m of changes.marks) {
+        const index = marksMap && marksMap.cells === cells.count ? marksMap.parts.findIndex((part) => part.name === m.part) : -1;
+        const within = marksMap && index >= 0 ? partNeighbourhood(cells, marksMap.parts[index].cells, next.length) : null;
+        const region = markRegion(m.seed, ownLabOf(current), adjacencyFor(current), creasesFor(current).geometry, within, next.length, m.shaded === true);
+        if (!region) {
+          flooded.push(m.what || m.part);
+          continue;
+        }
+        const rgb = rgbOf(m.colour);
+        for (const f of region) paintFace(f, rgb);
       }
     }
     // Holes and dents (a button's eye holes) with the colour chosen for them.
@@ -5759,7 +6240,7 @@ export default function App() {
     }
     // Colour borders into the grooves nearby (on by default with a part tidy): where sculpted parts of
     // different colour meet, the colour changes at the bottom of the groove between them.
-    const band = changes.creaseSnap ?? (changes.partTidy?.length || focusUsable ? 3 : 0);
+    const band = changes.creaseSnap ?? (changes.partTidy?.length || focusUsable || autoUsable ? 3 : 0);
     if (band > 0) {
       // By group, not by shade: a group's faces keep their thousands of shades (the bake makes them one);
       // a face that changes side takes the group's colour.  (11-04: by shade, the blue of the eyes mixed
@@ -5803,7 +6284,7 @@ export default function App() {
         if (pitColours.has(rgbToHex(c))) frozen[id] = 1;
       });
       // A part up close changes only inside what was looked at.
-      const only = focusUsable && !changes.partTidy?.length && focus ? focus.mask : null;
+      const only = focusUsable && !changes.partTidy?.length && !autoUsable && focus ? focus.mask : null;
       const snapped = snapToCreases(ids, adjacencyFor(current), creasesFor(current).geometry, { band, frozen, lab: ownLabOf(current), grooveCost: 60, colourCost: 0.5, only });
       for (let f = 0; f < next.length; f++) if (snapped[f] !== ids[f]) paintFace(f, colourOf[snapped[f]]);
     }
@@ -5817,7 +6298,7 @@ export default function App() {
       pins = [...(pins ?? []), [key]];
     }
     if (faces === 0) return null;
-    return { next, also, pinned: pins !== storedStrip?.pins || from !== storedStrip?.from ? { pins, from } : undefined, faces, moved, pitHexes: [...pitColours] };
+    return { next, also, pinned: pins !== storedStrip?.pins || from !== storedStrip?.from ? { pins, from } : undefined, faces, moved, pitHexes: [...pitColours], flooded };
   }
 
   /** 03's hand choices, as a plan sets them (by the colour's palette number). */
@@ -5856,12 +6337,15 @@ export default function App() {
    */
   function applyPlan(changes: TidyChanges, entryId: string, title: string, lines: ChangeLine[], dropped?: string[], mapNow?: StoredPartMap | null): void {
     if (!model) return;
+    // The faces' colours before this ask's first plan, to flash what it changed once all is in.
+    if (!flashArmRef.current && paletteColoursRef.current) flashArmRef.current = packedFaceColours(paletteColoursRef.current);
     if (tidyChainRef.current && tidyChainRef.current.base.length !== model.triangles.length) tidyChainRef.current = null;
     const chain = tidyChainRef.current;
     pushTidyUndo({
       entryId,
       title,
       lines,
+      historyTop: history[history.length - 1] ?? null,
       settings: {
         palette: settings.palette,
         merge: settings.merge,
@@ -5895,7 +6379,12 @@ export default function App() {
       }
       patchSettings("export", next);
     }
+    floodedRef.current = [];
     const painted = hasColourEdits(changes) ? planColours(model, changes, mapNow) : null;
+    if (floodedRef.current.length) {
+      const what = [...new Set(floodedRef.current)].join(" · ");
+      setTidyLog((prev) => [...prev, { id: `s${Date.now()}f`, role: "sys", text: t("tidy.markFlooded", { what }), at: new Date().toISOString(), model: tidyModelName, scope: "clean" }]);
+    }
     if (painted) {
       keepGroupsFor(model.triangleColors, painted.next, painted.also.size ? painted.also : undefined, painted.pinned);
       if (painted.moved.length) {
@@ -5919,7 +6408,8 @@ export default function App() {
       trimTeeth: changes.trimTeeth,
       lineSmooth: changes.lineSmooth,
       // The holes' colour is protected: small as they are, the bake's speck clean-up would take them (11-04: minBlob 300 ate a button's eye holes).
-      protect: [...new Set([...(changes.protect ?? []).map(rename), ...(painted?.pitHexes ?? [])])],
+      // So are the things pointed at (a thin rim — 11-05): a speck clean-up would take a rim a few faces wide.
+      protect: [...new Set([...(changes.protect ?? []).map(rename), ...(painted?.pitHexes ?? []), ...(painted ? (changes.marks ?? []).map((m) => m.colour.toUpperCase()) : [])])],
       unprotect: changes.unprotect?.map(rename),
       merge: changes.merge?.map((m) => ({ from: rename(m.from), into: rename(m.into) })),
       protectAccents: changes.protectAccents,
@@ -5948,7 +6438,8 @@ export default function App() {
   /** ✅ on a preview: it stays (it is already in; only the mark changes). */
   function acceptPreview(entryId: string): void {
     const entry = tidyLog.find((e) => e.id === entryId);
-    setTidyLog((prev) => prev.map((e) => (e.id === entryId && e.status === "preview" ? { ...e, status: "applied" as const } : e)));
+    // Previews stack (an auto tidy, then its parts up close): they are all on the model, so ✅ keeps them all.
+    setTidyLog((prev) => prev.map((e) => (e.model === tidyModelName && e.status === "preview" ? { ...e, status: "applied" as const } : e)));
     setStatus(t("tidy.previewApplied", { title: entry?.text.slice(0, 40) ?? "" }));
   }
 
@@ -5978,11 +6469,28 @@ export default function App() {
     if (model.triangleColors !== expected && model.triangleColors !== saved.colours && !window.confirm(t("tidy.undoConfirm"))) return;
     setPendingTidy(null);
     setSettings((prev) => ({ ...prev, ...saved.settings }));
-    if (model.triangleColors !== saved.colours) applyColours(model, saved.colours, { keepSelection: true });
-    // The bake recorded the colours it started from; back at those, that step would be a no-op — dropped.
-    if (chain && saved.colours === chain.base && history[history.length - 1] === chain.base) {
-      setHistory((prev) => prev.slice(0, -1));
-      dropUndo("colours");
+    if (saved.historyTop !== undefined) {
+      // Back to before the tidy, its own colour steps (the paint, the bake) leave the history with it: ↩ again goes
+      // to what came before the tidy — not back to its result, as when the undo itself was a step (11-04).
+      const at = saved.historyTop === null ? 0 : history.lastIndexOf(saved.historyTop) + 1;
+      const drop = at > 0 || saved.historyTop === null ? history.length - at : 0;
+      if (model.triangleColors !== saved.colours) {
+        setModel({ ...model, triangleColors: saved.colours, stats: { ...model.stats, uniqueFaceColors: countUniqueColours(saved.colours) } });
+        forgetRecipeUndo();
+      }
+      if (drop > 0) {
+        setHistory((prev) => prev.slice(0, at));
+        for (let k = 0; k < drop; k++) dropUndo("colours");
+      }
+      setFuture([]);
+      redoOrderRef.current = [];
+    } else {
+      if (model.triangleColors !== saved.colours) applyColours(model, saved.colours, { keepSelection: true });
+      // The bake recorded the colours it started from; back at those, that step would be a no-op — dropped.
+      if (chain && saved.colours === chain.base && history[history.length - 1] === chain.base) {
+        setHistory((prev) => prev.slice(0, -1));
+        dropUndo("colours");
+      }
     }
     tidyChainRef.current = saved.chain;
     tidyUndoRef.current = steps.slice(0, -1);
@@ -6033,6 +6541,7 @@ export default function App() {
         entryId,
         title,
         lines,
+        historyTop: history[history.length - 1] ?? null,
         settings: { palette: settings.palette, merge: settings.merge, mergeFlags: settings.mergeFlags, stripByModel: settings.stripByModel, mix: settings.mix },
         colours: before,
         chain: chain ? { ...chain } : null,
@@ -6104,9 +6613,129 @@ export default function App() {
     if (!entry?.changes || busy !== null) return;
     const context = planContext(entry.scope);
     if (!context) return;
+    const heldAuto = autoFocusByEntryRef.current.get(entryId);
+    if (heldAuto && model && heldAuto.triangles === model.triangles) autoFocusRef.current = heldAuto;
+    const held = focusByEntryRef.current.get(entryId);
+    if (held && model && held.triangles === model.triangles) {
+      focusRef.current = held;
+      context.focus = { part: held.part, blobs: held.map.blobs.map((b) => ({ id: b.id, areaPct: b.areaPct, mean: rgbToHex(b.mean), family: b.familyName })) };
+    }
     const { changes, dropped } = sanitizeChanges({ ...entry.changes, parts: undefined }, context, entry.scope, t);
+    if (changes.fix?.length) {
+      void tryWithFixes(entryId, changes, dropped, context);
+      return;
+    }
     const lines = describeChanges(changes, context, t);
     setTidyLog((prev) => prev.map((e) => (e.id === entryId ? { ...e, status: lines.length > 0 ? "preview" : "none", lines } : e)));
+    if (lines.length > 0) applyPlan(changes, entryId, t("tidy.bySuggestion"), lines, dropped);
+  }
+
+  /**
+   * 💬 What a consult wants painted that no blob or cell holds alone (a thin white rim round an eye — 11-05, the owner:
+   * "색이 안 잡힌다는 이유로 아무것도 안 했어"): asked again with a grid on the part's own original pictures, the
+   * points the AI gives become wand marks — painted along the original's colour borders, stopping at folds.
+   */
+  async function marksForFixes(fixes: NonNullable<TidyChanges["fix"]>, context: TidyContext, message: string, signal: AbortSignal, route: AiRoute): Promise<{ marks: NonNullable<TidyChanges["marks"]>; missed: string[] }> {
+    const marks: NonNullable<TidyChanges["marks"]> = [];
+    const missed: string[] = [];
+    const current = model;
+    const map = current ? partMapFor(current) : null;
+    const cells = current ? cellsFor(current) : null;
+    if (!current || !positions || !map || !cells || map.cells !== cells.count) return { marks, missed: fixes.map((fix) => fix.what) };
+    const SIZE = 720;
+    const ownBuffer = buildColourBuffer(current.triangles.length, (i) => ownColoursOf(current)[i]);
+    const resultBuffer = paletteColours ?? sourceColours ?? ownBuffer;
+    const shots = takeTidyPictures("clean", false);
+    const lab = ownLabOf(current);
+    for (let n = 0; n < fixes.length; n++) {
+      const fix = fixes[n];
+      setTidyBusy(t("tidy.busyPoint", { what: fix.what, done: n, n: fixes.length }));
+      await yieldToUi();
+      const index = map.parts.findIndex((part) => part.name === fix.part);
+      if (index < 0) {
+        missed.push(fix.what);
+        continue;
+      }
+      // The part's cells and two rings of cells round them (the part map is rough).
+      const own = new Uint8Array(cells.count);
+      for (const c of map.parts[index].cells) own[c] = 1;
+      const inRegion = partNeighbourhood(cells, map.parts[index].cells, current.triangles.length);
+      const partFaces: number[] = [];
+      for (let f = 0; f < cells.cellOf.length; f++) if (own[cells.cellOf[f]]) partFaces.push(f);
+      const poses = partCloseUps(partFaces, 2);
+      const originals = renderViews(positions, ownBuffer, poses, SIZE);
+      const [now] = renderViews(positions, resultBuffer, [poses[0]], SIZE);
+      const images = await Promise.all([...originals.map((shot) => withGrid(shot.dataUrl)), withGrid(now.dataUrl)]);
+      const first = (shots?.stable.length ?? 0) + 1;
+      const pick = poses.map((_, i) => first + i);
+      const resultPicture = first + poses.length;
+      const labels = [...poses.map((_, i) => `${fix.part} 원본 확대 ${i + 1} — 격자`), `${fix.part} 지금 결과 — 사진 ${first}과 같은 각도, 격자`];
+      const reply = await aiAsk(
+        {
+          stable: tidyStablePrompt(context),
+          stableImages: shots?.stable ?? [],
+          images,
+          text: pointPrompt(context, 0, fix.part, map.subject, `${fix.what} → ${fix.colour}${fix.problem ? ` (${fix.problem})` : ""}`, [{ id: 1, name: fix.what, hex: fix.colour }], pick, resultPicture, SIZE, [...(shots?.stableLabels ?? []), ...labels], message),
+          schema: POINT_SCHEMA,
+          tag: "point",
+        },
+        signal,
+        route,
+      ).catch((err) => {
+        if (signal.aborted) throw err;
+        return null;
+      });
+      let got = 0;
+      if (reply?.ok) {
+        const idsOf = new Map<number, Int32Array>();
+        for (const point of sanitizePoints(reply.result, [...pick, resultPicture], SIZE, new Set([1]))) {
+          const poseIndex = point.picture === resultPicture ? 0 : point.picture - first;
+          let ids = idsOf.get(poseIndex);
+          if (!ids) idsOf.set(poseIndex, (ids = renderFaceIds(positions, poses[poseIndex], SIZE)));
+          const seed = seedUnderPoint(ids, SIZE, point.x, point.y, inRegion, lab, point.source);
+          if (seed < 0) continue;
+          marks.push({ part: fix.part, seed, colour: fix.colour, what: point.what || fix.what, ...(point.shaded ? { shaded: true } : {}) });
+          got++;
+        }
+      }
+      if (got === 0) missed.push(fix.what);
+    }
+    return { marks, missed };
+  }
+
+  /** A consult's fixes made marks (pointed at on the pictures), in place; what could not be found is said. */
+  async function resolveFixes(changes: TidyChanges, dropped: string[], context: TidyContext, message: string, signal: AbortSignal, route: AiRoute): Promise<void> {
+    const fixes = changes.fix;
+    delete changes.fix;
+    if (!fixes?.length) return;
+    const { marks, missed } = await marksForFixes(fixes, context, message, signal, route);
+    if (marks.length) changes.marks = [...(changes.marks ?? []), ...marks];
+    for (const what of missed) dropped.push(t("tidy.drop.fixMissed", { what }));
+    // A rim a few faces wide does not live through smoothing (11-05: the eye's white rim, smoothed with the
+    // protected colours, came out a dotted line).
+    if (changes.marks?.length && changes.smoothProtected === true) {
+      delete changes.smoothProtected;
+      dropped.push(t("tidy.drop.smoothThin"));
+    }
+  }
+
+  /** 👀 on a proposal with fixes: the things pointed at first (Claude asked again), then the preview. */
+  async function tryWithFixes(entryId: string, changes: TidyChanges, dropped: string[], context: TidyContext): Promise<void> {
+    if (tidyBusy !== null || busy !== null) return;
+    const controller = new AbortController();
+    tidyAbortRef.current = controller;
+    const message = [...tidyLog].reverse().find((e) => e.role === "user" && e.model === tidyModelName)?.text ?? "";
+    try {
+      await resolveFixes(changes, dropped, context, message, controller.signal, aiRoute ?? "local");
+    } catch {
+      setTidyLog((prev) => [...prev, { id: `s${Date.now()}`, role: "sys", text: t("tidy.stopped"), at: new Date().toISOString(), model: tidyModelName, scope: "clean" }]);
+      return;
+    } finally {
+      setTidyBusy(null);
+      tidyAbortRef.current = null;
+    }
+    const lines = describeChanges(changes, context, t);
+    setTidyLog((prev) => prev.map((e) => (e.id === entryId ? { ...e, status: lines.length > 0 ? "preview" : "none", lines, ...(dropped.length ? { dropped } : {}) } : e)));
     if (lines.length > 0) applyPlan(changes, entryId, t("tidy.bySuggestion"), lines, dropped);
   }
 
@@ -6137,14 +6766,43 @@ export default function App() {
     return { faces, cells: cellCount, subject: String(r.subject ?? "").trim().slice(0, 80), parts, at: new Date().toISOString() };
   }
 
-  async function tidyAsk(message: string, analyse: boolean, closeUp = false, scopeArg?: TidyScope, options?: { reshapeOnly?: boolean }): Promise<void> {
+  /** Shape first: what the model is, and which cells make each part (no owner check needed — it is the AI's own step). */
+  async function shapeStep(context: TidyContext, cells: ShapeCells, message: string, controller: AbortController, route: AiRoute, sys: (text: string) => void): Promise<StoredPartMap | null> {
+    if (!model) return null;
+    const shots = takeTidyPictures("clean", false, { cells, partOfCell: null });
+    if (!shots) return null;
+    if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
+    setTidyBusy(t("tidy.busyShape"));
+    const shaped = await aiAsk(
+      {
+        stable: tidyStablePrompt(context),
+        stableImages: shots.stable,
+        images: shots.current,
+        text: shapePrompt(context, [...shots.stableLabels, ...shots.currentLabels], message),
+        schema: SHAPE_SCHEMA,
+        tag: "shape",
+      },
+      controller.signal,
+      route,
+    );
+    if (aiRoute === "key") setKeyUsage(loadKeyUsage());
+    const made = shaped.ok ? partsFromAnswer(shaped.result, cells.count, model.triangles.length) : null;
+    if (made) {
+      setPartMaps((prev) => ({ ...prev, [tidyModelName]: made }));
+      sys(t("tidy.shapeLog", { subject: made.subject || "?", n: made.parts.length, names: made.parts.map((part) => part.name).join(", ") }));
+    } else sys(t("tidy.shapeFailed", { message: shaped.ok ? "—" : shaped.error }));
+    return made;
+  }
+
+  async function tidyAsk(message: string, analyse: boolean, closeUp = false, scopeArg?: TidyScope, options?: { reshapeOnly?: boolean; images?: AttachedImage[] }): Promise<void> {
     if (!model || tidyBusy !== null || busy !== null) return;
     const scope = scopeArg ?? tidyScope;
     const exporting = scope === "export";
     const history = tidyLog.filter((entry) => entry.model === tidyModelName && (entry.scope === "export") === exporting);
     const at = () => new Date().toISOString();
     const sys = (text: string) => setTidyLog((prev) => [...prev, { id: `s${Date.now()}${Math.random().toString(36).slice(2, 5)}`, role: "sys", text, at: at(), model: tidyModelName, scope }]);
-    setTidyLog((prev) => [...prev, { id: `u${Date.now()}`, role: "user", text: message, at: at(), model: tidyModelName, scope }]);
+    const attached = options?.images ?? [];
+    setTidyLog((prev) => [...prev, { id: `u${Date.now()}`, role: "user", text: message, at: at(), model: tidyModelName, scope, ...(attached.length ? { images: attached.map((image) => image.thumb) } : {}) }]);
     const controller = new AbortController();
     tidyAbortRef.current = controller;
     const route = aiRoute ?? "local";
@@ -6160,32 +6818,7 @@ export default function App() {
         cells = cellsFor(model);
         context.cellCount = cells.count;
         if (map && map.cells !== cells.count) map = null;
-        if (!map) {
-          // Shape first: what the model is, and which cells make each part (no owner check needed — it is the AI's own step).
-          const shots = takeTidyPictures("clean", false, { cells, partOfCell: null });
-          if (!shots) return;
-          if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
-          setTidyBusy(t("tidy.busyShape"));
-          const shaped = await aiAsk(
-            {
-              stable: tidyStablePrompt(context),
-              stableImages: shots.stable,
-              images: shots.current,
-              text: shapePrompt(context, [...shots.stableLabels, ...shots.currentLabels], message),
-              schema: SHAPE_SCHEMA,
-              tag: "shape",
-            },
-            controller.signal,
-            route,
-          );
-          if (aiRoute === "key") setKeyUsage(loadKeyUsage());
-          const made = shaped.ok ? partsFromAnswer(shaped.result, cells.count, model.triangles.length) : null;
-          if (made) {
-            map = made;
-            setPartMaps((prev) => ({ ...prev, [tidyModelName]: made }));
-            sys(t("tidy.shapeLog", { subject: made.subject || "?", n: made.parts.length, names: made.parts.map((part) => part.name).join(", ") }));
-          } else sys(t("tidy.shapeFailed", { message: shaped.ok ? "—" : shaped.error }));
-        }
+        if (!map) map = await shapeStep(context, cells, message, controller, route, sys);
         if (options?.reshapeOnly) return;
         if (map) {
           setTidyBusy(t("tidy.busyParts"));
@@ -6204,6 +6837,16 @@ export default function App() {
       await yieldToUi();
       const pictures = takeTidyPictures(scope, closeUp, cells ? { cells, partOfCell: map ? cellParts(cells, map.parts) : null } : undefined, shaping ? pitsFor(model) : []);
       if (!pictures) return;
+      // The owner's own pictures go last, and the model's pictures make room for them (12 at most in one question).
+      if (attached.length) {
+        const room = Math.max(0, 12 - pictures.stable.length - attached.length);
+        pictures.current = pictures.current.slice(0, room);
+        pictures.currentLabels = pictures.currentLabels.slice(0, room);
+        attached.forEach((image, i) => {
+          pictures.current.push(image.full);
+          pictures.currentLabels.push(t("tidy.attachedLabel", { n: i + 1 }));
+        });
+      }
       if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
       setTidyBusy(t("tidy.busyThinking", { n: pictures.stable.length + pictures.current.length }));
       const answer = await aiAsk(
@@ -6240,14 +6883,17 @@ export default function App() {
         setPartMaps((prev) => ({ ...prev, [tidyModelName]: updated }));
         now.shape = shapeContext(model, updated, cells);
       }
-      if (!sameMesh && (changes.partTidy || changes.paint)) {
+      if (!sameMesh && (changes.partTidy || changes.paint || changes.fix)) {
         delete changes.partTidy;
         delete changes.paint;
+        delete changes.fix;
         dropped.push(t("tidy.drop.meshChanged"));
       }
+      const asked = raw.asked_to_change === true && !analyse;
+      // What no blob or cell holds alone, pointed at on the part's pictures now (asked) or when the proposal is tried.
+      if (asked && changes.fix?.length) await resolveFixes(changes, dropped, now, message, controller.signal, route);
       const lines = describeChanges(changes, now, t);
       const doable = lines.filter((line) => line.key !== "parts");
-      const asked = raw.asked_to_change === true && !analyse;
       const observations = Array.isArray(raw.observations) ? raw.observations.map(String).filter(Boolean).slice(0, 6) : [];
       const entry: TidyLogEntry = {
         id: `a${Date.now()}`,
@@ -6267,6 +6913,581 @@ export default function App() {
     } catch (err) {
       const stopped = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
       sys(stopped ? t("tidy.stopped") : t("tidy.failed", { message: err instanceof Error ? err.message : String(err) }));
+    } finally {
+      setTidyBusy(null);
+      tidyAbortRef.current = null;
+    }
+  }
+
+  /**
+   * Close-ups of a part: aimed at its middle, as near as fits it all, from the directions it shows the
+   * most in — measured (drawn once in a flat colour, whatever stands in front hiding it), so the back of
+   * the hair is looked at from behind, not through the head.  Up to `count`, at least 50° apart.
+   */
+  function partCloseUps(partFaces: ArrayLike<number>, count: number): CameraPose[] {
+    if (!positions || !model) return [];
+    const centre = [0, 0, 0];
+    const normal = [0, 0, 0];
+    let sum = 0;
+    for (let k = 0; k < partFaces.length; k++) {
+      const o = partFaces[k] * 9;
+      const ax = positions[o], ay = positions[o + 1], az = positions[o + 2];
+      const ux = positions[o + 3] - ax, uy = positions[o + 4] - ay, uz = positions[o + 5] - az;
+      const vx = positions[o + 6] - ax, vy = positions[o + 7] - ay, vz = positions[o + 8] - az;
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const w = Math.hypot(nx, ny, nz) / 2;
+      sum += w;
+      centre[0] += ((ax + positions[o + 3] + positions[o + 6]) / 3) * w;
+      centre[1] += ((ay + positions[o + 4] + positions[o + 7]) / 3) * w;
+      centre[2] += ((az + positions[o + 5] + positions[o + 8]) / 3) * w;
+      normal[0] += nx / 2;
+      normal[1] += ny / 2;
+      normal[2] += nz / 2;
+    }
+    if (sum > 0) for (let k = 0; k < 3; k++) centre[k] /= sum;
+    let reach = 0;
+    for (let k = 0; k < partFaces.length; k++) {
+      const o = partFaces[k] * 9;
+      reach = Math.max(reach, Math.hypot(positions[o] - centre[0], positions[o + 1] - centre[1], positions[o + 2] - centre[2]));
+    }
+    const unit = (d: number[]) => {
+      const l = Math.hypot(d[0], d[1], d[2]);
+      return l > 1e-9 ? d.map((v) => v / l) : [0, -1, 0];
+    };
+    const dir = unit(normal);
+    const fov = 30;
+    const distance = (Math.max(reach, 1e-3) / Math.sin(((fov / 2) * Math.PI) / 180)) * 1.1;
+    const poseAlong = (d: number[]): CameraPose => ({
+      position: [centre[0] + d[0] * distance, centre[1] + d[1] * distance, centre[2] + d[2] * distance],
+      target: centre as [number, number, number],
+      // Looking straight down (or up), "up" on the picture is the model's front-back axis.
+      up: Math.abs(d[2]) > 0.9 ? [0, 1, 0] : [0, 0, 1],
+      fov,
+      aspect: 1,
+      zoom: 4,
+    });
+    const turn = (d: number[], deg: number) => {
+      const a = (deg * Math.PI) / 180;
+      return unit([d[0] * Math.cos(a) - d[1] * Math.sin(a), d[0] * Math.sin(a) + d[1] * Math.cos(a), d[2]]);
+    };
+    const r = Math.SQRT1_2;
+    // The views the owner knows the model from (front, a little from above, the iso view) come first: the first
+    // close-up is one of them when the part shows there at least half as well (11-04: seen from above, a hat's brim looked like hair).
+    const known = [VIEW_DIRECTIONS.front, [0, -1, 0.6], VIEW_DIRECTIONS.iso].map(unit);
+    const candidates = [...known, dir, turn(dir, 35), turn(dir, -35), [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, -1], [r, r, 0], [-r, r, 0], [r, -r, 0], [-r, -r, 0]].map(unit);
+    const poses = candidates.map(poseAlong);
+    const regionOf = new Int32Array(model.triangles.length).fill(-1);
+    for (let k = 0; k < partFaces.length; k++) regionOf[partFaces[k]] = 0;
+    const shows = regionPixels(positions, regionOf, 1, poses).map((c) => c[0]);
+    const order = candidates.map((_, i) => i).sort((a, b) => shows[b] - shows[a]);
+    const bestKnown = [0, 1, 2].sort((a, b) => shows[b] - shows[a])[0];
+    if (shows[bestKnown] >= shows[order[0]] * 0.5) {
+      order.splice(order.indexOf(bestKnown), 1);
+      order.unshift(bestKnown);
+    }
+    const chosen: number[] = [];
+    const apart = Math.cos((50 * Math.PI) / 180);
+    for (const i of order) {
+      if (chosen.length >= count || shows[i] <= 0 || (chosen.length > 0 && shows[i] < shows[chosen[0]] * 0.3)) break;
+      const dot = (j: number) => candidates[i][0] * candidates[j][0] + candidates[i][1] * candidates[j][1] + candidates[i][2] * candidates[j][2];
+      if (chosen.some((j) => dot(j) > apart)) continue;
+      chosen.push(i);
+    }
+    return (chosen.length ? chosen : [0]).map((i) => poses[i]);
+  }
+
+  /**
+   * The model's front in four quarters up close, the original and another colouring side by side in each
+   * picture (for a review to see small things that went missing).
+   */
+  async function sideBySideQuarters(before: ColourBuffer, after: ColourBuffer): Promise<string[]> {
+    if (!positions) return [];
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (let i = 0; i < positions.length; i += 3) {
+      const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+      if (z < z0) z0 = z;
+      if (z > z1) z1 = z;
+    }
+    const half = Math.max(x1 - x0, z1 - z0) / 2;
+    const fov = 30;
+    const distance = ((half / 2) * 1.15) / Math.tan(((fov / 2) * Math.PI) / 180) + (y1 - y0);
+    const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+    const out: string[] = [];
+    for (const [dx, dz] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]) {
+      const target: [number, number, number] = [cx + (dx * half) / 2, (y0 + y1) / 2, cz + (dz * half) / 2];
+      const front = VIEW_DIRECTIONS.front;
+      const pose: CameraPose = { position: [target[0] + front[0] * distance, target[1] + front[1] * distance, target[2] + front[2] * distance], target, up: [0, 0, 1], fov, aspect: 1, zoom: 2 };
+      const [a] = renderViews(positions, before, [pose], 480);
+      const [b] = renderViews(positions, after, [pose], 480);
+      const canvas = document.createElement("canvas");
+      canvas.width = 968;
+      canvas.height = 480;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) continue;
+      ctx.fillStyle = "#222";
+      ctx.fillRect(0, 0, 968, 480);
+      for (const [url, left] of [[a.dataUrl, 0], [b.dataUrl, 488]] as const) {
+        const img = new Image();
+        await new Promise<void>((resolve) => {
+          img.onload = () => resolve();
+          img.onerror = () => resolve();
+          img.src = url;
+        });
+        ctx.drawImage(img, left, 0, 480, 480);
+      }
+      out.push(canvas.toDataURL("image/jpeg", 0.88));
+    }
+    return out;
+  }
+
+  /**
+   * A big part's stretches: its cells (5 or more) in up to three groups of cells close together
+   * (farthest-apart seeds, each cell to the nearest), each group's own faces.  None for a small part.
+   */
+  function partTiles(partCells: number[], ownFaces: Int32Array, cells: ShapeCells): Int32Array[] {
+    if (!positions || partCells.length < 5) return [];
+    const k = Math.min(3, Math.ceil(partCells.length / 4));
+    const index = new Map(partCells.map((c, i) => [c, i]));
+    const sum = new Float64Array(partCells.length * 4);
+    for (const f of ownFaces) {
+      const i = index.get(cells.cellOf[f]);
+      if (i === undefined) continue;
+      sum[i * 4] += positions[f * 9];
+      sum[i * 4 + 1] += positions[f * 9 + 1];
+      sum[i * 4 + 2] += positions[f * 9 + 2];
+      sum[i * 4 + 3]++;
+    }
+    const at = (i: number) => [sum[i * 4] / (sum[i * 4 + 3] || 1), sum[i * 4 + 1] / (sum[i * 4 + 3] || 1), sum[i * 4 + 2] / (sum[i * 4 + 3] || 1)];
+    const d2 = (a: number[], b: number[]) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+    const used = partCells.map((_, i) => i).filter((i) => sum[i * 4 + 3] > 0);
+    if (used.length < 5) return [];
+    const seeds = [used[0]];
+    while (seeds.length < k) {
+      let far = -1;
+      let farD = -1;
+      for (const i of used) {
+        const d = Math.min(...seeds.map((s) => d2(at(i), at(s))));
+        if (d > farD) {
+          farD = d;
+          far = i;
+        }
+      }
+      seeds.push(far);
+    }
+    const groupOf = new Int32Array(partCells.length).fill(-1);
+    for (const i of used) {
+      let best = 0;
+      for (let g = 1; g < seeds.length; g++) if (d2(at(i), at(seeds[g])) < d2(at(i), at(seeds[best]))) best = g;
+      groupOf[i] = best;
+    }
+    const lists: number[][] = seeds.map(() => []);
+    for (const f of ownFaces) {
+      const i = index.get(cells.cellOf[f]);
+      if (i !== undefined && groupOf[i] >= 0) lists[groupOf[i]].push(f);
+    }
+    return lists.filter((list) => list.length > 0).map((list) => Int32Array.from(list));
+  }
+
+  /**
+   * 🤖 AI 단색 도색 (11-04 저녁 — the owner: "AI 색정리도 계속 진행해봐. 지금 너무 허접해"): the shape
+   * first, then the model's final palette (a few colours; the owner's rule: colours the bake made dull
+   * become the clean colour of that thing, clean ones stay), then every part up close at once — its own
+   * faces cut into blobs by the model's colours, numbered on the views it shows best in — each blob
+   * given a palette colour.  One preview for all of it; what no answer placed is filled from its sides.
+   */
+  async function autoTidy(message: string): Promise<void> {
+    if (!model || !positions || tidyBusy !== null || busy !== null) return;
+    const scope: TidyScope = "clean";
+    const at = () => new Date().toISOString();
+    const sys = (text: string) => setTidyLog((prev) => [...prev, { id: `s${Date.now()}${Math.random().toString(36).slice(2, 5)}`, role: "sys", text, at: at(), model: tidyModelName, scope }]);
+    setTidyLog((prev) => [...prev, { id: `u${Date.now()}`, role: "user", text: message, at: at(), model: tidyModelName, scope }]);
+    const controller = new AbortController();
+    tidyAbortRef.current = controller;
+    const route = aiRoute ?? "local";
+    const stopped = () => {
+      if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
+    };
+    try {
+      const context = buildTidyContext();
+      if (!context) return;
+      setTidyBusy(t("tidy.busyShapeShots"));
+      await yieldToUi();
+      const cells = cellsFor(model);
+      context.cellCount = cells.count;
+      let found = partMapFor(model);
+      if (found && found.cells !== cells.count) found = null;
+      if (!found) found = await shapeStep(context, cells, message, controller, route, sys);
+      if (!found) return;
+      const map = found;
+      stopped();
+      setTidyBusy(t("tidy.busyParts"));
+      await yieldToUi();
+      context.shape = shapeContext(model, map, cells);
+      context.pits = pitsContext(model, map, cells);
+
+      // 1. The palette, from the whole model with its part borders.
+      const shots = takeTidyPictures("clean", false, { cells, partOfCell: cellParts(cells, map.parts) }, pitsFor(model));
+      if (!shots) return;
+      stopped();
+      setTidyBusy(t("tidy.busyPalette"));
+      const answer = await aiAsk(
+        {
+          stable: tidyStablePrompt(context),
+          stableImages: shots.stable,
+          images: shots.current,
+          text: palettePrompt(context, [...shots.stableLabels, ...shots.currentLabels], message),
+          schema: paletteSchemaFor(context.target),
+          tag: "palette",
+        },
+        controller.signal,
+        route,
+      );
+      if (aiRoute === "key") setKeyUsage(loadKeyUsage());
+      if (!answer.ok) throw new Error(answer.error);
+      const plan = sanitizePalette(answer.result, map.parts.map((part) => part.name), context.pits?.length ?? 0);
+      if (!plan) {
+        sys(t("tidy.paletteFailed"));
+        return;
+      }
+      sys(t("tidy.paletteLog", { n: plan.palette.length, list: plan.palette.map((c) => `${c.name} ${c.hex}`).join(" · ") }));
+
+      // 2. Every part up close, a few questions at a time (the blobs and pictures are made one part at a time).
+      const { partOfFace } = partFacesFor(model, map, cells);
+      const own = ownColoursOf(model);
+      const ownBuffer = buildColourBuffer(model.triangles.length, (i) => own[i]);
+      const facesOf: number[][] = map.parts.map(() => []);
+      for (let f = 0; f < partOfFace.length; f++) if (partOfFace[f] >= 0) facesOf[partOfFace[f]].push(f);
+      const byId = new Map(plan.palette.map((c) => [c.id, c]));
+      const paletteIds = new Set(byId.keys());
+      const parts = new Map<string, { index: number; map: BlobMap; share: number }>();
+      // What each part was shown (its blobs and close-ups) and its latest answer: a later pass asks it again about the same blobs.
+      type PartLook = { p: number; blobMap: BlobMap; faces: Int32Array; poses: CameraPose[]; overview: number; images: string[]; labels: string[]; neighbours: string[] };
+      const looks = new Map<string, PartLook>();
+      const answers = new Map<string, TidyAssignment["assign"]>();
+      const notes: string[] = [];
+      // Things pointed at in passes 2 and 3 (painted over the votes).
+      const marks: NonNullable<TidyChanges["marks"]> = [];
+      const askPart = async (name: string, look: PartLook, extra: string, extraImages: string[] = [], extraLabels: string[] = []) => {
+        stopped();
+        const setting = plan.parts.get(name);
+        const reply = await aiAsk(
+          {
+            stable: tidyStablePrompt(context),
+            stableImages: shots.stable,
+            images: [...look.images, ...extraImages],
+            text:
+              assignPrompt(
+                context,
+                {
+                  name,
+                  subject: map.subject,
+                  main: setting ? byId.get(setting.main) ?? null : null,
+                  also: (setting?.also ?? []).map((id) => byId.get(id)).filter((c): c is NonNullable<typeof c> => Boolean(c)),
+                  looks: setting?.looks ?? "",
+                  neighbours: look.neighbours.map((n) => ({ name: n, looks: plan.parts.get(n)?.looks ?? "" })),
+                },
+                plan.palette,
+                look.blobMap.blobs.map((b) => ({ id: b.id, areaPct: b.areaPct, mean: rgbToHex(b.mean), family: b.familyName })),
+                [...shots.stableLabels, ...look.labels, ...extraLabels],
+                message,
+              ) + extra,
+            schema: ASSIGN_SCHEMA,
+            tag: "assign",
+          },
+          controller.signal,
+          route,
+        );
+        if (!reply.ok) throw new Error(reply.error);
+        return sanitizeAssign(reply.result, look.blobMap.blobs.length, paletteIds);
+      };
+      const todo = map.parts.map((_, p) => p).filter((p) => facesOf[p].length > 0).sort((a, b) => facesOf[b].length - facesOf[a].length);
+      let modelArea = 0;
+      for (let f = 0; f < areaWeights.length; f++) modelArea += areaWeights[f];
+      let done = 0;
+      setTidyBusy(t("tidy.busyAutoParts", { done, n: todo.length }));
+      /**
+       * What a part is shown: its own faces and the cells round them cut into blobs, numbered close-ups from the
+       * views it shows best in (and its stretches), and its colour map.
+       */
+      const buildLook = (p: number): PartLook => {
+        const part = map.parts[p];
+        // Its own faces and the cells round its cells: the part map is rough (a lens in the hat's cells).
+        const ownFaces = Int32Array.from(facesOf[p]);
+        const near = new Uint8Array(cells.count);
+        for (const c of part.cells) for (const d of cells.touching[c].keys()) near[d] = 1;
+        const region: number[] = [];
+        const seenParts = new Map<number, number>();
+        for (let f = 0; f < partOfFace.length; f++) {
+          if (partOfFace[f] !== p && !near[cells.cellOf[f]]) continue;
+          region.push(f);
+          if (partOfFace[f] !== p && partOfFace[f] >= 0) seenParts.set(partOfFace[f], (seenParts.get(partOfFace[f]) ?? 0) + 1);
+        }
+        const neighbours = [...seenParts].filter(([, n]) => n >= region.length * 0.02).sort((a, b) => b[1] - a[1]).map(([q]) => map.parts[q].name);
+        const faces = Int32Array.from(region);
+        const areaPct = context.shape?.parts[p]?.areaPct ?? 0;
+        const blobMap = regionBlobs(faces, own, areaWeights, adjacencyFor(model), creasesFor(model).concavity, {
+          coarse: 6,
+          fine: 24,
+          max: areaPct >= 6 ? 48 : 40,
+          geometry: creasesFor(model).geometry,
+          // A speck is small for the model (an eye's glint stays even in the head's big region).
+          speckArea: modelArea * 0.00008,
+        });
+        parts.set(part.name, { index: p, map: blobMap, share: areaPct / 100 });
+        const codes = new Int32Array(model.triangles.length).fill(-1);
+        faces.forEach((f, i) => {
+          codes[f] = blobMap.blobOf[i];
+        });
+        const poses = partCloseUps(ownFaces, areaPct >= 6 ? 3 : 2);
+        // A part spread over the body (a coat with a bag on it) also gets nearer looks at its stretches:
+        // its cells in a few groups close together, each looked at on its own (11-04: the bag's stripes were a few pixels).
+        const tiles = partTiles(part.cells, ownFaces, cells);
+        const overview = poses.length;
+        for (const tile of tiles) poses.push(...partCloseUps(tile, 1));
+        const [plain] = renderViews(positions, ownBuffer, [poses[0]], 560);
+        // The numbered close-ups with everything not this part dimmed (the buffer is put back right after: nothing else draws in between).
+        const dimmed: number[] = [];
+        for (let f = 0; f < partOfFace.length; f++) if (partOfFace[f] !== p) dimmed.push(f);
+        const kept = new Uint8Array(dimmed.length * FACE_BYTES);
+        dimmed.forEach((f, i) => kept.set(ownBuffer.subarray(f * FACE_BYTES, (f + 1) * FACE_BYTES), i * FACE_BYTES));
+        for (const f of dimmed)
+          for (let k = 0; k < FACE_BYTES; k++) if (k % 4 !== 3) ownBuffer[f * FACE_BYTES + k] = linearToSrgbByte(SRGB_TO_LINEAR[ownBuffer[f * FACE_BYTES + k]] * 0.4);
+        let numbered: ReturnType<typeof renderNumberedViews>;
+        try {
+          numbered = renderNumberedViews(positions, ownBuffer, codes, blobMap.blobs.length, poses, 720);
+        } finally {
+          dimmed.forEach((f, i) => ownBuffer.set(kept.subarray(i * FACE_BYTES, (i + 1) * FACE_BYTES), f * FACE_BYTES));
+        }
+        const labels = [
+          `${part.name} 확대 — 원본 색`,
+          ...numbered.shots.map((_, i) => (i < overview ? `${part.name} 확대 ${i + 1} — 덩어리 번호(원본 색 위)` : `${part.name} 부분 확대 ${i - overview + 1} — 덩어리 번호(원본 색 위)`)),
+        ];
+        // Its colour map: the part and the cells round it laid out flat, numbered (nothing hidden, small things full size).
+        const sheet = numberedMapPicture(regionAtlas(model, faces, 1024), (i) => own[faces[i]], blobMap.blobOf, blobMap.blobs.length, (i) => partOfFace[faces[i]] !== p);
+        labels.push(`${part.name} 색 지도 — 이 부위와 둘레의 겉면을 펼친 것(가려진 면 없음), 덩어리 번호(원본 색 위), 어두운 곳 = 둘레`);
+        const look: PartLook = { p, blobMap, faces, poses, overview, images: [plain.dataUrl, ...numbered.shots.map((shot) => shot.dataUrl), sheet], labels, neighbours };
+        looks.set(part.name, look);
+        return look;
+      };
+      const lookAt = async (p: number) => {
+        const part = map.parts[p];
+        const setting = plan.parts.get(part.name);
+        try {
+          stopped();
+          await yieldToUi();
+          const look = buildLook(p);
+          const ask = (check: string) => askPart(part.name, look, check);
+          let got = await ask("");
+          // Its own check: a blob light in the original given a far darker colour.  The bake's light only darkens —
+          // a light face is that thing's own light colour far more often than shade (11-04 Tkc: a tan brim lip and a
+          // bag's tan stripes went dark brown and black, "one part, one colour").  Those blobs are named back to it once.
+          const regionShare = look.faces.length / Math.max(1, model.triangles.length);
+          const doubtful = got.assign
+            .flatMap((m) => m.blobs.map((id) => ({ id, to: byId.get(m.colour) })))
+            .map(({ id, to }) => ({ id, to, blob: look.blobMap.blobs[id - 1] }))
+            .filter((x) => x.blob && x.to && x.blob.areaPct * regionShare > 0.03 && rgbToLab(x.blob.mean).L - rgbToLab(hexToRgb(x.to.hex)).L > 30)
+            .sort((a, b) => b.blob.areaPct - a.blob.areaPct)
+            .slice(0, 6);
+          if (doubtful.length) {
+            const lines = doubtful.map((x) => `- B${x.id} (원본 ${rgbToHex(x.blob.mean)}, 밝기 ${Math.round(rgbToLab(x.blob.mean).L)}) → ${x.to?.id} ${x.to?.name} ${x.to?.hex} (밝기 ${Math.round(rgbToLab(hexToRgb(x.to?.hex ?? "#000000")).L)})`);
+            const again = await ask(`
+
+■ 점검 (네 첫 답을 앱이 확인함)
+아래 덩어리는 원본에서 밝은데 훨씬 어두운 색을 골랐다. 구운 조명은 색을 어둡게 할 뿐 밝은 면을 새로 만들지 않는다 — 원본이 밝은 면은 보통 그 면의 진짜 색이 밝다(챙 밑면·가방 줄·테두리·단추). 사진을 다시 보고, 정말 그림자·같은 천이면 그대로, 따로 칠해진 면·무늬면 맞는 밝은 색으로 고쳐 assign 전체를 다시 낸다.
+${lines.join("\n")}`).catch(() => null);
+            if (again && again.assign.length) got = again;
+          }
+          answers.set(part.name, got.assign);
+          if (got.observations[0]) notes.push(`${part.name}: ${got.observations[0]}`);
+        } catch (err) {
+          if (controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) throw err;
+          // No answer for this part: its main colour all over (the crease snap still divides it from its neighbours) — or left as it is.
+          const held = parts.get(part.name);
+          if (held && setting) answers.set(part.name, [{ what: "", blobs: held.map.blobs.map((b) => b.id), colour: setting.main, mine: true }]);
+          else parts.delete(part.name);
+          notes.push(t("tidy.autoPartFailed", { part: part.name }));
+        }
+        done++;
+        setTidyBusy(t("tidy.busyAutoParts", { done, n: todo.length }));
+      };
+      const queue = todo.slice();
+      await Promise.all(
+        Array.from({ length: Math.min(AUTO_PARALLEL, queue.length) }, async () => {
+          for (let p = queue.shift(); p !== undefined; p = queue.shift()) await lookAt(p);
+        }),
+      );
+      stopped();
+
+      // All of it as one plan: the parts' colours, the holes, borders into the grooves, then a light bake.
+      const pitsHex = plan.pits.map((m) => ({ ids: m.ids, into: byId.get(m.colour)?.hex ?? "" })).filter((m) => m.into);
+      const assemble = (): TidyChanges => {
+        const assign: NonNullable<TidyChanges["assign"]> = [];
+        const detailHexes = new Set<string>();
+        for (const [name, list] of answers) {
+          const look = looks.get(name);
+          for (const m of list) {
+            const hex = byId.get(m.colour)?.hex;
+            if (!hex) continue;
+            assign.push({ part: name, blobs: m.blobs, colour: hex, what: m.what || undefined, ...(m.mine ? {} : { mine: false }) });
+            // A small piece (an eye, a button, a stripe) is a detail: its colour stays through the speck clean-up.
+            const share = look ? (m.blobs.reduce((total, id) => total + (look.blobMap.blobs[id - 1]?.areaPct ?? 0), 0) * look.faces.length) / Math.max(1, model.triangles.length) : 1;
+            if (m.mine && share < 0.15) detailHexes.add(hex);
+          }
+        }
+        // A pointed-at thing's colour stays through the speck clean-up.
+        for (const m of marks) detailHexes.add(m.colour);
+        return {
+          assign,
+          ...(marks.length ? { marks: marks.slice() } : {}),
+          ...(pitsHex.length ? { pits: pitsHex } : {}),
+          // No snapping to grooves: the blobs already end at folds and colour changes, and the snap ate thin things
+          // the AI had named (11-04 Tkc: a bag's stripes, 1,186 of 1,201 faces kept without it, 254 with it).
+          creaseSnap: 0,
+          // Only real specks go (a flower's gold dot is a blob the AI placed, not a speck).
+          minBlob: Math.max(20, Math.round(model.triangles.length * 0.00002)),
+          smoothing: 2,
+          trimTeeth: 2,
+          lineSmooth: 16,
+          ...(detailHexes.size ? { protect: [...detailHexes] } : {}),
+        };
+      };
+      autoFocusRef.current = { triangles: model.triangles, partOfFace, parts };
+
+      // 3. Passes 2 and 3 (the owner, 11-04: "한방에 뽑으려 하지 말고 1차 2차 3차 이렇게 여러 번"): the result so far
+      // next to the original, the AI names what is still wrong, and only those parts are asked again — with their
+      // close-ups in the colours they now have.  Stops as soon as a look finds nothing to fix.
+      let wholeMap: FaceAtlas | null = null;
+      for (let pass = 2; pass <= 1 + AUTO_REVIEWS; pass++) {
+        stopped();
+        setTidyBusy(t("tidy.busyReview", { pass }));
+        await yieldToUi();
+        const draft = planColours(model, assemble());
+        if (!draft) break;
+        const resultBuffer = buildColourBuffer(model.triangles.length, (i) => draft.next[i]);
+        const views: ViewName[] = ["front", "back", "iso"];
+        const viewName: Record<ViewName, string> = { front: "앞", back: "뒤", left: "왼쪽", right: "오른쪽", top: "위", iso: "사선" };
+        // The whole result from three sides, and the front in four quarters up close — original | result side by side
+        // (a bag's stripes are a few pixels in a whole view).
+        const wholeShots = renderViews(positions, resultBuffer, views);
+        const quarters = await sideBySideQuarters(ownBuffer, resultBuffer);
+        // The whole surface laid out flat, original and result in the same layout: what went missing anywhere, the back too.
+        wholeMap ??= atlasRef.current?.triangles === model.triangles ? atlasRef.current.atlas : buildFaceAtlas(model, adjacencyFor(model), faceGeometryFor(model), areaWeights, 2048);
+        const maps = [mapPicture(wholeMap, (f) => own[f]), mapPicture(wholeMap, (f) => draft.next[f])];
+        const resultShots = [...wholeShots, ...quarters, ...maps];
+        const resultLabels = [
+          ...views.map((v) => `${pass - 1}차 결과 ${viewName[v]}`),
+          ...quarters.map((_, i) => `앞모습 ${["왼쪽 위", "오른쪽 위", "왼쪽 아래", "오른쪽 아래"][i]} 확대 — 왼쪽 원본 | 오른쪽 ${pass - 1}차 결과`),
+          "색 지도(겉면 전체를 펼친 것) — 원본",
+          `색 지도(같은 배치) — ${pass - 1}차 결과`,
+        ];
+        const reviewed = await aiAsk(
+          {
+            stable: tidyStablePrompt(context),
+            stableImages: shots.stable,
+            images: resultShots.map((shot) => (typeof shot === "string" ? shot : shot.dataUrl)),
+            text: reviewPrompt(
+              context,
+              pass,
+              map.parts.map((part) => ({ name: part.name, looks: plan.parts.get(part.name)?.looks ?? "" })),
+              plan.palette,
+              [...shots.stableLabels, ...resultLabels],
+              message,
+            ),
+            schema: REVIEW_SCHEMA,
+            tag: "review",
+          },
+          controller.signal,
+          route,
+        );
+        if (!reviewed.ok) break;
+        const problems = sanitizeReview(reviewed.result, [...looks.keys()]);
+        if (problems.length === 0) {
+          sys(t("tidy.reviewOk", { pass }));
+          break;
+        }
+        sys(t("tidy.reviewLog", { pass, list: problems.map((m) => `${m.part}: ${m.problem}`).join(" · ") }));
+        let fixed = 0;
+        setTidyBusy(t("tidy.busyFix", { pass, done: fixed, n: problems.length }));
+        const fixes = problems.slice();
+        await Promise.all(
+          Array.from({ length: Math.min(AUTO_PARALLEL, fixes.length) }, async () => {
+            for (let m = fixes.shift(); m !== undefined; m = fixes.shift()) {
+              const look = looks.get(m.part);
+              if (!look) continue;
+              await yieldToUi();
+              // The thing to fix pointed at on the original (a grid on the pictures), and the face under the point found:
+              // no blob numbers to misread (11-04: a brooch's dot fixed on the wrong blob three times over).
+              const SIZE = 720;
+              const poses = look.poses.slice(0, Math.min(2, look.poses.length));
+              const originals = renderViews(positions, ownBuffer, poses, SIZE);
+              const [now] = renderViews(positions, resultBuffer, [poses[0]], SIZE);
+              const images = await Promise.all([...originals.map((shot) => withGrid(shot.dataUrl)), withGrid(now.dataUrl)]);
+              const first = shots.stable.length + 1;
+              const pick = poses.map((_, i) => first + i);
+              const resultPicture = first + poses.length;
+              const pictureLabels = [...poses.map((_, i) => `${m.part} 원본 확대 ${i + 1} — 격자`), `${m.part} 지금 결과(${pass - 1}차) — 사진 ${first}과 같은 각도, 격자`];
+              const reply = await aiAsk(
+                {
+                  stable: tidyStablePrompt(context),
+                  stableImages: shots.stable,
+                  images,
+                  text: pointPrompt(context, pass, m.part, map.subject, m.problem, plan.palette, pick, resultPicture, SIZE, [...shots.stableLabels, ...pictureLabels], message),
+                  schema: POINT_SCHEMA,
+                  tag: "point",
+                },
+                controller.signal,
+                route,
+              ).catch((err) => {
+                if (controller.signal.aborted) throw err;
+                return null;
+              });
+              if (reply?.ok) {
+                const inRegion = new Uint8Array(model.triangles.length);
+                for (const f of look.faces) inRegion[f] = 1;
+                const idsOf = new Map<number, Int32Array>();
+                for (const point of sanitizePoints(reply.result, [...pick, resultPicture], SIZE, paletteIds)) {
+                  const poseIndex = point.picture === resultPicture ? 0 : point.picture - first;
+                  let ids = idsOf.get(poseIndex);
+                  if (!ids) idsOf.set(poseIndex, (ids = renderFaceIds(positions, poses[poseIndex], SIZE)));
+                  const seed = seedUnderPoint(ids, SIZE, point.x, point.y, inRegion, ownLabOf(model), point.source);
+                  const hex = byId.get(point.colour)?.hex;
+                  if (seed >= 0 && hex) marks.push({ part: m.part, seed, colour: hex, what: point.what || undefined, ...(point.shaded ? { shaded: true } : {}) });
+                }
+              }
+              fixed++;
+              setTidyBusy(t("tidy.busyFix", { pass, done: fixed, n: problems.length }));
+            }
+          }),
+        );
+      }
+      stopped();
+      const sameMesh = modelRef.current !== null && modelRef.current.triangles === model.triangles && modelRef.current.triangleColors === model.triangleColors;
+      const changes = assemble();
+      const now = buildTidyContext() ?? context;
+      Object.assign(now, { cellCount: context.cellCount, shape: context.shape, pits: context.pits });
+      const lines = describeChanges(changes, now, t);
+      const entry: TidyLogEntry = {
+        id: `a${Date.now()}`,
+        role: "ai",
+        text: plan.reply || "…",
+        at: at(),
+        model: tidyModelName,
+        scope,
+        observations: [...plan.observations, ...notes].slice(0, 10),
+        changes,
+        lines,
+        status: lines.length === 0 ? "none" : sameMesh ? "preview" : "suggested",
+      };
+      setTidyLog((prev) => [...prev, entry]);
+      autoFocusByEntryRef.current.set(entry.id, autoFocusRef.current);
+      if (lines.length > 0 && sameMesh) applyPlan(changes, entry.id, t("tidy.byAiPreview"), lines, []);
+    } catch (err) {
+      const stop = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
+      sys(stop ? t("tidy.stopped") : t("tidy.failed", { message: err instanceof Error ? err.message : String(err) }));
     } finally {
       setTidyBusy(null);
       tidyAbortRef.current = null;
@@ -6296,6 +7517,7 @@ export default function App() {
     tidyAbortRef.current = controller;
     try {
       setTidyBusy(t("tidy.busyBlobs", { part }));
+      setFocusBusyPart(part);
       await yieldToUi();
       // The part's cells and the cells round them (the part map is rough at its edges).
       const own = new Uint8Array(cells.count);
@@ -6309,54 +7531,12 @@ export default function App() {
         if (own[cells.cellOf[f]]) partFaces.push(f);
       }
       const regionFaces = Int32Array.from(faces);
-      const blobMap = regionBlobs(regionFaces, ownColoursOf(model), areaWeights, adjacencyFor(model), creasesFor(model).concavity, { coarse: 6, fine: 24, max: 36 });
+      const blobMap = regionBlobs(regionFaces, ownColoursOf(model), areaWeights, adjacencyFor(model), creasesFor(model).concavity, { coarse: 6, fine: 24, max: 36, geometry: creasesFor(model).geometry });
       const mask = new Uint8Array(model.triangles.length);
       for (const f of regionFaces) mask[f] = 1;
       focusRef.current = { triangles: model.triangles, colours: model.triangleColors, part, map: blobMap, mask };
-      // The close-up: straight at the part (its mean normal), and turned 35° about the up axis.
-      const centre = [0, 0, 0];
-      const normal = [0, 0, 0];
-      let sum = 0;
-      let reach = 0;
-      for (const f of partFaces) {
-        const o = f * 9;
-        const ax = positions[o], ay = positions[o + 1], az = positions[o + 2];
-        const ux = positions[o + 3] - ax, uy = positions[o + 4] - ay, uz = positions[o + 5] - az;
-        const vx = positions[o + 6] - ax, vy = positions[o + 7] - ay, vz = positions[o + 8] - az;
-        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-        const w = Math.hypot(nx, ny, nz) / 2;
-        sum += w;
-        centre[0] += ((ax + positions[o + 3] + positions[o + 6]) / 3) * w;
-        centre[1] += ((ay + positions[o + 4] + positions[o + 7]) / 3) * w;
-        centre[2] += ((az + positions[o + 5] + positions[o + 8]) / 3) * w;
-        normal[0] += nx / 2;
-        normal[1] += ny / 2;
-        normal[2] += nz / 2;
-      }
-      if (sum > 0) for (let k = 0; k < 3; k++) centre[k] /= sum;
-      for (const f of partFaces) {
-        const o = f * 9;
-        reach = Math.max(reach, Math.hypot(positions[o] - centre[0], positions[o + 1] - centre[1], positions[o + 2] - centre[2]));
-      }
-      const nl = Math.hypot(normal[0], normal[1], normal[2]);
-      const dir = nl > 1e-9 ? normal.map((v) => v / nl) : [0, -1, 0];
-      const fov = 30;
-      const distance = (Math.max(reach, 1e-3) / Math.sin(((fov / 2) * Math.PI) / 180)) * 1.1;
-      const poseAlong = (d: number[]) => ({
-        position: [centre[0] + d[0] * distance, centre[1] + d[1] * distance, centre[2] + d[2] * distance] as [number, number, number],
-        target: centre as [number, number, number],
-        // Looking straight down (or up), "up" on the picture is the model's front-back axis.
-        up: (Math.abs(d[2]) > 0.9 ? [0, 1, 0] : [0, 0, 1]) as [number, number, number],
-        fov,
-        aspect: 1,
-        zoom: 4,
-      });
-      const turn = (d: number[], deg: number) => {
-        const a = (deg * Math.PI) / 180;
-        return [d[0] * Math.cos(a) - d[1] * Math.sin(a), d[0] * Math.sin(a) + d[1] * Math.cos(a), d[2]];
-      };
-      const poseA = poseAlong(dir);
-      const poseB = poseAlong(turn(dir, 35));
+      // The close-ups: from the directions the part shows the most in.
+      const [poseA, poseB = poseA] = partCloseUps(partFaces, 2);
       const ownBuffer = buildColourBuffer(model.triangles.length, (i) => ownColoursOf(model)[i]);
       const codes = new Int32Array(model.triangles.length).fill(-1);
       regionFaces.forEach((f, i) => {
@@ -6402,6 +7582,9 @@ export default function App() {
       const sameMesh = modelRef.current !== null && modelRef.current.triangles === model.triangles && modelRef.current.triangleColors === model.triangleColors;
       const { changes, dropped } = sanitizeChanges(raw.changes, now, scope, t);
       delete changes.parts;
+      // What no blob holds alone (a thin rim), pointed at on the pictures and caught along the original's borders.
+      if (sameMesh && changes.fix?.length) await resolveFixes(changes, dropped, now, ask, controller.signal, aiRoute ?? "local");
+      else delete changes.fix;
       const lines = describeChanges(changes, now, t);
       const entry: TidyLogEntry = {
         id: `a${Date.now()}`,
@@ -6417,12 +7600,14 @@ export default function App() {
         dropped: dropped.length ? dropped : undefined,
       };
       setTidyLog((prev) => [...prev, entry]);
+      if (focusRef.current) focusByEntryRef.current.set(entry.id, focusRef.current);
       if (lines.length > 0 && sameMesh) applyPlan(changes, entry.id, t("tidy.byAiPreview"), lines, dropped);
     } catch (err) {
       const stopped = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
       sys(stopped ? t("tidy.stopped") : t("tidy.failed", { message: err instanceof Error ? err.message : String(err) }));
     } finally {
       setTidyBusy(null);
+      setFocusBusyPart(null);
       tidyAbortRef.current = null;
     }
   }
@@ -7156,6 +8341,7 @@ export default function App() {
     focus: visible ? focus : NO_FOCUS,
     callouts: visible ? callouts : NO_CALLOUTS,
     flat: paneLook.flat[slot === 0 ? 0 : 1],
+    formLines: formLines && paneLook.flat[slot === 0 ? 0 : 1],
     softEdges: paneLook.soft[slot === 0 ? 0 : 1],
     cornerVertex,
     brush: brushMode,
@@ -7271,26 +8457,21 @@ export default function App() {
       kept.push(p);
       keptGroup.push(pieceGroup[p]);
     }
-    const linearOf = new Map<number, [number, number, number]>();
-    const colourOf = (position: number) => {
-      let lin = linearOf.get(position);
-      if (!lin) {
-        const entry = palette[position];
-        const rgb = (resultMode === "print" && effectiveByIndex.get(entry.index)) || entry.rgb;
-        lin = [srgbToLinear(rgb[0]), srgbToLinear(rgb[1]), srgbToLinear(rgb[2])];
-        linearOf.set(position, lin);
-      }
-      return lin;
+    const colourOf = (position: number): RGB => {
+      const entry = palette[position];
+      return (resultMode === "print" && effectiveByIndex.get(entry.index)) || entry.rgb;
     };
     const points = new Float32Array(kept.length * 9);
-    const colours = new Float32Array(kept.length * 9);
+    // A colour buffer, as the model's (sRGB RGBA bytes).
+    const colours = new Uint8Array(kept.length * FACE_BYTES);
     const parentFace = new Int32Array(kept.length);
     const corners = new Int32Array(kept.length * 3);
     kept.forEach((p, i) => {
-      const lin = colourOf(keptGroup[i]);
+      const rgb = colourOf(keptGroup[i]);
       for (let k = 0; k < 3; k++) {
         const v = cut.pieces[p * 3 + k];
         const o = i * 9 + k * 3;
+        const c = i * FACE_BYTES + k * 4;
         corners[i * 3 + k] = v;
         if (v < vertexCount) {
           const point = model.vertices[v];
@@ -7303,9 +8484,10 @@ export default function App() {
           points[o + 1] = cut.addedVertices[a + 1];
           points[o + 2] = cut.addedVertices[a + 2];
         }
-        colours[o] = lin[0];
-        colours[o + 1] = lin[1];
-        colours[o + 2] = lin[2];
+        colours[c] = rgb[0];
+        colours[c + 1] = rgb[1];
+        colours[c + 2] = rgb[2];
+        colours[c + 3] = 255;
       }
       parentFace[i] = cut.pieceFaces[p];
     });
@@ -7516,6 +8698,16 @@ export default function App() {
               />
               </>
             )}
+            {/* The target colour count first: the strip and the 🤖 AI flat paint both keep within it. */}
+            {step === 2 && model && (
+              <TargetSection
+                strip={stripData}
+                targetGroups={targetGroups}
+                onTargetChange={(n) => patchSettings("palette", { ...settings.palette, maxColours: Math.max(2, Math.min(64, n)) })}
+                busy={isBusy}
+                highlight={tidyHighlight}
+              />
+            )}
             {(step === 2 || step === 3) && model && (
               <TidyPanel
                 scope={tidyScope}
@@ -7535,7 +8727,7 @@ export default function App() {
                 log={tidyLog.filter((entry) => entry.model === tidyModelName && entry.scope !== "export")}
                 busy={tidyBusy}
                 elapsed={tidyElapsed}
-                onSend={(message) => void tidyAsk(message, false)}
+                onSend={(message, images) => void tidyAsk(message, false, false, undefined, { images })}
                 onAnalyse={() => void tidyAsk(t("tidy.analyseMessage"), true)}
                 onStop={() => tidyAbortRef.current?.abort()}
                 onApplySuggestion={applyTidySuggestion}
@@ -7543,12 +8735,13 @@ export default function App() {
                 onApplyPreview={acceptPreview}
                 onCancelEntry={cancelEntry}
                 canCancel={canCancelEntry}
-                onAuto={() => void tidyAsk(t(tidyScope === "mix" ? "tidy.mixAutoAsk" : "tidy.autoAsk"), false)}
+                onAuto={() => void (tidyScope === "mix" ? tidyAsk(t("tidy.mixAutoAsk"), false) : autoTidy(t("tidy.autoAsk")))}
                 parts={partsShown}
                 partView={partView}
                 onPartView={setPartView}
                 onRedoParts={() => void tidyAsk(t("tidy.partsRedo"), false, false, "clean", { reshapeOnly: true })}
                 onFocusPart={(part) => void focusAsk(part)}
+                focusBusy={focusBusyPart}
                 connection={aiConnection}
                 disabled={isBusy}
               />
@@ -7579,8 +8772,6 @@ export default function App() {
                 onFlagChange={updateFlag}
                 mergeSettings={settings.merge}
                 onMergeSettings={(next) => patchSettings("merge", next)}
-                targetGroups={targetGroups}
-                onTargetChange={(n) => patchSettings("palette", { ...settings.palette, maxColours: Math.max(2, Math.min(64, n)) })}
                 onSplitGroup={(family, fraction) => keepStripCuts(addCut(committedCuts, family, fraction))}
                 onMergeUp={(family, index) => keepStripCuts(removeCut(committedCuts, family, index))}
                 onMergeSelected={mergeSelected}
@@ -7679,8 +8870,8 @@ export default function App() {
                     disabled={isBusy}
                     auto={{ label: t("tidy.exportAuto"), hint: t("tidy.exportAutoHint"), onClick: () => void tidyAsk(t("tidy.exportAutoAsk"), false, false, "export") }}
                     examples={[t("tidy.exExport3"), t("tidy.exExport1"), t("tidy.exExport2")]}
-                    placeholder={t("tidy.exExport3")}
-                    onSend={(message) => void tidyAsk(message, false, false, "export")}
+                    placeholder={t("tidy.exportPlaceholder")}
+                    onSend={(message, images) => void tidyAsk(message, false, false, "export", { images })}
                     onStop={() => tidyAbortRef.current?.abort()}
                     onTry={applyTidySuggestion}
                     onApply={acceptPreview}
@@ -7848,6 +9039,17 @@ export default function App() {
                 onClick={() => setPaneLook("flat", "both", pairPressed(paneLook.flat) !== true)}
               >
                 <Icon name="flat" size={14} stroke={1.4} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn small"
+                aria-pressed={formLines}
+                aria-label={t("view.lines")}
+                disabled={pairPressed(paneLook.flat) === false}
+                title={pairPressed(paneLook.flat) === false ? `${t("view.lines")} — ${t("view.linesNeedFlat")}` : `${t("view.lines")} — ${t("view.linesHint")}`}
+                onClick={() => setFormLines(!formLines)}
+              >
+                <Icon name="lines" size={14} stroke={1.4} />
               </button>
               <button
                 type="button"
@@ -8247,12 +9449,12 @@ export default function App() {
             {showMap && (
               <ColourMap
                 ref={mapRef}
-                atlas={atlas}
+                atlas={shownAtlas}
                 building={atlasBuilding}
                 colourOf={colourOfFace}
                 coloursVersion={coloursVersion}
                 masks={atlasMasks}
-                brush={{ active: brushMode, radiusPx: atlas ? brushRadius * atlas.scale : 4, hex: brushHex, innerPx: healMode && atlas ? healSize * atlas.scale : undefined }}
+                brush={{ active: brushMode, radiusPx: shownAtlas ? brushRadius * shownAtlas.scale : 4, hex: brushHex, innerPx: healMode && shownAtlas ? healSize * shownAtlas.scale : undefined }}
                 eyedropper={eyedropper}
                 hand={hand}
                 background={background}
@@ -8261,10 +9463,16 @@ export default function App() {
                 onBrushStart={() => void beginStroke()}
                 onBrushPaintAt={paintAtMap}
                 onBrushEnd={endStroke}
-                label={t("map.label")}
-                hint={t("map.hint")}
+                label={unfolded ? t("map.unfoldLabel", { n: unfolded.pieces }) : t("map.label")}
+                hint={t(unfolded ? "map.unfoldHint" : unfoldOn && pickedPatches.length === 0 ? "map.unfoldPickHint" : "map.hint")}
                 emptyLabel={t("map.empty")}
                 buildingLabel={t("busy.atlas")}
+                busyLabel={unfolding !== null ? t("map.unfolding", { pct: Math.round(unfolding * 100) }) : (unfoldNote ?? undefined)}
+                tools={
+                  <button type="button" className="link-btn" aria-pressed={unfoldOn} title={t("map.unfoldHintToggle")} onClick={() => setUnfoldOn(!unfoldOn)}>
+                    🧩 {t("map.unfold")}
+                  </button>
+                }
               />
             )}
             {step === 4 && layerPreview && printHeightMm !== null && (
@@ -8274,7 +9482,8 @@ export default function App() {
               </span>
             )}
             {model && model.triangles.length >= BIG_MODEL_FACES && step <= 2 && (
-              <span className="view-chip" style={chipStyle}>
+              // Said once a model is opened, then out of the way (11-05: always on, it sat over the views' corner).
+              <span key={`${model.name}|${model.triangles.length}`} className="view-chip passing long" style={chipStyle}>
                 {t("load.bigModel", { faces: model.triangles.length.toLocaleString() })}
               </span>
             )}
@@ -8292,6 +9501,24 @@ export default function App() {
                 {t("view.dragging")}
               </span>
             )}
+            <div className="view-notices">
+            {/* Claude at work, where the eyes are (the consult's own line may be scrolled away). */}
+            {tidyBusy !== null && (
+              <div className="view-working" role="status">
+                <GyupaSpin size={22} />
+                <span>
+                  {tidyBusy} · {t("tidy.seconds", { n: tidyElapsed })}
+                </span>
+                <button type="button" className="btn small" onClick={() => tidyAbortRef.current?.abort()}>
+                  ⏹ {t("tidy.stop")}
+                </button>
+              </div>
+            )}
+            {aiArrived !== null && tidyBusy === null && (
+              <div className="view-arrived" role="status" key={aiArrived}>
+                {changeFlash ? t("tidy.arrivedChanged", { pct: formatPct((changeFlash.faces / changeFlash.total) * 100) }) : t("tidy.arrived")}
+              </div>
+            )}
             {aiPreview && (
               <div className="ai-preview-banner" role="status">
                 <span>{t("tidy.previewBanner", { n: aiPreview.lines?.length ?? 0 })}</span>
@@ -8305,6 +9532,7 @@ export default function App() {
                 )}
               </div>
             )}
+            </div>
             {compareStep && cutNoticeShown && cutNotice && (
               <div className="cut-notice" role="status">
                 <span className="cut-notice-icon">
@@ -8553,6 +9781,11 @@ export default function App() {
         <span className="status-dot" aria-hidden="true" />
         <span className="label">{isBusy ? busy : t("status.label")}</span>
         <span className="message" title={status}>{status}</span>
+        {memoryMb !== null && (
+          <span className={`memory-use${memoryMb > 2500 ? " warn" : ""}`} title={t("status.memoryHint")}>
+            {t("status.memory", { gb: (memoryMb / 1000).toFixed(memoryMb >= 1000 ? 1 : 2) })}
+          </span>
+        )}
         <span className="storage-mode" title={t(storageMode === "folder" ? "storage.folderHint" : "storage.browserHint")}>
           {t(storageMode === "folder" ? "storage.folder" : "storage.browser")}
         </span>

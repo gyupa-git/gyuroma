@@ -210,10 +210,6 @@ export function buildFaceAtlas(
     chartDir.set(d, c * 3);
     centreZ[c] /= weight[c] || 1;
   }
-  const minU = new Float64Array(chartCount).fill(Infinity);
-  const minV = new Float64Array(chartCount).fill(Infinity);
-  const maxU = new Float64Array(chartCount).fill(-Infinity);
-  const maxV = new Float64Array(chartCount).fill(-Infinity);
   const uv = new Float32Array(n * 6);
   for (let f = 0; f < n; f++) {
     const c = chartOf[f];
@@ -221,25 +217,86 @@ export function buildFaceAtlas(
     const tri = model.triangles[f];
     for (let corner = 0; corner < 3; corner++) {
       const v = model.vertices[tri[corner]];
-      const u = v[0] * right[0] + v[1] * right[1] + v[2] * right[2];
-      const w = v[0] * up[0] + v[1] * up[1] + v[2] * up[2];
-      uv[f * 6 + corner * 2] = u;
-      uv[f * 6 + corner * 2 + 1] = w;
+      uv[f * 6 + corner * 2] = v[0] * right[0] + v[1] * right[1] + v[2] * right[2];
+      uv[f * 6 + corner * 2 + 1] = v[0] * up[0] + v[1] * up[1] + v[2] * up[2];
+    }
+  }
+  return layOutCharts(n, uv, chartOf, chartCount, chartDir, centreZ, size, null);
+}
+
+/**
+ * A patch unfolded on its own (unfold.ts) as a colour map: its pieces are the charts, the rest of the model is
+ * off the map (11-05, the owner: "이 한 조각을 눌렀을 때 그 한 조각이 그대로 펼쳐진 느낌으로").
+ */
+export function buildPatchAtlas(model: MeshModel, geometry: FaceGeometry, faces: Int32Array, unfolded: { uv: Float32Array; piece: Int32Array; pieces: number }, size: number): FaceAtlas {
+  const n = model.triangles.length;
+  const { pieces } = unfolded;
+  const chartOf = new Int32Array(n).fill(-1);
+  const uv = new Float32Array(n * 6);
+  const chartDir = new Float32Array(pieces * 3);
+  const centreZ = new Float64Array(pieces);
+  const weight = new Float64Array(pieces);
+  for (let i = 0; i < faces.length; i++) {
+    const f = faces[i];
+    const c = unfolded.piece[i];
+    chartOf[f] = c;
+    uv.set(unfolded.uv.subarray(i * 6, i * 6 + 6), f * 6);
+    for (let d = 0; d < 3; d++) chartDir[c * 3 + d] += geometry.normals[f * 3 + d];
+    centreZ[c] += geometry.centroids[f * 3 + 2];
+    weight[c]++;
+  }
+  for (let c = 0; c < pieces; c++) {
+    const len = Math.hypot(chartDir[c * 3], chartDir[c * 3 + 1], chartDir[c * 3 + 2]) || 1;
+    for (let d = 0; d < 3; d++) chartDir[c * 3 + d] /= len;
+    centreZ[c] /= weight[c] || 1;
+  }
+  return layOutCharts(n, uv, chartOf, pieces, chartDir, centreZ, size, faces, true);
+}
+
+/**
+ * Charts with their UV (model units, 6 numbers a face) laid side by side in the square and drawn as face ids:
+ * shared by the whole-model map and a patch unfolded on its own (`members` = the faces shown; the rest are not on
+ * the map, `chartOf` −1).
+ */
+export function layOutCharts(
+  n: number,
+  uv: Float32Array,
+  chartOf: Int32Array,
+  chartCount: number,
+  chartDir: Float32Array,
+  centreZ: Float64Array,
+  size: number,
+  members: Int32Array | null,
+  /** Biggest first, in one band (a patch's pieces: the one clicked is the big one, its crumbs go to the side). */
+  bySize = false,
+): FaceAtlas {
+  const count = members ? members.length : n;
+  const faceAt = (i: number) => (members ? members[i] : i);
+  const minU = new Float64Array(chartCount).fill(Infinity);
+  const minV = new Float64Array(chartCount).fill(Infinity);
+  const maxU = new Float64Array(chartCount).fill(-Infinity);
+  const maxV = new Float64Array(chartCount).fill(-Infinity);
+  for (let i = 0; i < count; i++) {
+    const f = faceAt(i);
+    const c = chartOf[f];
+    for (let corner = 0; corner < 3; corner++) {
+      const u = uv[f * 6 + corner * 2];
+      const w = uv[f * 6 + corner * 2 + 1];
       if (u < minU[c]) minU[c] = u;
       if (u > maxU[c]) maxU[c] = u;
       if (w < minV[c]) minV[c] = w;
       if (w > maxV[c]) maxV[c] = w;
     }
   }
-
   // 5. Scale + shelf packing. Charts are laid out top-to-bottom following the model (bands by
   //    chart height in the model); inside a band, taller charts first. Retry smaller until it fits.
   const pad = 1;
   let area = 0;
   for (let c = 0; c < chartCount; c++) area += Math.max(1e-9, (maxU[c] - minU[c]) * (maxV[c] - minV[c]));
   let scale = Math.sqrt((0.55 * size * size) / Math.max(area, 1e-9));
-  const byZ = Array.from({ length: chartCount }, (_v, c) => c).sort((a, b) => centreZ[b] - centreZ[a]);
-  const bandCount = Math.max(1, Math.min(12, Math.round(Math.sqrt(chartCount / 8))));
+  const chartArea = (c: number) => (maxU[c] - minU[c]) * (maxV[c] - minV[c]);
+  const byZ = Array.from({ length: chartCount }, (_v, c) => c).sort(bySize ? (a, b) => chartArea(b) - chartArea(a) : (a, b) => centreZ[b] - centreZ[a]);
+  const bandCount = bySize ? 1 : Math.max(1, Math.min(12, Math.round(Math.sqrt(chartCount / 8))));
   const bandSize = Math.ceil(chartCount / bandCount);
   const chartX = new Float64Array(chartCount);
   const chartY = new Float64Array(chartCount);
@@ -302,7 +359,8 @@ export function buildFaceAtlas(
 
   // 5. Face corner pixel coordinates (v axis flipped so "up" is up).
   const faceUv = new Float32Array(n * 6);
-  for (let f = 0; f < n; f++) {
+  for (let i = 0; i < count; i++) {
+    const f = faceAt(i);
     const c = chartOf[f];
     for (let corner = 0; corner < 3; corner++) {
       faceUv[f * 6 + corner * 2] = chartX[c] + pad + 0.5 + (uv[f * 6 + corner * 2] - minU[c]) * scale;
@@ -312,7 +370,8 @@ export function buildFaceAtlas(
 
   // 6. Rasterise face ids.
   const idMap = new Int32Array(size * size).fill(-1);
-  for (let f = 0; f < n; f++) {
+  for (let i = 0; i < count; i++) {
+    const f = faceAt(i);
     const x0 = faceUv[f * 6], y0 = faceUv[f * 6 + 1];
     const x1 = faceUv[f * 6 + 2], y1 = faceUv[f * 6 + 3];
     const x2 = faceUv[f * 6 + 4], y2 = faceUv[f * 6 + 5];

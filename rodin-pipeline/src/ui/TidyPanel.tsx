@@ -1,9 +1,11 @@
 import { useState } from "react";
+import type { AttachedImage } from "./attachImage";
 import { ConsultBox } from "./ConsultBox";
 import { TIDY_CONSULT_PRESETS, TIDY_PRESETS, type ChangeLine, type TidyConsultPreset, type TidyLogEntry, type TidyPreset, type TidyScope } from "../engine/tidy";
 import type { TidyArea } from "../engine/tidyArea";
 import type { AiRoute, KeyUsage } from "../engine/aiClient";
 import { useT } from "../i18n";
+import { GyupaSpin } from "./GyupaLoader";
 import { HelpTip } from "./HelpTip";
 import { Segmented } from "./Shell";
 
@@ -68,6 +70,7 @@ export function TidyPanel({
   onPartView,
   onRedoParts,
   onFocusPart,
+  focusBusy = null,
   connection,
   disabled,
 }: {
@@ -94,7 +97,7 @@ export function TidyPanel({
   /** What the AI is doing now, or null. */
   busy: string | null;
   elapsed: number;
-  onSend: (message: string) => void;
+  onSend: (message: string, images: AttachedImage[]) => void;
   onAnalyse: () => void;
   onStop: () => void;
   onApplySuggestion: (entryId: string) => void;
@@ -104,7 +107,7 @@ export function TidyPanel({
   onApplyPreview: (entryId: string) => void;
   onCancelEntry: (entryId: string) => void;
   canCancel: (entryId: string) => boolean;
-  /** 🤖 the whole job at once: 02 the Gyupa-style tidy, 03 the mixing check. */
+  /** 🤖 the whole job at once: 02 the AI flat paint, 03 the mixing check. */
   onAuto: () => void;
   /** The part map (shape first), when there is one. */
   parts: { subject: string; list: Array<{ name: string; pct: number; tint: string }> } | null;
@@ -113,6 +116,8 @@ export function TidyPanel({
   onRedoParts: () => void;
   /** 🎯 one part up close. */
   onFocusPart: (part: string) => void;
+  /** The part being worked on up close (its chip shows the working face). */
+  focusBusy?: string | null;
   connection: AiConnection;
   disabled: boolean;
 }) {
@@ -139,7 +144,8 @@ export function TidyPanel({
     });
   };
   const mixing = scope === "mix";
-  const examples = mixing ? [t("tidy.exAnalyse"), t("tidy.exMix1"), t("tidy.exMix2")] : [t("tidy.exAuto"), t("tidy.exAnalyse"), t("tidy.exEdges"), t("tidy.exShade"), t("tidy.exSpecks")];
+  // Not the 🤖 and 🔍 asks again — they have their own buttons (11-04: the chips in two lines).
+  const examples = mixing ? [t("tidy.exMix1"), t("tidy.exMix2")] : [t("tidy.exEdges"), t("tidy.exShade"), t("tidy.exSpecks")];
 
   return (
     <section className="pane-section tidy" aria-label={t("tidy.title")}>
@@ -288,7 +294,7 @@ export function TidyPanel({
               busy={busy}
               elapsed={elapsed}
               disabled={disabled}
-              auto={mixing ? { label: t("tidy.mixAuto"), hint: t("tidy.mixAutoHint"), onClick: onAuto } : { label: t("tidy.auto"), hint: t("tidy.autoHint"), onClick: onAuto }}
+              auto={mixing ? { label: t("tidy.mixAuto"), hint: t("tidy.mixAutoHint"), short: t("tidy.mixAutoShort"), onClick: onAuto } : { label: t("tidy.auto"), hint: t("tidy.autoHint"), short: t("tidy.autoShort"), onClick: onAuto }}
               extra={
                 !mixing && (
                   <div className="tidy-parts">
@@ -302,22 +308,24 @@ export function TidyPanel({
                             <button
                               key={part.name}
                               type="button"
-                              className="tidy-part"
+                              className={`tidy-part${focusBusy === part.name ? " working" : ""}`}
                               disabled={busy !== null || disabled || ai !== true}
+                              aria-busy={focusBusy === part.name || undefined}
                               title={`${t("tidy.focus", { part: part.name })} — ${t("tidy.focusHint")}`}
                               onClick={() => onFocusPart(part.name)}
                             >
-                              <i style={{ background: part.tint }} aria-hidden="true" />
+                              {/* The part being worked on shows the working face where its colour was: the sign is where the press was. */}
+                              {focusBusy === part.name ? <GyupaSpin size={13} /> : <i style={{ background: part.tint }} aria-hidden="true" />}
                               {part.name} <span className="muted">{part.pct.toFixed(0)}%</span>
                             </button>
                           ))}
                         </span>
                         <span className="tidy-parts-actions">
-                          <button type="button" className="text-link" aria-pressed={partView} onClick={() => onPartView(!partView)}>
+                          <button type="button" className="link-btn" aria-pressed={partView} title={t("tidy.partsShowHint")} onClick={() => onPartView(!partView)}>
                             {partView ? t("tidy.partsHide") : t("tidy.partsShow")}
                           </button>
-                          <button type="button" className="text-link" disabled={busy !== null || disabled} onClick={onRedoParts}>
-                            {t("tidy.partsRedo")}
+                          <button type="button" className="link-btn" disabled={busy !== null || disabled} title={t("tidy.partsRedoHint")} onClick={onRedoParts}>
+                            ↻ {t("tidy.partsRedo")}
                           </button>
                         </span>
                       </>

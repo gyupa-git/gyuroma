@@ -34,6 +34,8 @@ const ICONS = {
   link: <><circle cx="5" cy="8" r="2.5" /><circle cx="11" cy="8" r="2.5" /><path d="M7.5 8h1" /></>,
   cube: <><path d="M8 1.8 13.5 5v6L8 14.2 2.5 11V5z" /><path d="M2.5 5 8 8.2 13.5 5M8 8.2v6" /></>,
   flat: <><circle cx="8" cy="8" r="5.5" /><path d="M8 2.5v11" /></>,
+  // A round shape drawn in lines: its outline and the fold across it.
+  lines: <><path d="M3 11.5C1.8 7.2 4.2 2.6 8.4 2.5c3.6-.1 5.6 3.4 4.7 6.7-.9 3.4-4.4 5.1-7.4 4.1" /><path d="M5.2 8.6c1.6-1.5 4.2-1.7 6-.4" /></>,
   // A staircase of faces, faint, and the straight line it is cut along.
   cutLine: <><path d="M2 13.5V11h3V8h3V5h3V2.5h3" strokeOpacity="0.4" /><path d="M2 12.5 13.5 3" /></>,
   soft: <><circle cx="8" cy="8" r="5.5" /><circle cx="8" cy="8" r="3.4" strokeOpacity="0.55" /><circle cx="8" cy="8" r="1.4" strokeOpacity="0.3" /></>,

@@ -107,6 +107,70 @@ class FaceHeap {
   }
 }
 
+/** The cost of stepping from one face to the next: 1, plus a lot over a groove, plus a little per colour change. */
+function crossingCost(geometry: CreaseGeometry, lab: Float32Array | null, grooveCost: number, colourCost: number): (f: number, g: number) => number {
+  const { centroids: c, normals: nm } = geometry;
+  return (f, g) => {
+    const dx = c[g * 3] - c[f * 3], dy = c[g * 3 + 1] - c[f * 3 + 1], dz = c[g * 3 + 2] - c[f * 3 + 2];
+    const len = Math.hypot(dx, dy, dz) || 1e-9;
+    const cos = nm[f * 3] * nm[g * 3] + nm[f * 3 + 1] * nm[g * 3 + 1] + nm[f * 3 + 2] * nm[g * 3 + 2];
+    // Inwards: the next face lies above this one's surface (and this one above the next's) — a valley.
+    const up = (dx * nm[f * 3] + dy * nm[f * 3 + 1] + dz * nm[f * 3 + 2]) / len;
+    const down = (dx * nm[g * 3] + dy * nm[g * 3 + 1] + dz * nm[g * 3 + 2]) / len;
+    const groove = up > 0.02 && down < -0.02 ? Math.max(0, 1 - cos) : 0;
+    let cost = 1 + grooveCost * groove;
+    if (lab) {
+      const dl = lab[g * 3] - lab[f * 3], da = lab[g * 3 + 1] - lab[f * 3 + 1], db = lab[g * 3 + 2] - lab[f * 3 + 2];
+      cost += (colourCost * Math.hypot(dl, da, db)) / 10;
+    }
+    return cost;
+  };
+}
+
+/**
+ * Faces with no label yet (-1: a blob the AI could not place, two things blurred into one) take the
+ * label of the side cheapest to reach — spreading over the surface as the crease snap does, a groove
+ * or a change in the model's own colour costing to cross — so the two sides meet where the sculpt
+ * or the texture divides them.  Faces no labelled face can reach stay -1.
+ */
+export function fillUnlabelled(labels: Int32Array, adjacency: FaceAdjacency, geometry: CreaseGeometry, options: { lab?: Float32Array | null; grooveCost?: number; colourCost?: number } = {}): Int32Array {
+  const n = labels.length;
+  const out = labels.slice();
+  const { offsets, neighbours } = adjacency;
+  const step = crossingCost(geometry, options.lab ?? null, options.grooveCost ?? 60, options.colourCost ?? 1);
+  const cost = new Float32Array(n).fill(Infinity);
+  let open = 0;
+  for (let f = 0; f < n; f++) if (labels[f] < 0) open++;
+  if (open === 0) return out;
+  const heap = new FaceHeap(open * 2);
+  for (let f = 0; f < n; f++) {
+    if (labels[f] < 0) continue;
+    for (let i = offsets[f]; i < offsets[f + 1]; i++)
+      if (labels[neighbours[i]] < 0) {
+        cost[f] = 0;
+        heap.push(f, 0);
+        break;
+      }
+  }
+  const done = new Uint8Array(n);
+  while (heap.size > 0) {
+    const a = heap.pop();
+    if (done[a]) continue;
+    done[a] = 1;
+    for (let i = offsets[a]; i < offsets[a + 1]; i++) {
+      const b = neighbours[i];
+      if (labels[b] >= 0 || done[b]) continue;
+      const next = cost[a] + step(a, b);
+      if (next < cost[b]) {
+        cost[b] = next;
+        out[b] = out[a];
+        heap.push(b, next);
+      }
+    }
+  }
+  return out;
+}
+
 export function snapToCreases(labels: Int32Array, adjacency: FaceAdjacency, geometry: CreaseGeometry, options: CreaseOptions): Int32Array {
   const n = labels.length;
   const band = Math.max(0, Math.floor(options.band));
@@ -180,25 +244,7 @@ export function snapToCreases(labels: Int32Array, adjacency: FaceAdjacency, geom
   }
   if (openCount === 0) return out;
 
-  const grooveCost = options.grooveCost ?? 60;
-  const colourCost = options.colourCost ?? 1;
-  const { centroids: c, normals: nm } = geometry;
-  const lab = options.lab ?? null;
-  const step = (f: number, g: number): number => {
-    const dx = c[g * 3] - c[f * 3], dy = c[g * 3 + 1] - c[f * 3 + 1], dz = c[g * 3 + 2] - c[f * 3 + 2];
-    const len = Math.hypot(dx, dy, dz) || 1e-9;
-    const cos = nm[f * 3] * nm[g * 3] + nm[f * 3 + 1] * nm[g * 3 + 1] + nm[f * 3 + 2] * nm[g * 3 + 2];
-    // Inwards: the next face lies above this one's surface (and this one above the next's) — a valley.
-    const up = (dx * nm[f * 3] + dy * nm[f * 3 + 1] + dz * nm[f * 3 + 2]) / len;
-    const down = (dx * nm[g * 3] + dy * nm[g * 3 + 1] + dz * nm[g * 3 + 2]) / len;
-    const groove = up > 0.02 && down < -0.02 ? Math.max(0, 1 - cos) : 0;
-    let cost = 1 + grooveCost * groove;
-    if (lab) {
-      const dl = lab[g * 3] - lab[f * 3], da = lab[g * 3 + 1] - lab[f * 3 + 1], db = lab[g * 3 + 2] - lab[f * 3 + 2];
-      cost += (colourCost * Math.hypot(dl, da, db)) / 10;
-    }
-    return cost;
-  };
+  const step = crossingCost(geometry, options.lab ?? null, options.grooveCost ?? 60, options.colourCost ?? 1);
 
   // Every open face to the side it is cheapest to reach from (all sides spreading at once).
   const cost = new Float32Array(n).fill(Infinity);

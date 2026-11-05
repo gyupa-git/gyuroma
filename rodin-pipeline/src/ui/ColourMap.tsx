@@ -1,8 +1,9 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
 import type { RGB } from "@core/types";
 import { faceAtAtlasPixel, paintAtlasImage, paintAtlasOutline, paintAtlasOverlay, type AtlasMasks, type FaceAtlas } from "../engine/atlas";
 import type { PickInfo } from "./MeshViewer";
 import { DEFAULT_BACKGROUND, fillBackground, type ViewBackground } from "./background";
+import { GyupaSpin } from "./GyupaLoader";
 
 export interface ColourMapHandle {
   /** Repaint the pixels of these faces from `colourOf`. */
@@ -45,6 +46,10 @@ export interface ColourMapProps {
   hint: string;
   emptyLabel: string;
   buildingLabel: string;
+  /** Work going on over the map (a patch being unfolded): the working face and this line. */
+  busyLabel?: string;
+  /** Small controls beside the label (they take clicks; the label does not). */
+  tools?: ReactNode;
 }
 
 interface ViewTransform {
@@ -73,7 +78,7 @@ function outlineWidthFor(scale: number): number {
 }
 
 export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function ColourMap(
-  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, label, hint, emptyLabel, buildingLabel },
+  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, label, hint, emptyLabel, buildingLabel, busyLabel, tools },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -517,8 +522,15 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     <div className={`colour-map${brush.active ? " brushing" : ""}${eyedropper ? " eyedropping" : ""}`}>
       <div className="mesh-viewer-label">
         {label}
-        {atlas && <span className="muted"> · {atlas.size}px · {hint}</span>}
+        {atlas && <span className="muted"> · {hint}</span>}
+        {tools && <span className="pane-tools">{tools}</span>}
       </div>
+      {busyLabel && (
+        <div className="colour-map-busy" role="status">
+          <GyupaSpin size={14} />
+          {busyLabel}
+        </div>
+      )}
       <div className="colour-map-host" ref={containerRef}>
         <canvas ref={canvasRef} />
       </div>

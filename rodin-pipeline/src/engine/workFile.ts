@@ -29,6 +29,8 @@ export interface WorkFileContents {
   /** The confirmed cuts the colours' mesh was made with; null = none. */
   cuts: StoredWorkCuts | null;
   settings: unknown;
+  /** What the AI found and said about this model (its part map, the consult) — so the work goes on where it was. */
+  ai?: { partMap: unknown; chat: unknown[] } | null;
   savedAt: number;
   /** The app and version that wrote it. */
   app: string;
@@ -44,6 +46,7 @@ interface WorkFileHeader {
   parts: [number, number, number];
   gzip: boolean;
   settings: unknown;
+  ai?: { partMap: unknown; chat: unknown[] } | null;
 }
 
 /** Why a file could not be read as a work file. */
@@ -79,6 +82,7 @@ export async function packWorkFile(contents: Omit<WorkFileContents, "savedAt"> &
     parts: [file.length, records[1]?.length ?? 0, records[2]?.length ?? 0],
     gzip: packed !== null,
     settings: contents.settings,
+    ai: contents.ai ?? null,
   };
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
   const lead = new Uint8Array(12);
@@ -118,6 +122,7 @@ export async function readWorkFile(blob: Blob): Promise<WorkFileContents> {
     colours: isStoredWorkColours(colours) ? colours : null,
     cuts: isStoredWorkCuts(cuts) ? cuts : null,
     settings: header.settings,
+    ai: header.ai && typeof header.ai === "object" ? { partMap: header.ai.partMap ?? null, chat: Array.isArray(header.ai.chat) ? header.ai.chat : [] } : null,
     savedAt: Number(header.savedAt) || 0,
     app: String(header.app ?? ""),
   };

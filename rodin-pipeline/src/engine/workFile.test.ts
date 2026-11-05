@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { packRuns, type StoredWorkColours, type StoredWorkCuts, type StoredWorkFile } from "./storage";
+import { deserialiseRecord, packRuns, serialiseJson, serialiseRecord, type StoredWorkColours, type StoredWorkCuts, type StoredWorkFile } from "./storage";
 import { packWorkFile, readWorkFile, WorkFileError, workFileName } from "./workFile";
 
 const obj = new TextEncoder().encode("# Exported from Nomad Sculpt\nv 0 0 0 1 0 0\nv 1 0 0 0 1 0\nv 0 1 0 0 0 1\nf 1 2 3\n".repeat(200));
@@ -23,7 +23,25 @@ const cuts: StoredWorkCuts = {
 };
 const settings = { stripByModel: { "Slc_p.obj": { target: 24, cuts: { 4: [0.0492, 0.985] } } }, manualPhysical: { 5: 1 } };
 
+describe("plain records", () => {
+  it("keep a part map and a conversation through the server's file (a reload lost them)", () => {
+    const maps = { "Tkc_p.obj": { faces: 4619786, cells: 90, subject: "톱니 쿠키", parts: [{ name: "얼굴", cells: [1, 2, 3] }], at: "2026-11-05" } };
+    const chat = [{ id: "u1", role: "user", text: "눈알 둘레에 흰 테두리", images: ["data:image/jpeg;base64,AAAA"] }];
+    for (const value of [maps, chat]) expect(deserialiseRecord(serialiseJson(value).slice().buffer)).toEqual(value);
+    // Anything else still is not JSON (a big record that fails its check must not become one).
+    expect(serialiseRecord({ faceCount: 3, colours: [1, 2, 3] })).toBeNull();
+  });
+});
+
 describe("work file", () => {
+  it("carries the AI's part map and the consult with the work", async () => {
+    const ai = { partMap: { faces: 3, cells: 2, subject: "x", parts: [{ name: "얼굴", cells: [0] }], at: "t" }, chat: [{ id: "a1", role: "ai", text: "네" }] };
+    const back = await readWorkFile(await packWorkFile({ file, colours: null, cuts: null, settings, ai, app: "GYUROMA test", savedAt: 1 }));
+    expect(back.ai).toEqual(ai);
+    const before = await readWorkFile(await packWorkFile({ file, colours: null, cuts: null, settings, app: "GYUROMA test", savedAt: 1 }));
+    expect(before.ai).toBeNull();
+  });
+
   it("brings back the model file, the colours, the cuts and the settings exactly", async () => {
     const blob = await packWorkFile({ file, colours, cuts, settings, app: "GYUROMA test", savedAt: 42 });
     // gzipped: the repeated OBJ text packs small
