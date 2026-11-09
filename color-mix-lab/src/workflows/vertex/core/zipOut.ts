@@ -24,23 +24,30 @@ export class ZipOut {
   });
   private encoder = new TextEncoder();
 
-  constructor(private readonly type = "application/zip") {}
+  /**
+   * `level`: deflate level 1–9 (6 by default). 1 compresses faster for a file ~8% bigger (on a 4.6M-face export
+   * the whole export went 19 → 17 s in the browser — 11-09).
+   */
+  constructor(
+    private readonly type = "application/zip",
+    private readonly level: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 = 6,
+  ) {}
 
   text(path: string, text: string): void {
-    const entry = new ZipDeflate(path, { level: 6 });
+    const entry = new ZipDeflate(path, { level: this.level });
     this.zip.add(entry);
     entry.push(this.encoder.encode(text), true);
   }
 
   bytes(path: string, bytes: Uint8Array): void {
-    const entry = new ZipDeflate(path, { level: 6 });
+    const entry = new ZipDeflate(path, { level: this.level });
     this.zip.add(entry);
     entry.push(bytes, true);
   }
 
   /** An entry written in pieces: push text, then end. */
   stream(path: string): ZipEntryStream {
-    const entry = new ZipDeflate(path, { level: 6 });
+    const entry = new ZipDeflate(path, { level: this.level });
     this.zip.add(entry);
     return {
       push: (text) => {

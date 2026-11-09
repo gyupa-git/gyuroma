@@ -9,6 +9,7 @@ import type { MeshModel } from "@core/types";
  */
 export type CutRequest =
   | { type: "model"; modelId: number; positions: Float64Array; corners: Int32Array }
+  | { type: "forget" }
   | { type: "cut"; id: number; modelId: number; groups: Int32Array; protectedGroup: Uint8Array; span: number; settled?: Int32Array; cutFaces?: Uint8Array };
 
 export type CutReply = { id: number; cut: BorderCut } | { id: number; error: string };
@@ -23,7 +24,11 @@ interface Pending {
 }
 
 let worker: Worker | null = null;
-let sentModel: { triangles: MeshModel["triangles"]; id: number } | null = null;
+/**
+ * The model the worker holds, known by its triangles — held weakly: a strong hold kept the last model's 4.6M face
+ * triples (~185MB) alive after another model was opened (11-09).
+ */
+let sentModel: { triangles: WeakRef<MeshModel["triangles"]>; id: number } | null = null;
 let nextModelId = 1;
 let nextId = 1;
 /** Who asks: the result view's preview, or an export — each newer request replaces only its own kind waiting. */
@@ -42,6 +47,7 @@ function ensureWorker(): Worker {
       if ("cut" in event.data) done.resolve(event.data.cut);
       else done.reject(new Error(event.data.error));
     }
+    // (A request given up by forgetCutModel has no-op handlers: its answer is dropped here.)
     sendNext();
   };
   return worker;
@@ -74,12 +80,12 @@ export function cutBorders(
   cutFaces?: Uint8Array,
 ): Promise<BorderCut> {
   const w = ensureWorker();
-  if (!sentModel || sentModel.triangles !== model.triangles) {
+  if (!sentModel || sentModel.triangles.deref() !== model.triangles) {
     const positions = new Float64Array(model.vertices.length * 3);
     model.vertices.forEach((v, i) => positions.set(v, i * 3));
     const corners = new Int32Array(model.triangles.length * 3);
     model.triangles.forEach((t, i) => corners.set(t, i * 3));
-    sentModel = { triangles: model.triangles, id: nextModelId++ };
+    sentModel = { triangles: new WeakRef(model.triangles), id: nextModelId++ };
     w.postMessage({ type: "model", modelId: sentModel.id, positions, corners } satisfies CutRequest, [positions.buffer, corners.buffer]);
   }
   const request: Pending["request"] = { type: "cut", id: nextId++, modelId: sentModel.id, groups: groups.slice(), protectedGroup: protectedGroup.slice(), span, settled, cutFaces };
@@ -88,4 +94,22 @@ export function cutBorders(
     waiting.set(asker, { request, resolve, reject });
     sendNext();
   });
+}
+
+/**
+ * A new model or a new start: the worker lets go of the last model (its flat copy and edge table, ~186MB on 4.6M
+ * faces) and nothing waits on it — the waiting requests are given up; the running one finishes in the worker
+ * (stopping it would leave its caller waiting forever) but its answer is not used.
+ */
+export function forgetCutModel(): void {
+  for (const pending of waiting.values()) pending.reject(new CutSuperseded());
+  waiting.clear();
+  if (running) {
+    const given = running;
+    given.reject(new CutSuperseded());
+    given.resolve = () => {};
+    given.reject = () => {};
+  }
+  sentModel = null;
+  worker?.postMessage({ type: "forget" } satisfies CutRequest);
 }

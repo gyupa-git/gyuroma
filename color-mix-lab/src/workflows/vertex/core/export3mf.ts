@@ -134,6 +134,8 @@ export interface Export3mfOptions {
    * between pieces.
    */
   onProgress?: (fraction: number) => void | Promise<void>;
+  /** Deflate level for the 3MF (6 by default; 1 compresses faster, the file ~8% bigger). */
+  compressionLevel?: 1 | 6;
 }
 
 export interface ExportVirtualDefinition {
@@ -164,8 +166,13 @@ export interface ExportValidationInput {
   layerMixing?: boolean;
 }
 
+/**
+ * Text for the XML, composed (NFC) first: a Korean name from a Mac file comes decomposed into its letters, and Bambu
+ * Studio showed each of them as "?" ("무대 커튼" → "???? ?????", 11-10).
+ */
 function xmlEscape(value: string): string {
   return value
+    .normalize("NFC")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -1549,7 +1556,7 @@ export async function buildPrusa3mfBlob(
   // millions of faces is never held as one string (the browser caps a string at
   // some hundred million characters) nor as one buffer.
   const progress = new WriteProgress(options.model.vertices.length + options.model.triangles.length, options.onProgress);
-  const zip = new ZipOut("model/3mf");
+  const zip = new ZipOut("model/3mf", options.compressionLevel ?? 6);
 
   if (bambuProject && options.bambuPrinter) {
     const physicalColours = physicalSlotColours(options.physicalSlots);

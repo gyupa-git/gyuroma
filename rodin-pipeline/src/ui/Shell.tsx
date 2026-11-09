@@ -26,6 +26,8 @@ const ICONS = {
   // Tip, tube, collar and bulb on one centre line, turned 45° — the same drawing as the eyedropper cursor.
   eyedropper: <g transform="translate(3.333 13.333) rotate(-45)"><path d="M0 0 1.8-1.1H9V1.1H1.8z" /><path d="M9-1.9h.8v3.8H9z" fill="currentColor" /><path d="M9.8-1.5h1.8a1.5 1.5 0 0 1 0 3H9.8z" fill="currentColor" /></g>,
   map: <><path d="M1.5 3.5 5.5 2l5 1.5 4-1.5v10.5l-4 1.5-5-1.5-4 1.5z" /><path d="M5.5 2v10.5M10.5 3.5V14" /></>,
+  /* the guide line tool: a dashed line along a surface, with the pencil tip that drew it */
+  guide: <><path d="M1.8 13.6c2.2-.2 3.6-1.6 4.6-3.4" strokeDasharray="1.6 1.7" /><path d="m7.3 9.2 5.2-5.2a1.3 1.3 0 0 1 1.8 1.8L9.1 11l-2.4.6z" /></>,
   fit: <path d="M2 5.5V2h3.5M10.5 2H14v3.5M14 10.5V14h-3.5M5.5 14H2v-3.5" />,
   lock: <><rect x="3" y="7" width="10" height="7" rx="1.5" /><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" /></>,
   pin: <><path d="M6 2.5h4l-.5 4 2 2v1h-7v-1l2-2z" /><path d="M8 9.5v4" /></>,

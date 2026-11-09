@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deserialiseRecord, packRuns, serialiseJson, serialiseRecord, type StoredWorkColours, type StoredWorkCuts, type StoredWorkFile } from "./storage";
+import { deserialiseRecord, JSON_KEYS, packRuns, serialiseJson, serialiseRecord, type StoredWorkColours, type StoredWorkCuts, type StoredWorkFile } from "./storage";
 import { packWorkFile, readWorkFile, WorkFileError, workFileName } from "./workFile";
 
 const obj = new TextEncoder().encode("# Exported from Nomad Sculpt\nv 0 0 0 1 0 0\nv 1 0 0 0 1 0\nv 0 1 0 0 0 1\nf 1 2 3\n".repeat(200));
@@ -31,6 +31,12 @@ describe("plain records", () => {
     // Anything else still is not JSON (a big record that fails its check must not become one).
     expect(serialiseRecord({ faceCount: 3, colours: [1, 2, 3] })).toBeNull();
   });
+
+  it("keeps the guide lines through the server's file too (else a reload would lose them, as it did the part maps)", () => {
+    expect(JSON_KEYS.has("guide-lines")).toBe(true);
+    const guides = { "Tkc_p.obj": { faceCount: 4619786, strokes: [[{ faces: [10, 11], bary: [0.2, 0.3, 0.5, 0.5] }]] } };
+    expect(deserialiseRecord(serialiseJson(guides).slice().buffer)).toEqual(guides);
+  });
 });
 
 describe("work file", () => {
@@ -40,6 +46,14 @@ describe("work file", () => {
     expect(back.ai).toEqual(ai);
     const before = await readWorkFile(await packWorkFile({ file, colours: null, cuts: null, settings, app: "GYUROMA test", savedAt: 1 }));
     expect(before.ai).toBeNull();
+  });
+
+  it("carries the guide lines with the work (11-05), and a file without them has none", async () => {
+    const guides = { faceCount: 3, strokes: [[{ faces: [0, 1, 2], bary: [0.2, 0.3, 1, 0, 0.5, 0.5] }]] };
+    const back = await readWorkFile(await packWorkFile({ file, colours: null, cuts: null, settings, guides, app: "GYUROMA test", savedAt: 1 }));
+    expect(back.guides).toEqual(guides);
+    const before = await readWorkFile(await packWorkFile({ file, colours: null, cuts: null, settings, app: "GYUROMA test", savedAt: 1 }));
+    expect(before.guides).toBeNull();
   });
 
   it("brings back the model file, the colours, the cuts and the settings exactly", async () => {

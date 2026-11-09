@@ -162,8 +162,8 @@ export const GUIDE: GuideChapter[] = [
       {
         step: 4,
         at: [".sidebar-foot .btn.primary", ".sidebar-foot", ".sidebar"],
-        ko: "검사를 다 통과하면 이 버튼으로 내보냅니다. 파일은 브라우저 **다운로드 폴더**에 저장돼요.",
-        en: "When every check passes, export with this button. The file lands in your browser's **downloads folder**.",
+        ko: "검사를 다 통과하면 이 버튼으로 내보냅니다. 누르면 **어느 프린터용인지** 한 번 물어봐요 — 맞으면 그대로, 아니면 그 자리에서 바꿔요. 파일은 브라우저 **다운로드 폴더**에 저장돼요.",
+        en: "When every check passes, export with this button. It asks once **which printer** the file is for: go on, or change it right there. The file lands in your browser's **downloads folder**.",
       },
       {
         at: GUIDE_BUTTON,

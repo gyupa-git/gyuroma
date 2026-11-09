@@ -30,6 +30,14 @@ export interface FaceAtlas {
   extent: [number, number];
   /** Scratch marks for circle queries. */
   marks: Uint8Array;
+  /** A patch laid flat on its own (buildPatchAtlas): the map is the surface itself, nothing off it is painted from it. */
+  unfolded?: boolean;
+  /** Faces round the pick left off the map because they came out over it or over nearer ones (layOutCharts). */
+  dropped?: number;
+  /** The model's face neighbours, for a patch laid flat: the brush keeps to the surface joined to its middle. */
+  adjacency?: FaceAdjacency;
+  /** Faces on the map too small to own a pixel, by the grid cell of their centre (facesUnderFlatBrush, built once). */
+  pixelless?: { cell: number; cols: number; start: Int32Array; faces: Int32Array };
 }
 
 /** Per-chart projection basis: charts are projected onto the plane facing their average normal, kept upright. */
@@ -226,31 +234,42 @@ export function buildFaceAtlas(
 
 /**
  * A patch unfolded on its own (unfold.ts) as a colour map: its pieces are the charts, the rest of the model is
- * off the map (11-05, the owner: "이 한 조각을 눌렀을 때 그 한 조각이 그대로 펼쳐진 느낌으로").
+ * off the map (11-05, the owner: "이 한 조각을 눌렀을 때 그 한 조각이 그대로 펼쳐진 느낌으로").  The first `core`
+ * of `faces` are the pick; the rest, when there are more, are the faces round it nearest first (surround.ts).
  */
-export function buildPatchAtlas(model: MeshModel, geometry: FaceGeometry, faces: Int32Array, unfolded: { uv: Float32Array; piece: Int32Array; pieces: number }, size: number): FaceAtlas {
+export function buildPatchAtlas(model: MeshModel, geometry: FaceGeometry, adjacency: FaceAdjacency, faces: Int32Array, unfolded: { uv: Float32Array; piece: Int32Array; pieces: number }, size: number, core = faces.length): FaceAtlas {
   const n = model.triangles.length;
-  const { pieces } = unfolded;
+  // The layout's islands (unfold.ts islandsOf): faces round the pick left off it are −1.
+  const { piece: island, pieces: islands } = unfolded;
   const chartOf = new Int32Array(n).fill(-1);
   const uv = new Float32Array(n * 6);
-  const chartDir = new Float32Array(pieces * 3);
-  const centreZ = new Float64Array(pieces);
-  const weight = new Float64Array(pieces);
+  const chartDir = new Float32Array(islands * 3);
+  const centreZ = new Float64Array(islands);
+  const weight = new Float64Array(islands);
+  const shown: number[] = [];
+  let pickShown = 0;
   for (let i = 0; i < faces.length; i++) {
+    const c = island[i];
+    if (c < 0) continue;
     const f = faces[i];
-    const c = unfolded.piece[i];
+    shown.push(f);
+    if (i < core) pickShown++;
     chartOf[f] = c;
     uv.set(unfolded.uv.subarray(i * 6, i * 6 + 6), f * 6);
     for (let d = 0; d < 3; d++) chartDir[c * 3 + d] += geometry.normals[f * 3 + d];
     centreZ[c] += geometry.centroids[f * 3 + 2];
     weight[c]++;
   }
-  for (let c = 0; c < pieces; c++) {
+  for (let c = 0; c < islands; c++) {
     const len = Math.hypot(chartDir[c * 3], chartDir[c * 3 + 1], chartDir[c * 3 + 2]) || 1;
     for (let d = 0; d < 3; d++) chartDir[c * 3 + d] /= len;
     centreZ[c] /= weight[c] || 1;
   }
-  return layOutCharts(n, uv, chartOf, pieces, chartDir, centreZ, size, faces, true);
+  const atlas = layOutCharts(n, uv, chartOf, islands, chartDir, centreZ, size, Int32Array.from(shown), true, pickShown);
+  atlas.unfolded = true;
+  atlas.adjacency = adjacency;
+  atlas.dropped = (atlas.dropped ?? 0) + faces.length - shown.length;
+  return atlas;
 }
 
 /**
@@ -269,6 +288,8 @@ export function layOutCharts(
   members: Int32Array | null,
   /** Biggest first, in one band (a patch's pieces: the one clicked is the big one, its crumbs go to the side). */
   bySize = false,
+  /** How many of `members` are the pick, the rest the faces round it nearest first (step 6). */
+  core = members ? members.length : n,
 ): FaceAtlas {
   const count = members ? members.length : n;
   const faceAt = (i: number) => (members ? members[i] : i);
@@ -290,7 +311,9 @@ export function layOutCharts(
   }
   // 5. Scale + shelf packing. Charts are laid out top-to-bottom following the model (bands by
   //    chart height in the model); inside a band, taller charts first. Retry smaller until it fits.
-  const pad = 1;
+  // A patch's islands with room between them, so pieces apart on the model show apart (11-05); the whole-model map
+  // packs tight.
+  const pad = bySize ? Math.max(2, Math.round(size / 160)) : 1;
   let area = 0;
   for (let c = 0; c < chartCount; c++) area += Math.max(1e-9, (maxU[c] - minU[c]) * (maxV[c] - minV[c]));
   let scale = Math.sqrt((0.55 * size * size) / Math.max(area, 1e-9));
@@ -368,7 +391,14 @@ export function layOutCharts(
     }
   }
 
-  // 6. Rasterise face ids.
+  // 6. Rasterise face ids.  With faces round the pick (members past `core`, nearest first) the map stays one flat
+  //    sheet: the pick is drawn whole, then each neighbour only where nothing is yet, and a neighbour more than half
+  //    under what is drawn already is left off the map (chartOf −1).  Flattened with the pick, the band round a hole
+  //    folds into it and over the pick; drawn under it, those faces were painted unseen (11-05, the owner: "색지도가
+  //    입체적으로 겹쳐서 배치되어 있으면 안 되고 평면으로 펼쳐져 있어야 되는 거 아니냐").
+  const layered = members !== null && core < count;
+  const shownChart = layered ? chartOf.slice() : chartOf;
+  let dropped = 0;
   const idMap = new Int32Array(size * size).fill(-1);
   for (let i = 0; i < count; i++) {
     const f = faceAt(i);
@@ -380,10 +410,43 @@ export function layOutCharts(
     const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2)));
     const maxY = Math.min(size - 1, Math.ceil(Math.max(y0, y1, y2)));
     const areaSign = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    const eps = Math.abs(areaSign) * 1e-4;
+    const sign = areaSign > 0 ? 1 : -1;
+    const around = layered && i >= core;
+    if (around) {
+      // How much of it lies under what is drawn, by the pixel centres strictly inside it (faces side by side share
+      // none); one too small to hold a centre, by whether its own centre lies inside the face drawn there.
+      let inside = 0;
+      let under = 0;
+      if (areaSign !== 0) {
+        for (let py = minY; py <= maxY; py++) {
+          const cy = py + 0.5;
+          for (let px = minX; px <= maxX; px++) {
+            const cx = px + 0.5;
+            if (((x1 - cx) * (y2 - cy) - (x2 - cx) * (y1 - cy)) * sign <= eps) continue;
+            if (((x2 - cx) * (y0 - cy) - (x0 - cx) * (y2 - cy)) * sign <= eps) continue;
+            if (((x0 - cx) * (y1 - cy) - (x1 - cx) * (y0 - cy)) * sign <= eps) continue;
+            inside++;
+            if (idMap[py * size + px] >= 0) under++;
+          }
+        }
+      }
+      let covered: boolean;
+      if (inside > 0) covered = under * 2 > inside;
+      else {
+        const cx = (x0 + x1 + x2) / 3;
+        const cy = (y0 + y1 + y2) / 3;
+        const g = idMap[Math.min(size - 1, Math.max(0, Math.floor(cy))) * size + Math.min(size - 1, Math.max(0, Math.floor(cx)))];
+        covered = g >= 0 && insideFaceUv(faceUv, g, cx, cy);
+      }
+      if (covered) {
+        shownChart[f] = -1;
+        dropped++;
+        continue;
+      }
+    }
     let written = false;
     if (areaSign !== 0) {
-      const eps = Math.abs(areaSign) * 1e-4;
-      const sign = areaSign > 0 ? 1 : -1;
       for (let py = minY; py <= maxY; py++) {
         const cy = py + 0.5;
         for (let px = minX; px <= maxX; px++) {
@@ -394,7 +457,9 @@ export function layOutCharts(
           if (w1 < -eps) continue;
           const w2 = ((x0 - cx) * (y1 - cy) - (x1 - cx) * (y0 - cy)) * sign;
           if (w2 < -eps) continue;
-          idMap[py * size + px] = f;
+          const at = py * size + px;
+          if (around && idMap[at] >= 0) continue;
+          idMap[at] = f;
           written = true;
         }
       }
@@ -403,7 +468,7 @@ export function layOutCharts(
       // Sub-pixel face: claim the pixel under its centroid so it stays reachable.
       const cx = Math.min(size - 1, Math.max(0, Math.floor((x0 + x1 + x2) / 3)));
       const cy = Math.min(size - 1, Math.max(0, Math.floor((y0 + y1 + y2) / 3)));
-      idMap[cy * size + cx] = f;
+      if (!around || idMap[cy * size + cx] < 0) idMap[cy * size + cx] = f;
     }
   }
 
@@ -434,12 +499,24 @@ export function layOutCharts(
     faceUv,
     scale,
     chartCount,
-    chartOf,
+    chartOf: shownChart,
     chartDir,
     filledRatio: pixelOffsets[n] / (size * size),
     extent: [extentX, extentY],
     marks: new Uint8Array(n),
+    dropped,
   };
+}
+
+/** Whether an atlas point lies strictly inside a face's triangle on the map. */
+function insideFaceUv(faceUv: Float32Array, face: number, x: number, y: number): boolean {
+  const o = face * 6;
+  const x0 = faceUv[o], y0 = faceUv[o + 1], x1 = faceUv[o + 2], y1 = faceUv[o + 3], x2 = faceUv[o + 4], y2 = faceUv[o + 5];
+  const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+  if (area === 0) return false;
+  const w0 = ((x1 - x) * (y2 - y) - (x2 - x) * (y1 - y)) / area;
+  const w1 = ((x2 - x) * (y0 - y) - (x0 - x) * (y2 - y)) / area;
+  return w0 > 1e-4 && w1 > 1e-4 && 1 - w0 - w1 > 1e-4;
 }
 
 /** Writes face colours into an RGBA buffer (all faces, or only `faces`). Returns the dirty rectangle. */
@@ -620,6 +697,261 @@ export function paintAtlasOutline(atlas: FaceAtlas, masks: AtlasMasks, data: Uin
   return true;
 }
 
+/** What the highlight overlay and outline were last painted for (repaintAtlasMasks keeps it). */
+export interface AtlasMaskPaint {
+  atlas: FaceAtlas;
+  /** Outline width the outline was drawn at. */
+  width: number;
+  /** Each face's class: 3 picked, 2 selected, 1 hover, 0 none (picked wins over selected over hover). */
+  faceClass: Uint8Array;
+  /** Each pixel's class (its face's), the outline's input. */
+  cls: Uint8Array;
+  /** Pixels with a class: something is drawn while there are any. */
+  classed: number;
+  /** The masks it was painted for: the very same arrays again mean nothing changed. */
+  masks: AtlasMasks;
+}
+
+/** A pixel rectangle (inclusive x0..x1, y0..y1). */
+export interface PixelRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+const OVERLAY_RGBA: Record<number, [number, number, number, number]> = {
+  3: [255, 255, 255, 120],
+  2: [255, 255, 255, 90],
+  1: [154, 160, 255, 130],
+};
+
+/** Each face's class under the masks (plain scans: this runs over millions of faces after every stroke). */
+function faceClassesOf(n: number, masks: AtlasMasks): Uint8Array {
+  const out = new Uint8Array(n);
+  const { hover, selected, picked } = masks;
+  if (hover) for (let f = 0; f < n; f++) if (hover[f]) out[f] = 1;
+  if (selected) for (let f = 0; f < n; f++) if (selected[f]) out[f] = 2;
+  if (picked) for (let f = 0; f < n; f++) if (picked[f]) out[f] = 3;
+  return out;
+}
+
+/**
+ * The highlight overlay and its outline painted for new masks — only around the faces whose class changed, when it
+ * can: a stroke inside a picked patch changes a few thousand faces, and painting all 9.4M pixels of a 3072 map and
+ * sending both 37.7MB images took ~150 ms and more on 4.6M faces (11-09). The result is byte for byte what
+ * paintAtlasOverlay + paintAtlasOutline give (atlas.test: random masks against them).
+ *
+ * `rect`: the pixels to send again — one box or several (the dirty tiles' runs), "full" = all of them, null = nothing.
+ */
+export function repaintAtlasMasks(
+  last: AtlasMaskPaint | null,
+  atlas: FaceAtlas,
+  masks: AtlasMasks,
+  overlay: Uint8ClampedArray,
+  outline: Uint8ClampedArray,
+  width: number,
+): { paint: AtlasMaskPaint; rect: PixelRect | PixelRect[] | "full" | null; any: boolean } {
+  const { idMap, size, pixelOffsets, pixelIndices } = atlas;
+  const n = pixelOffsets.length - 1;
+  const w = Math.max(1, Math.min(32, Math.round(width)));
+  // The same mask arrays as last time: nothing to paint.
+  if (last && last.atlas === atlas && last.width === w && last.masks.hover === masks.hover && last.masks.selected === masks.selected && last.masks.picked === masks.picked)
+    return { paint: last, rect: null, any: last.classed > 0 };
+  const faceClass = faceClassesOf(n, masks);
+
+  // All of it, in one pass over the pixels for the classes and the overlay, then the outline from those classes —
+  // what paintAtlasOverlay and paintAtlasOutline write (each made its own pass over the pixels).
+  const full = (): { paint: AtlasMaskPaint; rect: "full"; any: boolean } => {
+    const cls = new Uint8Array(idMap.length);
+    let classed = 0;
+    for (let i = 0; i < idMap.length; i++) {
+      const f = idMap[i];
+      const c = f >= 0 ? faceClass[f] : 0;
+      const rgba = OVERLAY_RGBA[c];
+      if (rgba) {
+        cls[i] = c;
+        classed++;
+        overlay[i * 4] = rgba[0];
+        overlay[i * 4 + 1] = rgba[1];
+        overlay[i * 4 + 2] = rgba[2];
+        overlay[i * 4 + 3] = rgba[3];
+      } else overlay[i * 4 + 3] = 0;
+    }
+    outline.fill(0);
+    if (classed > 0) {
+      const rows = new Uint8Array(idMap.length);
+      const grown = new Uint8Array(idMap.length);
+      spreadClass(cls, rows, size, w, true);
+      spreadClass(rows, grown, size, w, false);
+      for (let i = 0; i < idMap.length; i++) {
+        if (cls[i]) continue;
+        const g = grown[i];
+        if (!g) continue;
+        const rgb = OUTLINE_RGB[g];
+        outline[i * 4] = rgb[0];
+        outline[i * 4 + 1] = rgb[1];
+        outline[i * 4 + 2] = rgb[2];
+        outline[i * 4 + 3] = 255;
+      }
+    }
+    return { paint: { atlas, width: w, faceClass, cls, classed, masks }, rect: "full", any: classed > 0 };
+  };
+  if (!last || last.atlas !== atlas || last.width !== w || last.faceClass.length !== n) return full();
+
+  // The faces whose class changed, and how many pixels they hold.
+  const changed: number[] = [];
+  let changedPixels = 0;
+  for (let f = 0; f < n; f++) {
+    if (faceClass[f] === last.faceClass[f]) continue;
+    changed.push(f);
+    changedPixels += pixelOffsets[f + 1] - pixelOffsets[f];
+  }
+  if (changed.length === 0) return { paint: { ...last, faceClass, masks }, rect: null, any: last.classed > 0 };
+  // Most of the map anyway (a whole colour hovered): all of it, in one go.
+  if (changedPixels > idMap.length / 4) return full();
+
+  const { cls } = last;
+  let classed = last.classed;
+  // The map in tiles: only the tiles holding a changed pixel are painted again (a pick's pixels lie scattered over
+  // the charts — one rectangle round them all was most of the map).
+  const tiles = Math.ceil(size / MASK_TILE);
+  const dirty = new Uint8Array(tiles * tiles);
+  let dirtyCount = 0;
+  for (const f of changed) {
+    const c = faceClass[f];
+    const rgba = OVERLAY_RGBA[c];
+    for (let p = pixelOffsets[f]; p < pixelOffsets[f + 1]; p++) {
+      const i = pixelIndices[p];
+      if (cls[i] && !c) classed--;
+      else if (!cls[i] && c) classed++;
+      cls[i] = c;
+      if (rgba) {
+        overlay[i * 4] = rgba[0];
+        overlay[i * 4 + 1] = rgba[1];
+        overlay[i * 4 + 2] = rgba[2];
+        overlay[i * 4 + 3] = rgba[3];
+      } else overlay[i * 4 + 3] = 0;
+      const x = i % size;
+      const t = ((((i - x) / size) / MASK_TILE) | 0) * tiles + ((x / MASK_TILE) | 0);
+      if (!dirty[t]) {
+        dirty[t] = 1;
+        dirtyCount++;
+      }
+    }
+  }
+  const paint: AtlasMaskPaint = { atlas, width: w, faceClass, cls, classed, masks };
+  // The changed faces held no pixels (off the map): only their class was kept.
+  if (dirtyCount === 0) return { paint, rect: null, any: classed > 0 };
+  if (classed === 0) {
+    // Nothing highlighted any more: as paintAtlasOutline leaves it, all clear.
+    outline.fill(0);
+    return { paint, rect: "full", any: false };
+  }
+  // Runs of dirty tiles along each tile row, each painted as a region (its outline needs w pixels round it).
+  const regions: PixelRect[] = [];
+  for (let ty = 0; ty < tiles; ty++) {
+    for (let tx = 0; tx < tiles; tx++) {
+      if (!dirty[ty * tiles + tx]) continue;
+      let end = tx;
+      while (end + 1 < tiles && dirty[ty * tiles + end + 1]) end++;
+      const x0 = tx * MASK_TILE;
+      const y0 = ty * MASK_TILE;
+      const x1 = Math.min(size - 1, (end + 1) * MASK_TILE - 1);
+      const y1 = Math.min(size - 1, (ty + 1) * MASK_TILE - 1);
+      regions.push(paintOutlineAround(cls, outline, size, w, x0, y0, x1, y1));
+      tx = end;
+    }
+  }
+  return { paint, rect: regions.length === 1 ? regions[0] : regions, any: true };
+}
+
+/** Tile side for repaintAtlasMasks (pixels). */
+const MASK_TILE = 128;
+
+/**
+ * The outline for the pixels within w of the box x0..x1 × y0..y1, worked out from the classes the way
+ * paintAtlasOutline does for the whole map (a row spread of w, then a column spread of w; a pixel there reads the
+ * classes within w along each), written into `outline`. Returns the box painted.
+ */
+function paintOutlineAround(cls: Uint8Array, outline: Uint8ClampedArray, size: number, w: number, x0: number, y0: number, x1: number, y1: number): PixelRect {
+  const ox0 = Math.max(0, x0 - w);
+  const ox1 = Math.min(size - 1, x1 + w);
+  const oy0 = Math.max(0, y0 - w);
+  const oy1 = Math.min(size - 1, y1 + w);
+  const ry0 = Math.max(0, oy0 - w);
+  const ry1 = Math.min(size - 1, oy1 + w);
+  const cx0 = Math.max(0, ox0 - w);
+  const cx1 = Math.min(size - 1, ox1 + w);
+  const ow = ox1 - ox0 + 1;
+  // Row spread over [cx0, cx1] for the rows ry0..ry1, kept for x in [ox0, ox1] — as spreadClass does a whole row.
+  const rows = new Uint8Array(ow * (ry1 - ry0 + 1));
+  for (let y = ry0; y <= ry1; y++) {
+    const line = y * size;
+    const out = (y - ry0) * ow;
+    let last = 0;
+    let lastAt = -1e9;
+    for (let x = cx0; x <= cx1; x++) {
+      const c = cls[line + x];
+      if (c) {
+        last = c;
+        lastAt = x;
+      }
+      if (x >= ox0 && x <= ox1) rows[out + x - ox0] = c ? c : x - lastAt <= w ? last : 0;
+    }
+    last = 0;
+    lastAt = 1e9;
+    for (let x = cx1; x >= cx0; x--) {
+      const c = cls[line + x];
+      if (c) {
+        last = c;
+        lastAt = x;
+      } else if (x >= ox0 && x <= ox1 && rows[out + x - ox0] === 0 && lastAt - x <= w) rows[out + x - ox0] = last;
+    }
+  }
+  // Column spread of those rows for oy0..oy1, and the outline written there.
+  const grown = new Uint8Array(oy1 - oy0 + 1);
+  for (let x = ox0; x <= ox1; x++) {
+    const col = x - ox0;
+    let last = 0;
+    let lastAt = -1e9;
+    for (let y = ry0; y <= ry1; y++) {
+      const c = rows[(y - ry0) * ow + col];
+      if (c) {
+        last = c;
+        lastAt = y;
+      }
+      if (y >= oy0 && y <= oy1) grown[y - oy0] = c ? c : y - lastAt <= w ? last : 0;
+    }
+    last = 0;
+    lastAt = 1e9;
+    for (let y = ry1; y >= ry0; y--) {
+      const c = rows[(y - ry0) * ow + col];
+      if (c) {
+        last = c;
+        lastAt = y;
+      } else if (y >= oy0 && y <= oy1 && grown[y - oy0] === 0 && lastAt - y <= w) grown[y - oy0] = last;
+    }
+    for (let y = oy0; y <= oy1; y++) {
+      const i = y * size + x;
+      const g = grown[y - oy0];
+      if (cls[i] || !g) {
+        outline[i * 4] = 0;
+        outline[i * 4 + 1] = 0;
+        outline[i * 4 + 2] = 0;
+        outline[i * 4 + 3] = 0;
+      } else {
+        const rgb = OUTLINE_RGB[g];
+        outline[i * 4] = rgb[0];
+        outline[i * 4 + 1] = rgb[1];
+        outline[i * 4 + 2] = rgb[2];
+        outline[i * 4 + 3] = 255;
+      }
+    }
+  }
+  return { x: ox0, y: oy0, w: ox1 - ox0 + 1, h: oy1 - oy0 + 1 };
+}
+
 /** Faces under a circle (atlas pixels). */
 export function facesInAtlasCircle(atlas: FaceAtlas, cx: number, cy: number, radius: number): Int32Array {
   const { idMap, size, marks } = atlas;
@@ -674,8 +1006,13 @@ export function faceAtlasPoint(atlas: FaceAtlas, face: number, bary: [number, nu
  * of pixels alone leaves them out — an area painted on the map then shows in 3D as
  * stipple.  The ball takes them in, as the 3D brush does; faces turned away from the
  * chart's direction are left out, as the 3D brush leaves out faces turned from the camera.
+ *
+ * A patch unfolded on its own is the surface laid flat, each face its own size: there the
+ * circle is all that is painted (facesUnderFlatBrush).  The ball would reach what is not on
+ * that map — the arm behind a ribbon, through its hole (11-05, the owner: "포탈도 아니고").
  */
-export function facesUnderMapBrush(atlas: FaceAtlas, model: MeshModel, geometry: FaceGeometry, cx: number, cy: number, radius: number): Int32Array {
+export function facesUnderMapBrush(atlas: FaceAtlas, model: MeshModel, geometry: FaceGeometry, cx: number, cy: number, radius: number, island?: number): Int32Array {
+  if (atlas.unfolded) return facesUnderFlatBrush(atlas, cx, cy, radius * atlas.scale, island);
   const flat = facesInAtlasCircle(atlas, cx, cy, radius * atlas.scale);
   const centre = faceAtAtlasPixel(atlas, cx, cy);
   if (centre < 0) return flat;
@@ -697,6 +1034,143 @@ export function facesUnderMapBrush(atlas: FaceAtlas, model: MeshModel, geometry:
   }
   for (const f of out) marks[f] = 0;
   return Int32Array.from(out);
+}
+
+/**
+ * The brush on a map that is the surface laid flat (`radius` in atlas pixels): the faces whose pixels lie under
+ * the circle, and the faces on the map too small to own a pixel whose centre does — so a painted area has no
+ * stipple, and nothing off the map is reached.
+ */
+function facesUnderFlatBrush(atlas: FaceAtlas, cx: number, cy: number, radius: number, lock?: number): Int32Array {
+  const { marks, faceUv, chartOf } = atlas;
+  // One island only: the stroke's (lock), else the one under the brush.  Islands lie side by side on the map but
+  // apart on the model, and a brush at an island's edge reached into the next one.
+  const shown = facesInAtlasCircle(atlas, cx, cy, radius);
+  const under = faceAtAtlasPixel(atlas, cx, cy);
+  const island = lock !== undefined && lock >= 0 ? lock : mapIslandAt(atlas, cx, cy, radius, shown);
+  const out: number[] = [];
+  for (const f of shown) {
+    if (chartOf[f] !== island) continue;
+    marks[f] = 1;
+    out.push(f);
+  }
+  const grid = pixellessGrid(atlas);
+  const r = Math.max(0.5, radius);
+  const r2 = r * r;
+  const lastCell = grid.cols - 1;
+  const c0 = Math.max(0, Math.floor((cx - r) / grid.cell));
+  const c1 = Math.min(lastCell, Math.floor((cx + r) / grid.cell));
+  const r0 = Math.max(0, Math.floor((cy - r) / grid.cell));
+  const r1 = Math.min(lastCell, Math.floor((cy + r) / grid.cell));
+  for (let row = r0; row <= r1; row++) {
+    for (let col = c0; col <= c1; col++) {
+      const cellIndex = row * grid.cols + col;
+      for (let k = grid.start[cellIndex]; k < grid.start[cellIndex + 1]; k++) {
+        const f = grid.faces[k];
+        if (marks[f] || chartOf[f] !== island) continue;
+        const o = f * 6;
+        const dx = (faceUv[o] + faceUv[o + 2] + faceUv[o + 4]) / 3 - cx;
+        const dy = (faceUv[o + 1] + faceUv[o + 3] + faceUv[o + 5]) / 3 - cy;
+        if (dx * dx + dy * dy > r2) continue;
+        marks[f] = 1;
+        out.push(f);
+      }
+    }
+  }
+  const joined = joinedToMiddle(atlas, out, under >= 0 && marks[under] ? under : nearestTo(atlas, out, cx, cy));
+  for (const f of out) marks[f] = 0;
+  return joined;
+}
+
+/**
+ * The island a brush at (cx, cy) is on: the one under it, else the one nearest it within its circle (−1 for none).
+ * A stroke keeps to the island it starts on (App paintAtMap) — the owner chose "따로 떼어 놓기" for what lies under
+ * something, and a stroke across the gap would carry on over there.
+ */
+export function mapIslandAt(atlas: FaceAtlas, cx: number, cy: number, radius: number, shown?: ArrayLike<number>): number {
+  const under = faceAtAtlasPixel(atlas, cx, cy);
+  if (under >= 0) return atlas.chartOf[under];
+  const near = nearestTo(atlas, Array.from(shown ?? facesInAtlasCircle(atlas, cx, cy, radius)), cx, cy);
+  return near >= 0 ? atlas.chartOf[near] : -1;
+}
+
+/** The face of `faces` whose centre on the map is nearest (cx, cy), or −1. */
+function nearestTo(atlas: FaceAtlas, faces: number[], cx: number, cy: number): number {
+  let best = Infinity;
+  let at = -1;
+  for (const f of faces) {
+    const [x, y] = faceAtlasCentre(atlas, f);
+    const d = (x - cx) ** 2 + (y - cy) ** 2;
+    if (d < best) {
+      best = d;
+      at = f;
+    }
+  }
+  return at;
+}
+
+/**
+ * The faces under the brush (marked 1 in `atlas.marks`) that the surface joins to the one in its middle without
+ * leaving the brush.  An island laid flat can come round and lie against itself where it was not cut (a loop of a
+ * bow unrolled, its two ends side by side): there the map shows two places of the model as neighbours, and a brush
+ * across that seam painted both (Tkc's ribbon, 11-05: some dabs reached fifteen brush widths away).
+ */
+function joinedToMiddle(atlas: FaceAtlas, faces: number[], middle: number): Int32Array {
+  const { marks, adjacency } = atlas;
+  if (!adjacency || middle < 0) return Int32Array.from(faces);
+  const { offsets, neighbours } = adjacency;
+  const out: number[] = [middle];
+  marks[middle] = 2;
+  for (let head = 0; head < out.length; head++) {
+    const f = out[head];
+    for (let k = offsets[f]; k < offsets[f + 1]; k++) {
+      const g = neighbours[k];
+      if (marks[g] !== 1) continue;
+      marks[g] = 2;
+      out.push(g);
+    }
+  }
+  return Int32Array.from(out);
+}
+
+/**
+ * The faces on the map too small to own a pixel, filed by the grid cell their centre falls in (built once per atlas).
+ * A face that owns no pixel because another lies over it is not one: a layout folds over itself (a bow's front over
+ * its back, a loop over the knot), and the brush took the faces under the fold by their centres — a stroke on the
+ * front of Tkc's ribbon painted its back and the arm four and more brush widths away (11-05).
+ */
+function pixellessGrid(atlas: FaceAtlas): NonNullable<FaceAtlas["pixelless"]> {
+  if (atlas.pixelless) return atlas.pixelless;
+  const { size, chartOf, pixelOffsets, faceUv, idMap } = atlas;
+  // Hidden: its centre lies inside the face drawn there (over it); a face beside it may hold that pixel too.
+  const tiny = (f: number): boolean => {
+    const o = f * 6;
+    const cx = (faceUv[o] + faceUv[o + 2] + faceUv[o + 4]) / 3;
+    const cy = (faceUv[o + 1] + faceUv[o + 3] + faceUv[o + 5]) / 3;
+    const g = idMap[Math.min(size - 1, Math.max(0, Math.floor(cy))) * size + Math.min(size - 1, Math.max(0, Math.floor(cx)))];
+    return !(g >= 0 && g !== f && insideFaceUv(faceUv, g, cx, cy));
+  };
+  const cell = 16;
+  const cols = Math.ceil(size / cell);
+  const cellOf = (f: number): number => {
+    const o = f * 6;
+    const x = Math.min(size - 1, Math.max(0, (faceUv[o] + faceUv[o + 2] + faceUv[o + 4]) / 3));
+    const y = Math.min(size - 1, Math.max(0, (faceUv[o + 1] + faceUv[o + 3] + faceUv[o + 5]) / 3));
+    return Math.floor(y / cell) * cols + Math.floor(x / cell);
+  };
+  const start = new Int32Array(cols * cols + 1);
+  const list: number[] = [];
+  for (let f = 0; f < chartOf.length; f++) {
+    if (chartOf[f] < 0 || pixelOffsets[f + 1] !== pixelOffsets[f] || !tiny(f)) continue;
+    list.push(f);
+    start[cellOf(f) + 1]++;
+  }
+  for (let c = 0; c < cols * cols; c++) start[c + 1] += start[c];
+  const fill = start.slice(0, cols * cols);
+  const faces = new Int32Array(list.length);
+  for (const f of list) faces[fill[cellOf(f)]++] = f;
+  atlas.pixelless = { cell, cols, start, faces };
+  return atlas.pixelless;
 }
 
 /**

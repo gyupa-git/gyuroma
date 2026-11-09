@@ -18,6 +18,10 @@ let model: { id: number; positions: Float64Array; corners: Int32Array; adjacency
 
 self.onmessage = (event: MessageEvent<CutRequest>) => {
   const request = event.data;
+  if (request.type === "forget") {
+    model = null;
+    return;
+  }
   if (request.type === "model") {
     const { positions, corners } = request;
     model = null; // the old one goes before the new one is built

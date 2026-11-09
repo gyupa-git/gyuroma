@@ -12,7 +12,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function mergeSettings(stored: unknown): PipelineSettings {
   if (!isRecord(stored)) return structuredClone(DEFAULT_SETTINGS);
   const out = structuredClone(DEFAULT_SETTINGS);
-  for (const section of ["filaments", "palette", "merge", "mix", "export"] as const) {
+  for (const section of ["filaments", "palette", "merge", "mix", "export", "performance"] as const) {
     const value = stored[section];
     if (isRecord(value)) Object.assign(out[section] as unknown as Record<string, unknown>, value);
   }
@@ -179,6 +179,22 @@ export interface StoredWorkFile {
   savedAt: number;
 }
 
+/**
+ * Which model file a colours or cuts record was made on (11-10): its name and byte size.  A face count alone let
+ * a second window's model take the first's colours when both had as many faces; a record made on another file is
+ * now left unused.  Absent on records saved before (those still go by the face count).
+ */
+export interface WorkIdentity {
+  name: string;
+  size: number;
+}
+
+/** True when a record made on `made` belongs to the stored file (a record without one — saved before 11-10 — does). */
+export function sameWorkFile(made: WorkIdentity | undefined, file: { name: string; size: number }): boolean {
+  // Composed and decomposed Korean are the same name (a Mac hands out either, 11-10).
+  return !made || (made.name.normalize("NFC") === file.name.normalize("NFC") && made.size === file.size);
+}
+
 export interface StoredWorkColours {
   faceCount: number;
   /** 3 bytes per face, in face order. */
@@ -186,6 +202,8 @@ export interface StoredWorkColours {
   savedAt: number;
   /** How many of the stored cuts (StoredWorkCuts) the mesh these colours belong to was cut with; 0 or absent = the file as it is. */
   cuts?: number;
+  /** The model file these colours were painted on (absent on records saved before 11-10). */
+  file?: WorkIdentity;
 }
 
 /**
@@ -216,6 +234,8 @@ export interface StoredCut {
 export interface StoredWorkCuts {
   /** The work file they were made on. */
   fileName: string;
+  /** Its size in bytes (absent on records saved before 11-10). */
+  fileSize?: number;
   cuts: StoredCut[];
   savedAt: number;
 }
@@ -305,20 +325,52 @@ export async function clearStoredWork(): Promise<void> {
 const MAGIC = "RDN1";
 let serverProbe: Promise<boolean> | null = null;
 
-function dataUrl(key: string): string {
-  return new URL(`__rodin/data/${key}`, document.baseURI).toString();
+function dataUrl(key: string, previous = false): string {
+  return new URL(`__rodin/data/${key}${previous ? "?prev=1" : ""}`, document.baseURI).toString();
 }
 
-/** True when the page is served by the GYUROMA dev/preview server (cached). */
+/**
+ * True when the page comes from this computer or its network (localhost, 127.x, 192.168.x, *.local …): served by
+ * GYUROMA's own server, which keeps the work in the folder.  The public site is served from elsewhere.
+ */
+export function expectsLocalServer(hostname = typeof location === "undefined" ? "" : location.hostname): boolean {
+  const host = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    host === "localhost" ||
+    host === "::1" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    /^127\./.test(host) ||
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+  );
+}
+
+async function pingOnce(): Promise<boolean> {
+  try {
+    const res = await fetch(new URL("__rodin/ping", document.baseURI).toString(), { cache: "no-store" });
+    return res.ok && (await res.text()).trim() === "ok";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True when the page is served by the GYUROMA dev/preview server (worked out once a page).  Served from this
+ * computer, a ping that fails is tried again for a few seconds first (11-10): the launcher restarts an old server,
+ * and one failed ping in that moment used to send the whole session's saves to the browser's store, which the
+ * next start (server up) never reads.
+ */
 export function localServerAvailable(): Promise<boolean> {
   if (!serverProbe) {
     serverProbe = (async () => {
-      try {
-        const res = await fetch(new URL("__rodin/ping", document.baseURI).toString(), { cache: "no-store" });
-        return res.ok && (await res.text()).trim() === "ok";
-      } catch {
-        return false;
+      const tries = expectsLocalServer() ? 6 : 1;
+      for (let i = 0; i < tries; i++) {
+        if (await pingOnce()) return true;
+        if (i + 1 < tries) await new Promise((resolve) => setTimeout(resolve, 1500));
       }
+      return false;
     })();
   }
   return serverProbe;
@@ -340,7 +392,14 @@ function unpackRecord(buffer: ArrayBuffer): { header: Record<string, unknown>; p
   if (new TextDecoder().decode(bytes.subarray(0, 4)) !== MAGIC) return null;
   const headerLength = new DataView(buffer).getUint32(4, true);
   if (8 + headerLength > buffer.byteLength) return null;
-  const header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + headerLength))) as Record<string, unknown>;
+  // A header cut short or garbled is a broken record (null), not an exception that stops a restore (11-10).
+  let header: unknown;
+  try {
+    header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + headerLength)));
+  } catch {
+    return null;
+  }
+  if (!isRecord(header)) return null;
   return { header, payload: bytes.slice(8 + headerLength) };
 }
 
@@ -364,6 +423,7 @@ export function serialiseRecord(value: unknown): Uint8Array | null {
     const header = {
       type: "work-cuts",
       fileName: value.fileName,
+      ...(value.fileSize !== undefined ? { fileSize: value.fileSize } : {}),
       savedAt: value.savedAt,
       cuts: value.cuts.map((cut) => ({
         faces: cut.faces,
@@ -384,7 +444,7 @@ export function serialiseRecord(value: unknown): Uint8Array | null {
     return packRecord({ type: "work-file", name: value.name, kind: value.kind, savedAt: value.savedAt, paletteLength: palette.length }, payload);
   }
   if (isStoredWorkColours(value)) {
-    return packRecord({ type: "work-colours", faceCount: value.faceCount, savedAt: value.savedAt, cuts: value.cuts ?? 0 }, value.colours);
+    return packRecord({ type: "work-colours", faceCount: value.faceCount, savedAt: value.savedAt, cuts: value.cuts ?? 0, ...(value.file ? { file: value.file } : {}) }, value.colours);
   }
   if (isRecord(value) && typeof value.name === "string" && value.buffer instanceof ArrayBuffer) {
     return packRecord({ type: "template", name: value.name }, new Uint8Array(value.buffer));
@@ -397,8 +457,9 @@ export function serialiseRecord(value: unknown): Uint8Array | null {
  * fails its own check can never turn into a JSON of millions of numbers.  These used to go to the browser's
  * store only, never read back while the server is up, so a reload lost them (11-05, the owner:
  * "새로고침하니까 부위 지도가 사라지는데?").
+ * The guide lines (✏️, kept by model name) go the same way (11-05).
  */
-export const JSON_KEYS = new Set(["part-maps", "tidy-chat"]);
+export const JSON_KEYS = new Set(["part-maps", "tidy-chat", "guide-lines"]);
 export function serialiseJson(value: unknown): Uint8Array {
   return packRecord({ type: "json" }, new TextEncoder().encode(JSON.stringify(value)));
 }
@@ -410,12 +471,19 @@ export function deserialiseRecord(buffer: ArrayBuffer): unknown {
   if (header.type === "work-cuts") {
     // payload is a copy of its own (unpackRecord slices it), so its buffer starts at 0: views can be made in place.
     let at = 0;
+    // A block that would run past the end (a file cut short) makes the whole record broken (null), not a RangeError (11-10).
+    let broken = false;
     const take = <T extends ArrayBufferView>(make: (buffer: ArrayBuffer, offset: number, length: number) => T, count: number, size: number): T => {
+      if (!(Number.isInteger(count) && count >= 0 && at + count * size <= payload.byteLength)) {
+        broken = true;
+        return make(new ArrayBuffer(0), 0, 0);
+      }
       const view = make(payload.buffer as ArrayBuffer, payload.byteOffset + at, count);
       at += Math.ceil((count * size) / 8) * 8;
       return view;
     };
     const metas = Array.isArray(header.cuts) ? (header.cuts as Array<Record<string, number>>) : [];
+    if (!metas.every((m) => isRecord(m) && Number.isInteger(m.faces) && Number.isInteger(m.vertices))) return null;
     const cuts: StoredCut[] = metas.map((m) => {
       const addedVertices = take((b, o, n) => new Float64Array(b, o, n), m.added, 8);
       const pieces = take((b, o, n) => new Int32Array(b, o, n), m.pieces * 3, 4);
@@ -425,24 +493,34 @@ export function deserialiseRecord(buffer: ArrayBuffer): unknown {
       const settled = take((b, o, n) => new Uint8Array(b, o, n), Number(m.settled) || 0, 1);
       return { faces: m.faces, vertices: m.vertices, addedVertices, pieces, pieceGroups, pieceFaces, replaced, settled: settled.length > 0 ? settled : undefined };
     });
+    if (broken) return null;
     const out: StoredWorkCuts = { fileName: String(header.fileName), cuts, savedAt: Number(header.savedAt) || 0 };
+    if (typeof header.fileSize === "number") out.fileSize = header.fileSize;
     return out;
   }
   if (header.type === "work-file") {
     const paletteLength = Number(header.paletteLength) || 0;
+    if (!(paletteLength >= 0 && paletteLength <= payload.length)) return null;
     const palette = paletteLength > 0 ? payload.slice(0, paletteLength) : undefined;
-    const body = payload.slice(paletteLength);
+    // The file's bytes straight out of the payload (a view, then one copy of its own) — slicing the payload
+    // and then its buffer copied the file twice more (11-10, Q7).
+    const body = payload.subarray(paletteLength);
     const out: StoredWorkFile = {
       name: String(header.name),
       kind: header.kind === "obj" || header.kind === "nomad" ? header.kind : "rodin",
-      buffer: body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+      buffer: body.byteOffset === 0 && body.byteLength === body.buffer.byteLength ? (body.buffer as ArrayBuffer) : (body.buffer as ArrayBuffer).slice(body.byteOffset, body.byteOffset + body.byteLength),
       palette,
       savedAt: Number(header.savedAt) || 0,
     };
     return out;
   }
   if (header.type === "work-colours") {
-    const out: StoredWorkColours = { faceCount: Number(header.faceCount) || 0, colours: payload, savedAt: Number(header.savedAt) || 0, cuts: Number(header.cuts) || 0 };
+    const faceCount = Number(header.faceCount) || 0;
+    // Colours that do not make their own face count are a broken record (they used to come back and be dropped quietly).
+    if (payload.length !== faceCount * 3) return null;
+    const out: StoredWorkColours = { faceCount, colours: payload, savedAt: Number(header.savedAt) || 0, cuts: Number(header.cuts) || 0 };
+    const file = header.file;
+    if (isRecord(file) && typeof file.name === "string" && typeof file.size === "number") out.file = { name: file.name, size: file.size };
     return out;
   }
   if (header.type === "template") {
@@ -470,23 +548,71 @@ export function deserialiseRecord(buffer: ArrayBuffer): unknown {
 /** Keys that only ever reached the browser's store (see JSON_KEYS): their copy there is moved up once. */
 const BROWSER_ONLY_BEFORE = JSON_KEYS;
 
-export async function dataGet<T>(key: string): Promise<T | null> {
-  if (await localServerAvailable()) {
+/** What a read found (11-10): the record, or why there is none — so a restore can say a broken record from an empty one. */
+export interface DataRead<T> {
+  value: T | null;
+  /** The record is there but cannot be read (cut short, garbled): `value` is the previous copy when that one could be. */
+  broken: boolean;
+  /** `value` is the copy before the last write (the folder keeps one: <key>.prev). */
+  fromPrevious: boolean;
+  /** The folder's server did not answer (nothing read, nothing to conclude). */
+  failed: boolean;
+}
+
+async function fetchRecord(key: string, previous: boolean): Promise<{ status: "missing" | "ok" | "broken"; value: unknown; bytes?: ArrayBuffer }> {
+  let lastError: unknown = null;
+  // One more try after a moment: a server busy writing a big file can drop a read.
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(dataUrl(key), { cache: "no-store" });
-      const missing = res.status === 204 || res.status === 404;
-      if (res.ok && !missing) return deserialiseRecord(await res.arrayBuffer()) as T | null;
-      if (missing && BROWSER_ONLY_BEFORE.has(key)) {
-        const kept = await idbGet<T>(key);
-        if (kept !== null) await dataSet(key, kept);
-        return kept;
+      const res = await fetch(dataUrl(key, previous), { cache: "no-store" });
+      if (res.status === 204 || res.status === 404) return { status: "missing", value: null };
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const bytes = await res.arrayBuffer();
+      let value: unknown = null;
+      try {
+        value = deserialiseRecord(bytes);
+      } catch {
+        value = null;
       }
-      if (missing) return null;
-    } catch {
-      // fall through to the browser store
+      return value === null ? { status: "broken", value: null, bytes } : { status: "ok", value };
+    } catch (err) {
+      lastError = err;
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 400));
     }
   }
-  return idbGet<T>(key);
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * Reads a record: the local server's file when available, else IndexedDB.
+ * With the server up it is the only source — a failed read is a failure, never the browser's old copy (11-10:
+ * that copy is from another time, and once brought a weeks-old model back).  A broken record falls back to
+ * the copy before its last write.
+ */
+export async function dataRead<T>(key: string): Promise<DataRead<T>> {
+  if (await localServerAvailable()) {
+    try {
+      const got = await fetchRecord(key, false);
+      if (got.status === "ok") return { value: got.value as T, broken: false, fromPrevious: false, failed: false };
+      if (got.status === "missing") {
+        if (BROWSER_ONLY_BEFORE.has(key)) {
+          const kept = await idbGet<T>(key);
+          if (kept !== null && (await dataSet(key, kept))) await idbDelete(key); // moved up once: an emptied file stays empty
+          return { value: kept, broken: false, fromPrevious: false, failed: false };
+        }
+        return { value: null, broken: false, fromPrevious: false, failed: false };
+      }
+      const before = await fetchRecord(key, true).catch(() => null);
+      return { value: before?.status === "ok" ? (before.value as T) : null, broken: true, fromPrevious: before?.status === "ok", failed: false };
+    } catch {
+      return { value: null, broken: false, fromPrevious: false, failed: true };
+    }
+  }
+  return { value: await idbGet<T>(key), broken: false, fromPrevious: false, failed: false };
+}
+
+export async function dataGet<T>(key: string): Promise<T | null> {
+  return (await dataRead<T>(key)).value;
 }
 
 /** Writes to one key go one after another: an older write must not land after a newer one. */
@@ -502,14 +628,27 @@ export function dataSet(key: string, value: unknown): Promise<boolean> {
   return next;
 }
 
+/**
+ * A model file's record as the pieces of a Blob — the same bytes as serialiseRecord, without putting the file
+ * into one new array twice (11-10, Q7: a 230 MB OBJ was three copies at once while it was stored).
+ */
+export function workFileBody(value: StoredWorkFile): Blob {
+  const palette = value.palette ?? new Uint8Array(0);
+  const headerBytes = new TextEncoder().encode(JSON.stringify({ type: "work-file", name: value.name, kind: value.kind, savedAt: value.savedAt, paletteLength: palette.length }));
+  const lead = new Uint8Array(8);
+  lead.set(new TextEncoder().encode(MAGIC), 0);
+  new DataView(lead.buffer).setUint32(4, headerBytes.length, true);
+  return new Blob([lead, headerBytes, palette as Uint8Array<ArrayBuffer>, value.buffer]);
+}
+
 async function writeRecord(key: string, value: unknown): Promise<boolean> {
   if (await localServerAvailable()) {
-    const bytes = JSON_KEYS.has(key) ? serialiseJson(value) : serialiseRecord(value);
-    if (bytes) {
+    const body: BodyInit | null = !JSON_KEYS.has(key) && isStoredWorkFile(value) ? workFileBody(value) : ((JSON_KEYS.has(key) ? serialiseJson(value) : serialiseRecord(value))?.buffer as ArrayBuffer | undefined) ?? null;
+    if (body) {
       // With the server up it is the only place read from: a write that fails there
       // has failed (the browser's store would never be read back).
       try {
-        const res = await fetch(dataUrl(key), { method: "PUT", body: bytes.buffer as ArrayBuffer, headers: { "Content-Type": "application/octet-stream" } });
+        const res = await fetch(dataUrl(key), { method: "PUT", body, headers: { "Content-Type": "application/octet-stream" } });
         return res.ok;
       } catch {
         return false;
@@ -545,15 +684,32 @@ export async function clearStoredWorkEverywhere(): Promise<void> {
   await Promise.all([dataDelete(WORK_FILE_KEY), dataDelete(WORK_COLOURS_KEY), dataDelete(WORK_CUTS_KEY)]);
 }
 
-/** Settings kept as JSON in the local server's folder (null when the server is not running or has none). */
-export async function loadServerSettings(): Promise<PipelineSettings | null> {
-  if (!(await localServerAvailable())) return null;
+/**
+ * Settings kept as JSON in the local server's folder.  "missing": none there yet (the browser's go up);
+ * "broken": there but not readable — the copy before the last write is used when it reads (11-10: a broken file
+ * was taken as none, and this browser's settings quietly overwrote the folder's — the colour strips per model,
+ * hand-picked outputs and recipe changes with them); "failed": the server did not answer.
+ */
+export async function loadServerSettings(): Promise<{ state: "ok" | "missing" | "broken" | "failed" | "none"; settings: PipelineSettings | null; fromPrevious?: boolean }> {
+  if (!(await localServerAvailable())) return { state: "none", settings: null };
+  const read = async (previous: boolean): Promise<{ state: "ok" | "missing" | "broken"; settings: PipelineSettings | null }> => {
+    const res = await fetch(dataUrl("settings", previous), { cache: "no-store" });
+    if (res.status === 204 || res.status === 404) return { state: "missing", settings: null };
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    try {
+      const parsed: unknown = JSON.parse(await res.text());
+      return isRecord(parsed) ? { state: "ok", settings: mergeSettings(parsed) } : { state: "broken", settings: null };
+    } catch {
+      return { state: "broken", settings: null };
+    }
+  };
   try {
-    const res = await fetch(dataUrl("settings"), { cache: "no-store" });
-    if (!res.ok || res.status === 204) return null;
-    return mergeSettings(JSON.parse(await res.text()));
+    const now = await read(false);
+    if (now.state !== "broken") return now;
+    const before = await read(true).catch(() => null);
+    return before?.state === "ok" ? { state: "broken", settings: before.settings, fromPrevious: true } : { state: "broken", settings: null };
   } catch {
-    return null;
+    return { state: "failed", settings: null };
   }
 }
 

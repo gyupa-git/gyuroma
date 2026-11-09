@@ -15,6 +15,16 @@ import type { AiConnection } from "./TidyPanel";
 
 /** Pictures one message may carry (the model's own pictures need the rest of the room). */
 const MAX_ATTACHED = 3;
+
+/** Whether a consult was left open at this place (open unless folded there before). */
+function storedOpen(key: string | null): boolean {
+  if (!key) return true;
+  try {
+    return window.localStorage.getItem(key) !== "0";
+  } catch {
+    return true;
+  }
+}
 export function ConsultBox({
   title,
   sub,
@@ -39,6 +49,7 @@ export function ConsultBox({
   connection,
   keyForm,
   connectionLine,
+  foldKey,
 }: {
   title: string;
   sub: string;
@@ -68,8 +79,30 @@ export function ConsultBox({
   connection: AiConnection;
   keyForm: ReactNode;
   connectionLine: ReactNode;
+  /**
+   * Where this consult is (02, 03, 04): it can then be folded to its title and 🤖 button, remembered there (11-09:
+   * open, it is the tallest thing in the panel). Work starting or an answer coming in opens it again.
+   */
+  foldKey?: string;
 }) {
   const t = useT();
+  const storeKey = foldKey ? `rodin-pipeline-consult-open-${foldKey}` : null;
+  const [open, setOpen] = useState(() => storedOpen(storeKey));
+  // The same box goes on from 02 to 03: each place keeps its own.
+  useEffect(() => setOpen(storedOpen(storeKey)), [storeKey]);
+  const toggleOpen = () => {
+    const next = !open;
+    setOpen(next);
+    if (!storeKey) return;
+    try {
+      window.localStorage.setItem(storeKey, next ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  };
+  useEffect(() => {
+    if (busy) setOpen(true);
+  }, [busy]);
   const [draft, setDraft] = useState("");
   const [attached, setAttached] = useState<AttachedImage[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -81,6 +114,8 @@ export function ConsultBox({
     if (!images.length) return false;
     const made = (await Promise.all(images.slice(0, MAX_ATTACHED).map(attachImage))).filter((x): x is AttachedImage => x !== null);
     setAttached((prev) => [...prev, ...made].slice(0, MAX_ATTACHED));
+    // A picture dropped on the folded box: open it, so the picture is seen waiting in the writing field.
+    if (made.length) setOpen(true);
     return true;
   };
   const onPaste = (event: ReactClipboardEvent<HTMLTextAreaElement>) => {
@@ -110,6 +145,7 @@ export function ConsultBox({
     seenAiRef.current = lastAi;
     if (!lastAi) return;
     setArrived(lastAi);
+    setOpen(true);
     const timer = window.setTimeout(() => setArrived(null), 3200);
     return () => window.clearTimeout(timer);
   }, [lastAi]);
@@ -157,11 +193,31 @@ export function ConsultBox({
       </span>
       {/* Who this is and where its Claude comes from; nothing to press here but a key change. */}
       <header className="consult-head">
-        <b className="consult-title">💬 {title}</b>
+        {/* Foldable: the title is the switch, its arrow like the panel's other folds (a fold button of its own
+            pushed the login line onto a second line). */}
+        {storeKey && ai !== false ? (
+          <button type="button" className="consult-title consult-toggle" aria-expanded={open} title={open ? t("tidy.fold") : t("tidy.unfold")} onClick={toggleOpen}>
+            <span className="chev" aria-hidden="true">
+              {open ? "▾" : "▸"}
+            </span>
+            💬 {title}
+          </button>
+        ) : (
+          <b className="consult-title">💬 {title}</b>
+        )}
         {ai === true && connectionLine}
       </header>
       {ai === false ? (
         keyForm
+      ) : !open ? (
+        // Folded: the step's whole job is still one press away.
+        auto ? (
+          <div className="consult-auto-row">
+            <button type="button" className="btn primary consult-auto" disabled={waiting || auto.disabled} title={auto.hint} onClick={auto.onClick}>
+              {auto.label}
+            </button>
+          </div>
+        ) : null
       ) : (
         <>
           {/* The step's whole job at once: one button, one line on it, the rest folded away. */}

@@ -47,7 +47,7 @@ import {
   colourKey,
   countUniqueColours,
   faceGeometry,
-  facesInSphere,
+  facesNearSegment,
   hexToRgb,
   highlightGeometry,
   highlightGeometryCut,
@@ -69,8 +69,11 @@ import {
   clearStoredWorkEverywhere,
   dataDelete,
   dataGet,
+  dataRead,
   dataSet,
   downloadTextFile,
+  expectsLocalServer,
+  sameWorkFile,
   isStoredWorkColours,
   isStoredWorkFile,
   loadServerSettings,
@@ -96,17 +99,22 @@ import {
 import { MeshViewer, VIEW_DIRECTIONS, type CameraPose, type Callout, type FocusMode, type HighlightOverlay, type LayerPreview, type MeshViewerHandle, type PickInfo, type ViewerCut, type ViewerHit } from "./ui/MeshViewer";
 import { meshWithCut, type BorderCut } from "@core/borderCut";
 import { fillSmallHoles } from "@core/meshHoles";
-import { cutBorders, CutSuperseded } from "./engine/borderCutClient";
+import { cutBorders, CutSuperseded, forgetCutModel } from "./engine/borderCutClient";
+import { canExportInWorker, exportInWorker, ExportWorkerUnavailable, type ExportOptions } from "./engine/exportClient";
 import { ColourStrip, type StripOutput } from "./ui/ColourStrip";
 import { CleanupPanel, TargetSection } from "./ui/CleanupPanel";
 import { ColourMap, type ColourMapHandle } from "./ui/ColourMap";
 import { loadStoredBackground, storeBackground, type ViewBackground } from "./ui/background";
 import { blendRecipeText } from "./engine/plan";
-import { atlasPointOnFace, buildFaceAtlas, buildPatchAtlas, faceAtlasPoint, facesUnderMapBrush, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
+import { atlasPointOnFace, buildFaceAtlas, buildPatchAtlas, faceAtlasPoint, facesUnderMapBrush, mapIslandAt, type AtlasMasks, type FaceAtlas } from "./engine/atlas";
 import { cancelUnfold, unfoldInWorker, UnfoldSuperseded } from "./engine/unfoldClient";
+import type { UnfoldResult } from "./engine/unfold";
+import { facesAround } from "./engine/surround";
 import { specksIn } from "./engine/specks";
 import { HelpTip } from "./ui/HelpTip";
 import { GyupaLoader, GyupaSpin } from "./ui/GyupaLoader";
+import { PointerNote } from "./ui/PointerNote";
+import { GuideBuilder, guidesOnMap, packGuides, unpackGuides, type GuideStroke, type StoredGuides } from "./engine/guides";
 import { LoadSection, type SourceInfo } from "./ui/LoadSection";
 import { FilamentSection } from "./ui/FilamentSection";
 import { MergeSection, type MergeReportData } from "./ui/MergeSection";
@@ -128,7 +136,7 @@ import { mapPicture, numberedMapPicture, regionAtlas } from "./ui/mapShots";
 import type { AttachedImage } from "./ui/attachImage";
 import { cellParts, faceCentroids, facePartsOf, partsBySpill, shapeCells, summariseParts, tidyByParts, type ShapeCells, type ShapePart } from "./engine/shapeParts";
 import { findRegions } from "./engine/regions";
-import { creaseGeometry, faceConcavity, fillUnlabelled, findPits, snapToCreases, type CreaseGeometry, type Pit } from "./engine/creases";
+import { faceConcavity, fillUnlabelled, findPits, snapToCreases, type CreaseGeometry, type Pit } from "./engine/creases";
 import { regionBlobs, type BlobMap } from "./engine/blobs";
 import { ConnectionLine, KeyForm } from "./ui/TidyPanel";
 import { ConsultBox } from "./ui/ConsultBox";
@@ -174,7 +182,7 @@ import {
 } from "./engine/tidy";
 import { pickedOnly, pickedValueLines, type TidyArea } from "./engine/tidyArea";
 import { findPrintPreset } from "@core/printPresets";
-import { shareNewColours } from "@core/rgbPool";
+import { shareNewColours, sharedRgb } from "@core/rgbPool";
 import { limitTidyToPicked } from "./engine/tidyArea";
 import { ExportSection, faceOnBed, type ExportCheck } from "./ui/ExportSection";
 import { NumberField, Swatch, pct, pctNumber } from "./ui/common";
@@ -182,6 +190,9 @@ import { Brand, Glossary, Icon, Intro, Menu, Segmented, StepNav, Welcome, suppor
 import { ColourSelect } from "./ui/ColourSelect";
 import { ColourPicker } from "./ui/ColourPicker";
 import { GatherDialog } from "./ui/GatherDialog";
+import { useNarrowRow } from "./ui/useNarrowRow";
+import { PerformanceDialog } from "./ui/PerformanceDialog";
+import { GuideBook } from "./guidebook/GuideBook";
 import { GuideTour, type GuideMode } from "./ui/GuideTour";
 import { dueHint, markHintsSeen } from "./guide";
 import { GyupaFaceIcon } from "./ui/GuideGyupa";
@@ -283,8 +294,49 @@ function partNeighbourhood(cells: { count: number; cellOf: ArrayLike<number>; to
   return within;
 }
 
-/** Most faces the colour map unfolds in one go (the solver's time grows with them; a whole body is not one piece anyway). */
-const UNFOLD_MAX_FACES = 800_000;
+/**
+ * Most faces the colour map unfolds in one go.  Raised from 800 k (11-05, the owner: "한도도 좀 더 높여 줘"): the
+ * coarse-to-fine solver lays 1 M faces out in about 10 s and 2 M in about 24 s (measured on a bumpy tube), using
+ * about 0.7 GB at the most, so a pick of half a big model still comes in under a minute.
+ */
+const UNFOLD_MAX_FACES = 2_000_000;
+/**
+ * How far round a pick its neighbours come with it, as a share of its size (facesAround).  At 0.3 Tkc's face brought
+ * the hat, the collar and the inside of the mouth, and they folded over it on the map (11-05: 850 triangles turned
+ * over, the face's own spot under the pointer showed black); at 0.1 the face comes with a clean band round it.
+ */
+const AROUND_SHARE = 0.1;
+/**
+ * Most faces round a pick unfolded with it: twice the pick (at least 60 k), but no more than this — round Tkc's hair
+ * (1.1 M faces) the band came to 0.7 M, 0.57 M of them folded over and left off the map, and it all took 3 minutes.
+ */
+const AROUND_MOST_FACES = 400_000;
+/**
+ * How wide the band round a pick is, as times the width above (11-05, the owner: "붙은면 같이 보는거 좀더 넓게 …
+ * 슬라이더로 조절" — an eyebrow to be painted on past its end was cut off at the band's edge).  ×1 is the band as it
+ * was; the faces it may bring grow with it (as its area does), still no more than AROUND_MOST_FACES.
+ */
+const AROUND_WIDTHS = [1, 1.5, 2, 3, 4, 6, 8];
+/**
+ * Unfolded patches kept for picking them again, in bytes of their layouts (about 32 a face: Tkc's ribbon with the
+ * faces round it, 480 k faces, is 15 MB) — the oldest go first past it.
+ */
+const UNFOLD_KEEP_BYTES = 200_000_000;
+/** ⚙ Saving memory: what the unfolded patches kept may hold. */
+const UNFOLD_KEEP_BYTES_LOW = 60_000_000;
+
+/** What an unfold is kept by: the faces picked themselves (a short hash of them) and whether the faces round them came. */
+function unfoldKeepKey(around: number, faces: ArrayLike<number>): string {
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9 ^ faces.length;
+  for (let i = 0; i < faces.length; i++) {
+    const v = faces[i];
+    a = Math.imul(a ^ v, 16777619);
+    b = Math.imul(b ^ Math.imul(v, 0x85ebca6b), 0xc2b2ae35);
+  }
+  // `around`: 0 = the pick alone, else the band's width (AROUND_WIDTHS).
+  return `${around ? `around${around}` : "alone"}|${faces.length}|${(a >>> 0).toString(36)}|${(b >>> 0).toString(36)}`;
+}
 
 /** A share in per cent, short: 0.04 → "0.04", 3.2 → "3.2", 41 → "41". */
 function formatPct(pct: number): string {
@@ -332,6 +384,30 @@ const BIG_MODEL_FACES = 2_000_000;
  * slider or a checkbox with the focus does not count, so ⌘Z still undoes
  * right after the edge slider was used.
  */
+/** The same bytes in both (compared four at a time where the lengths allow). */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  const words = a.byteOffset % 4 === 0 && b.byteOffset % 4 === 0 ? a.length >> 2 : 0;
+  if (words > 0) {
+    const x = new Uint32Array(a.buffer, a.byteOffset, words);
+    const y = new Uint32Array(b.buffer, b.byteOffset, words);
+    for (let i = 0; i < words; i++) if (x[i] !== y[i]) return false;
+  }
+  for (let i = words * 4; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Every face the same colour in both (the same tuple, or the same three values). */
+function sameColourValues(a: ArrayLike<RGB>, b: ArrayLike<RGB>): boolean {
+  if (a.length !== b.length) return false;
+  for (let f = 0; f < a.length; f++) {
+    const x = a[f];
+    const y = b[f];
+    if (x !== y && (x[0] !== y[0] || x[1] !== y[1] || x[2] !== y[2])) return false;
+  }
+  return true;
+}
+
 function typingIn(target: HTMLElement | null): boolean {
   if (!target) return false;
   if (target.tagName === "TEXTAREA" || target.isContentEditable) return true;
@@ -383,7 +459,24 @@ function sameGroups(a: Int32Array, b: Int32Array): boolean {
 }
 
 /** Confirmed cuts kept for undo (each holds the model before it: ~30 MB of arrays at 2.4 million faces, its parts shared). */
+/** What the colour masks (hover, selection: one byte a face each) may hold at once. */
+const MASK_CACHE_BYTES = 48 * 1024 * 1024;
+
+/** AI answers whose part maps are kept to preview again (each holds per-face arrays: 18MB+ on a 4.6M-face model). */
+const KEPT_ANSWER_MAPS = 8;
+
+/** Drops a map's oldest entries (insertion order) down to `most`. */
+function keepNewest<K, V>(map: Map<K, V>, most: number): void {
+  while (map.size > most) {
+    const oldest = map.keys().next();
+    if (oldest.done) break;
+    map.delete(oldest.value);
+  }
+}
+
 const MESH_UNDO_LIMIT = 5;
+/** ⚙ Saving memory: cut steps kept (each holds a whole mesh, ~150MB on 4.6M faces). */
+const MESH_UNDO_LIMIT_LOW = 2;
 /**
  * One change made in a recipe panel, for that panel's own undo (the work's
  * undo ⌘Z does not touch recipe choices): which panel, the colour it was made
@@ -628,6 +721,12 @@ export default function App() {
   const [settings, setSettings] = useState<PipelineSettings>(() => loadStoredSettings());
   const [model, setModel] = useState<MeshModel | null>(null);
   const [sourceInfo, setSourceInfo] = useState<SourceInfo | null>(null);
+  /**
+   * ⚙ Saving memory (fewer undo steps, smaller caches): on, off, or by itself for models of 2M faces or more
+   * (11-09: on 4.6M faces 20 undo steps were ~370MB and 5 cut steps up to ~0.8GB).
+   */
+  const lowMemoryOn = settings.performance.lowMemory === "on" || (settings.performance.lowMemory === "auto" && (model?.triangles.length ?? 0) >= BIG_MODEL_FACES);
+  const colourUndoLimit = lowMemoryOn ? 8 : 20;
   const [history, setHistory] = useState<RGB[][]>([]);
   const [future, setFuture] = useState<RGB[][]>([]);
   const [template, setTemplate] = useState<{ info: Template3mfInfo; buffer: ArrayBuffer } | null>(null);
@@ -791,9 +890,76 @@ export default function App() {
       // ignore
     }
   };
-  const [unfolded, setUnfolded] = useState<{ key: string; atlas: FaceAtlas; pieces: number } | null>(null);
+  // ☑ The faces round the pick too (other colours touching it), so its edge can be painted out past or back in on
+  // the map (11-05, the owner: "그 조각 안에 묶여서 면적을 넓힐 수도, 수정을 할 수도 없어").  Remembered here.
+  const [unfoldAround, setUnfoldAroundState] = useState(() => {
+    try {
+      return window.localStorage.getItem("rodin-pipeline-unfold-around") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setUnfoldAround = (on: boolean) => {
+    setUnfoldAroundState(on);
+    try {
+      window.localStorage.setItem("rodin-pipeline-unfold-around", on ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  };
+  // The band's width (AROUND_WIDTHS, by index): the slider moves `aroundWidthShown` at once and the band itself only
+  // when the button comes up (each width is unfolded again) — not when the drag rests a moment (11-05, the owner:
+  // "클릭을 떼기도 전에 먼저 바뀌는데").  The arrow keys move it a step at a time, each taken at once.  Remembered here.
+  const [aroundWidthAt, setAroundWidthAt] = useState(() => {
+    try {
+      const at = Number(window.localStorage.getItem("rodin-pipeline-unfold-around-width"));
+      return Number.isInteger(at) && at >= 0 && at < AROUND_WIDTHS.length ? at : 0;
+    } catch {
+      return 0;
+    }
+  });
+  const [aroundWidthShown, setAroundWidthShown] = useState(aroundWidthAt);
+  const aroundWidthShownRef = useRef(aroundWidthAt);
+  const aroundWidthDraggingRef = useRef(false);
+  const takeAroundWidth = (at: number) => {
+    setAroundWidthAt(at);
+    try {
+      window.localStorage.setItem("rodin-pipeline-unfold-around-width", String(at));
+    } catch {
+      // ignore
+    }
+  };
+  const moveAroundWidth = (at: number) => {
+    aroundWidthShownRef.current = at;
+    setAroundWidthShown(at);
+    if (!aroundWidthDraggingRef.current) takeAroundWidth(at);
+  };
+  /** The button went down on the slider: what it is moved to is taken when it comes up (wherever the pointer is then). */
+  const holdAroundWidth = () => {
+    aroundWidthDraggingRef.current = true;
+    const end = () => {
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      aroundWidthDraggingRef.current = false;
+      takeAroundWidth(aroundWidthShownRef.current);
+    };
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  };
+  const aroundWidth = AROUND_WIDTHS[aroundWidthAt] ?? 1;
+  const [unfolded, setUnfolded] = useState<{ key: string; atlas: FaceAtlas; pieces: number; around: boolean } | null>(null);
   const unfoldedRef = useRef(unfolded);
   unfoldedRef.current = unfolded;
+  /**
+   * Patches already unfolded, newest last (11-05, the owner: "고른조각을 펼치기 했으면 그건 좀 데이터나 메모리로 가지고
+   * 있어야하는거아니냐? 다른조각눌렀다가 다시 그 조각누르니까 처음부터 다시 조각 계산하네"): the layout only — the map is
+   * drawn again from it in about a second — up to UNFOLD_KEEP_BYTES, and none kept over for a model of another shape.
+   */
+  const unfoldKeptRef = useRef<{ triangles: MeshModel["triangles"] | null; bytes: number; entries: Map<string, { faces: Int32Array; out: UnfoldResult; core: number; bytes: number }> }>({
+    triangles: null,
+    bytes: 0,
+    entries: new Map(),
+  });
   /** How far the unfold has gone (0..1) while it runs. */
   const [unfolding, setUnfolding] = useState<number | null>(null);
   /** Why the pick is not unfolded (too big, failed) — said on the map itself, not only on the status line. */
@@ -832,6 +998,25 @@ export default function App() {
   const [hand, setHand] = useState(false);
   const handRef = useRef(false);
   handRef.current = hand;
+  /**
+   * ✏️ Guide line tool (11-05, the owner: "3d모델에 반투명한 가상선 긋기 … 색지도에 가상 선으로 띄워져있고"): a drag on
+   * the model draws a half see-through line on its surface that colours nothing; it shows on the 3D views and at the
+   * same places on the colour map, as a guide for painting the map where it is hard to read (a fold, a bump).  The
+   * lines stay while other tools are used, until taken back or cleared; a new model (or one cut anew) drops them.
+   */
+  const [lineTool, setLineTool] = useState(false);
+  const lineToolRef = useRef(false);
+  lineToolRef.current = lineTool;
+  const [guideLines, setGuideLines] = useState<GuideStroke[]>([]);
+  const [showGuideLines, setShowGuideLines] = useState(true);
+  const guideBuilderRef = useRef<GuideBuilder | null>(null);
+  const guideRafRef = useRef<number | null>(null);
+  /** ✏️ The guide lines kept by model name (user-data `guide-lines`), once read; and whose lines are on screen. */
+  const guideStoreRef = useRef<Record<string, StoredGuides>>({});
+  const [guideStoreReady, setGuideStoreReady] = useState(false);
+  const guideShownForRef = useRef<string | null>(null);
+  /** Bumped when a work file brings guide lines: they are taken back from the store again. */
+  const [guideTakenNonce, setGuideTakenNonce] = useState(0);
   /** Fill tool: a click fills the patch under it, or the whole selection when clicked inside it. */
   const [fillMode, setFillMode] = useState(false);
   const fillModeRef = useRef(false);
@@ -857,7 +1042,9 @@ export default function App() {
   /** A picked place at least this wide on the print (mm) is asked about first. */
   const [gapBigMm, setGapBigMm] = useState(GAP_BIG_DIAMETER_MM);
   const [coloursVersion, setColoursVersion] = useState(0);
-  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[]; healed: Uint8Array | null; relabel: Map<number, number> | null; healColours: Set<number> | null } | null>(null);
+  /** Bumped when a preview painted only in the views is let go: they show the model's colours again (no new model). */
+  const [colourEpoch, setColourEpoch] = useState(0);
+  const strokeRef = useRef<{ working: RGB[]; mask: Uint8Array | null; count: number; rgb: RGB; hex: string; changed: number[]; healed: Uint8Array | null; relabel: Map<number, number> | null; healColours: Set<number> | null; mapIsland: number } | null>(null);
   /**
    * A brush stroke just committed: which faces it painted, from which colours to
    * which.  A stroke changes only those faces, so the colour buffers, the labels and
@@ -1002,11 +1189,13 @@ export default function App() {
     setBrushMaskOnly(pickedRef.current.length > 0);
     setFillMode(false);
     setGapMode(false);
+    setLineTool(false);
   }, [brushMode]);
   useEffect(() => {
     if (!fillMode) return;
     setBrushMode(false);
     setGapMode(false);
+    setLineTool(false);
   }, [fillMode]);
   // The gap clean picks as the select tool does: no brush, fill or eyedropper with it.
   useEffect(() => {
@@ -1014,10 +1203,27 @@ export default function App() {
     setBrushMode(false);
     setFillMode(false);
     setEyedropper(false);
+    setLineTool(false);
   }, [gapMode]);
   useEffect(() => {
-    if (eyedropper) setGapMode(false);
+    if (!eyedropper) return;
+    setGapMode(false);
+    setLineTool(false);
   }, [eyedropper]);
+  // ✏️ The guide line tool is a tool of its own: the brush, fill, gap clean and eyedropper go.
+  useEffect(() => {
+    if (!lineTool) return;
+    setBrushMode(false);
+    setHealMode(false);
+    setFillMode(false);
+    setGapMode(false);
+    setEyedropper(false);
+    // The brush's circles (the line is drawn with a crosshair).
+    for (const handle of viewerHandles()) handle.setBrushCursor(null);
+    mapRef.current?.setRemoteCursor(null);
+    setStatus(t("guide.on"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineTool]);
   /** Colour mode: every patch of this colour is outlined; clicks add/remove patches. */
   const [shownHex, setShownHex] = useState<string | null>(null);
   const shownHexRef = useRef<string | null>(null);
@@ -1051,6 +1257,14 @@ export default function App() {
   });
   /** 모아 뽑기 is open (it keeps its files while closed). */
   const [gatherOpen, setGatherOpen] = useState(false);
+  /** ⚙ Speed & memory open. */
+  const [perfOpen, setPerfOpen] = useState(false);
+  const closePerf = useCallback(() => setPerfOpen(false), []);
+  /** 📖 The detailed guide open. */
+  const [bookOpen, setBookOpen] = useState(false);
+  const closeBook = useCallback(() => setBookOpen(false), []);
+  /** The panel foot 04's export button is drawn into (always in view under the scrolling content). */
+  const [exportFootHost, setExportFootHost] = useState<HTMLDivElement | null>(null);
   /** The app guide: Gyupa walking the screen (ui/GuideTour, the lines in guide.ts), or one first-time hint. */
   const [guideMode, setGuideMode] = useState<GuideMode | null>(null);
   /** Which of the four steps is on screen (load · colours · filaments · export). */
@@ -1161,6 +1375,12 @@ export default function App() {
   const originalColoursRef = useRef<RGB[] | null>(null);
   /** Last colour array handed to the autosave effect (skips re-saving what is already stored). */
   const lastSavedColoursRef = useRef<RGB[] | null>(null);
+  /** The load whose model file is down in the store (-1: not yet, or it failed — the next save stores it first). */
+  const workFileStoredRef = useRef(-1);
+  /** A failed save tried again by itself (saveFailed). */
+  const saveRetryRef = useRef<{ timer: number; tries: number }>({ timer: 0, tries: 0 });
+  /** The colour save waiting out its 0.4 s (sent at once when the window is left or hidden). */
+  const pendingSaveRef = useRef<{ timer: number; run: () => void } | null>(null);
   /** Increments on every model install/clear so stale async saves and restores are dropped. */
   const loadGenerationRef = useRef(0);
   const workRestoredRef = useRef(false);
@@ -1179,23 +1399,49 @@ export default function App() {
   // rodin-pipeline/user-data/settings (survives port, browser and profile changes).
   const settingsSyncReadyRef = useRef(false);
   const [storageMode, setStorageMode] = useState<"browser" | "folder">("browser");
+  /** Served from this computer but its folder server never answered: the work goes to this browser only (11-10). */
+  const [storageWarn, setStorageWarn] = useState(false);
+  /** The folder's settings are in (or there is no folder): the restore goes by its "remember the work", not this browser's. */
+  const [settingsSynced, setSettingsSynced] = useState(false);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const available = await localServerAvailable();
-      if (cancelled) return;
-      if (available) {
-        const fromServer = await loadServerSettings();
+      try {
+        const available = await localServerAvailable();
         if (cancelled) return;
+        if (!available) {
+          if (expectsLocalServer()) setStorageWarn(true);
+          return;
+        }
         setStorageMode("folder");
-        if (fromServer) setSettings(fromServer);
-        else await storeServerSettings(loadStoredSettings());
+        let fromServer = await loadServerSettings();
+        // A folder that did not answer is asked again before anything is written over it.
+        for (let i = 0; fromServer.state === "failed" && i < 2; i++) {
+          await new Promise((resolve) => window.setTimeout(resolve, 1500));
+          if (cancelled) return;
+          fromServer = await loadServerSettings();
+        }
+        if (cancelled) return;
+        if (fromServer.settings) setSettings(fromServer.settings);
+        if (fromServer.state === "missing") await storeServerSettings(loadStoredSettings());
+        // Broken: the copy before its last write when that reads, else this browser's go on — and the broken file
+        // is not written over at once (the next change keeps it as the folder's previous copy). Unread: this
+        // session leaves the folder's settings alone (11-10: a broken or unread file was taken as none, and this
+        // browser's settings went over it, colour strips per model and hand-picked outputs with them).
+        if (fromServer.state === "broken") setStatus(t(fromServer.fromPrevious ? "status.settingsFromPrevious" : "status.settingsBroken"));
+        if (fromServer.state === "failed") {
+          setStatus(t("status.settingsUnreachable"));
+          return;
+        }
+        settingsSyncReadyRef.current = true;
+      } finally {
+        if (!cancelled) setSettingsSynced(true);
       }
-      settingsSyncReadyRef.current = true;
     })();
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
     storeSettings(settings);
@@ -1240,11 +1486,24 @@ export default function App() {
   useEffect(() => {
     const onLeave = (event: BeforeUnloadEvent) => {
       if (!modelRef.current) return;
+      // The save waiting out its 0.4 s goes now: it can be down while the question is read (11-10).
+      flushPendingSave();
       event.preventDefault();
       event.returnValue = "";
     };
+    // A window hidden (another tab, the app in the background, closing on a phone) saves what waits at once too.
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flushPendingSave();
+    };
     window.addEventListener("beforeunload", onLeave);
-    return () => window.removeEventListener("beforeunload", onLeave);
+    window.addEventListener("pagehide", flushPendingSave);
+    document.addEventListener("visibilitychange", onHidden);
+    return () => {
+      window.removeEventListener("beforeunload", onLeave);
+      window.removeEventListener("pagehide", flushPendingSave);
+      document.removeEventListener("visibilitychange", onHidden);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ------------------------------------------------------------------
@@ -1271,7 +1530,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [geometryVertices, geometryTriangles],
   );
-  const areaWeightList = useMemo(() => Array.from(areaWeights), [areaWeights]);
   /** The model's whole area (model units²), for turning a face count into a printed size. */
   const areaTotal = useMemo(() => {
     let sum = 0;
@@ -1363,18 +1621,18 @@ export default function App() {
   // Pieces split off as groups of their own: their colours sit at the end of their family.
   const pins = useMemo(() => pinMap(storedStrip?.pins), [storedStrip?.pins]);
   /** The last strip worked out ahead for new colours (keepGroupsFor), so the render does not build it again. */
-  const stripAheadRef = useRef<{ colours: RGB[]; weights: typeof areaWeightList; pins: typeof pins; strip: ColourStripData } | null>(null);
+  const stripAheadRef = useRef<{ colours: RGB[]; weights: Float32Array; pins: typeof pins; strip: ColourStripData } | null>(null);
   const stripFor = (colours: RGB[]): ColourStripData => {
     const ahead = stripAheadRef.current;
-    if (ahead && ahead.colours === colours && ahead.weights === areaWeightList && ahead.pins === pins) return ahead.strip;
-    const strip = buildColourStrip(colours, areaWeightList, pins);
-    stripAheadRef.current = { colours, weights: areaWeightList, pins, strip };
+    if (ahead && ahead.colours === colours && ahead.weights === areaWeights && ahead.pins === pins) return ahead.strip;
+    const strip = buildColourStrip(colours, areaWeights, pins);
+    stripAheadRef.current = { colours, weights: areaWeights, pins, strip };
     return strip;
   };
   const stripData = useMemo(
     () => (model ? stripFor(model.triangleColors) : null),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [model, areaWeightList, pins],
+    [model, areaWeights, pins],
   );
   const committedCuts = useMemo<StripCuts>(() => {
     if (!stripData) return {};
@@ -1405,7 +1663,7 @@ export default function App() {
     [stripData, previewCuts, committedGroups],
   );
   /** The labels last worked out, so a brush stroke only relabels the faces it painted. */
-  const labelsRef = useRef<{ colours: RGB[]; paletteKey: string; labels: Int32Array; palette: PaletteEntry[] } | null>(null);
+  const labelsRef = useRef<{ colours: RGB[]; paletteKey: string; labels: Int32Array; palette: PaletteEntry[]; stroke: NonNullable<typeof strokePatchRef.current> | null } | null>(null);
   const { palette, labels, positionOfKey } = useMemo(() => {
     if (!model || !stripData) return { palette: [] as PaletteEntry[], labels: new Int32Array(0), positionOfKey: new Map<number, number>() };
     const built = stripPalette(committedGroups);
@@ -1413,7 +1671,9 @@ export default function App() {
     const prev = labelsRef.current;
     const patch = strokePatchFor(prev?.colours, model.triangleColors);
     let faceLabels: Int32Array;
+    let patchedFor: NonNullable<typeof strokePatchRef.current> | null = null;
     if (patch && prev && prev.paletteKey === paletteKey && prev.labels.length === model.triangles.length) {
+      patchedFor = patch;
       // The same palette: only the painted faces change group, and the groups' counts with them.
       // A new array all the same, so what was worked out from the old labels is not taken for these.
       faceLabels = prev.labels.slice();
@@ -1433,7 +1693,7 @@ export default function App() {
     } else {
       faceLabels = stripLabels(model.triangleColors, built.groupOfKey, built.palette);
     }
-    labelsRef.current = { colours: model.triangleColors, paletteKey, labels: faceLabels, palette: built.palette };
+    labelsRef.current = { colours: model.triangleColors, paletteKey, labels: faceLabels, palette: built.palette, stroke: patchedFor };
     return { palette: built.palette, labels: faceLabels, positionOfKey: built.groupOfKey };
   }, [model, stripData, committedGroups]);
   const areaByPosition = useMemo(() => areaFractionByPosition(labels, palette.length, areaWeights), [labels, palette.length, areaWeights]);
@@ -1506,7 +1766,7 @@ export default function App() {
     // A colour already in a group stays there (a colour given another group's value joins that group).
     if (also) for (const [key, name] of also) if (!groupOfKey.has(key)) groupOfKey.set(key, name);
     const pinsNext = pinned ? pinned.pins : storedStrip?.pins;
-    const strip = pinned ? buildColourStrip(next, areaWeightList, pinMap(pinned.pins)) : stripFor(next);
+    const strip = pinned ? buildColourStrip(next, areaWeights, pinMap(pinned.pins)) : stripFor(next);
     const stored = stripStore(targetGroups, cutsKeepingGroups(strip, groupOfKey), livePins(pinsNext, strip), pinned ? pinned.from : storedStrip?.from);
     // These cuts fit these colours only; the ones from before the first such edit go along (see committedCuts).
     const previous = settings.stripByModel[stripKey];
@@ -1863,13 +2123,20 @@ export default function App() {
   // one colour buffer, nothing in the plan recomputed until the drag ends.
   // Each face's original colour as an index, worked out once per model, so a
   // drag only maps ~50k colours to groups instead of a million faces.
-  const faceColourIndex = useMemo(() => {
-    if (!model) return null;
+  /**
+   * Each face's colour as an index into the model's distinct colours — worked out when a strip drag or a group card
+   * needs it, for the colour list it was asked for (11-09: as a memo of the model it ran over every face after every
+   * stroke, ~66 ms and 18MB on 4.6M faces, for a drag that may never come).
+   */
+  const faceColourIndexRef = useRef<{ colours: RGB[]; index: Int32Array; keys: number[] } | null>(null);
+  function faceColourIndexFor(current: MeshModel): { index: Int32Array; keys: number[] } {
+    const held = faceColourIndexRef.current;
+    if (held && held.colours === current.triangleColors) return held;
     const keyIndex = new Map<number, number>();
     const keys: number[] = [];
-    const index = new Int32Array(model.triangles.length);
-    for (let f = 0; f < model.triangles.length; f++) {
-      const key = stripColourKey(model.triangleColors[f]);
+    const index = new Int32Array(current.triangles.length);
+    for (let f = 0; f < current.triangles.length; f++) {
+      const key = stripColourKey(current.triangleColors[f]);
       let at = keyIndex.get(key);
       if (at === undefined) {
         at = keys.length;
@@ -1878,18 +2145,19 @@ export default function App() {
       }
       index[f] = at;
     }
-    return { index, keys };
-  }, [model]);
+    faceColourIndexRef.current = { colours: current.triangleColors, index, keys };
+    return faceColourIndexRef.current;
+  }
   /** Two buffers taken in turn, so a drag does not allocate (and collect) a buffer per move; let go once it ends. */
   const dragBuffers = useRef<ColourBuffer[]>([]);
   const dragTurn = useRef(0);
   const dragColours = useMemo(() => {
-    if (!model || !stripData || !previewCuts || !faceColourIndex) {
+    if (!model || !stripData || !previewCuts) {
       dragBuffers.current = [];
       return null;
     }
     const built = stripPalette(liveGroups);
-    const { index, keys } = faceColourIndex;
+    const { index, keys } = faceColourIndexFor(model);
     const colourOf = new Uint8Array(keys.length * 3);
     for (let u = 0; u < keys.length; u++) {
       const key = keys[u];
@@ -1915,11 +2183,13 @@ export default function App() {
       out[p++] = r; out[p++] = g; out[p++] = b; out[p++] = 255;
     }
     return out;
-  }, [model, stripData, previewCuts, liveGroups, faceColourIndex]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model, stripData, previewCuts, liveGroups]);
   const coloursForMode = (mode: PreviewMode) =>
     mode === "source" ? sourceColours : (dragColours ?? (mode === "palette" ? paletteColours : (printColours ?? paletteColours)));
 
-  const defaultFileName = model ? `${baseName(model.name)}_colormix.3mf` : "model_colormix.3mf";
+  // Composed (NFC): a Mac file hands its Korean name out decomposed, and Bambu Studio showed that as "????" (11-10).
+  const defaultFileName = model ? `${baseName(model.name).normalize("NFC")}_colormix.3mf` : "model_colormix.3mf";
 
   const exportCheck = useMemo<ExportCheck | null>(() => {
     // A colour printer prints the cleaned colours as they are: nothing to assign.
@@ -2082,7 +2352,10 @@ export default function App() {
     const mask = maskFromLabels(labels, positions);
     maskKeys.current.set(mask, key);
     maskCache.set(key, mask);
-    if (maskCache.size > 32) maskCache.delete(maskCache.keys().next().value as string);
+    // Up to 32 masks, and up to MASK_CACHE_BYTES of them: 32 of a 4.6M-face model were 148MB (11-09) — a dropped one
+    // is made again in ~20–35 ms when it comes back.
+    const most = Math.max(4, Math.min(32, Math.floor((lowMemoryOn ? MASK_CACHE_BYTES / 2 : MASK_CACHE_BYTES) / Math.max(1, mask.length))));
+    while (maskCache.size > most) maskCache.delete(maskCache.keys().next().value as string);
     return mask;
   };
   const hoverMask = useMemo<Uint8Array | null>(() => {
@@ -2101,12 +2374,19 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, selectedHexes, shownHex, positionByHex, labels]);
 
+  // The same patches on the same mesh are the same mask — kept while only colours change (a stroke inside the pick),
+  // so its outline and the map's highlight are not made again (11-10: 31 ms + a map repaint on Tkc each stroke).
+  // A pick taken again with the same faces (colours changed elsewhere) gives the mask before back, too.
+  const pickedMaskKeptRef = useRef<Uint8Array | null>(null);
   const pickedMask = useMemo<Uint8Array | null>(() => {
-    if (!model || pickedPatches.length === 0) return null;
+    if (!model || pickedPatches.length === 0) return (pickedMaskKeptRef.current = null);
     const mask = new Uint8Array(model.triangles.length);
     for (const patch of pickedPatches) for (let i = 0; i < patch.faces.length; i++) mask[patch.faces[i]] = 1;
-    return mask;
-  }, [model, pickedPatches]);
+    const before = pickedMaskKeptRef.current;
+    if (before && sameBytes(before, mask)) return before;
+    return (pickedMaskKeptRef.current = mask);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model?.triangles, pickedPatches]);
   const pickedMaskRef = useRef<Uint8Array | null>(null);
   pickedMaskRef.current = pickedMask;
 
@@ -2408,8 +2688,8 @@ export default function App() {
       let shape = key ? overlayShapes.get(key) : undefined;
       if (!shape) {
         const { fill, fillNormals, edges, edgeNormals, edgeInside } = outlineCut
-          ? highlightGeometryCut(model, mask, outlineCut, labels, vertexNormals ?? undefined)
-          : highlightGeometry(model, mask, vertexNormals ?? undefined);
+          ? highlightGeometryCut(model, mask, outlineCut, labels, vertexNormals ?? undefined, cornerVertex ?? undefined)
+          : highlightGeometry(model, mask, vertexNormals ?? undefined, cornerVertex ?? undefined);
         shape = { fill: toViewSpace(fill), fillNormals: toViewSpace(fillNormals), edges: toViewSpace(edges), edgeNormals: toViewSpace(edgeNormals), edgeInside: toViewSpace(edgeInside) };
         if (key) {
           overlayShapes.set(key, shape);
@@ -2424,9 +2704,12 @@ export default function App() {
           }
         }
       }
-      return { id, pulse: true, ...look, ...shape };
+      // ⚙ Blinking off: every highlight just shows.
+      const overlay = { id, pulse: true, ...look, ...shape };
+      if (!settings.performance.highlightPulse) overlay.pulse = false;
+      return overlay;
     },
-    [model, vertexNormals, toViewSpace, overlayShapes, outlineCut, labels],
+    [model, vertexNormals, cornerVertex, toViewSpace, overlayShapes, outlineCut, labels, settings.performance.highlightPulse],
   );
 
   const hoverOverlay = useMemo<HighlightOverlay | null>(
@@ -2466,10 +2749,19 @@ export default function App() {
 
   // The picked patch is the one being looked at: a thin tint for the opening
   // flash, then the outline alone, so the colour it points at stays visible.
-  const pickedOverlay = useMemo<HighlightOverlay | null>(
-    () => (pickedMask ? overlayFor("picked", pickedMask, { colour: "#9aa0ff", opacity: 0.22, lineOpacity: 0.9 }) : null),
-    [pickedMask, overlayFor],
-  );
+  // Its outline stays the same object while the mask, the mesh and the view space stay (no blink again, nothing sent
+  // again) — unless the border cut is shown: then the outline follows the cut lines, which follow the colours.
+  const pickedOverlayRef = useRef<{ inputs: unknown[]; overlay: HighlightOverlay } | null>(null);
+  const pickedOverlay = useMemo<HighlightOverlay | null>(() => {
+    if (!pickedMask || !model) return null;
+    const inputs = [pickedMask, model.triangles, vertexNormals, cornerVertex, toViewSpace, outlineCut, outlineCut ? labels : null, settings.performance.highlightPulse];
+    const kept = pickedOverlayRef.current;
+    if (kept && kept.inputs.length === inputs.length && kept.inputs.every((input, i) => input === inputs[i])) return kept.overlay;
+    const overlay = overlayFor("picked", pickedMask, { colour: "#9aa0ff", opacity: 0.22, lineOpacity: 0.9 });
+    pickedOverlayRef.current = overlay ? { inputs, overlay } : null;
+    return overlay;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickedMask, overlayFor]);
 
   // Select: a light iris tint and outline on the patch a click would take.
   // Fill: the patch (or selection) already in the fill colour, outlined in white.
@@ -2571,7 +2863,7 @@ export default function App() {
     });
     const groupOfKey = new Map<number, string>();
     for (const group of live) for (const colour of group.colours) groupOfKey.set(colour.key, `${group.family}:${group.index}`);
-    const strip = buildColourStrip(next, areaWeightList, pins);
+    const strip = buildColourStrip(next, areaWeights, pins);
     // A piece split off from a band now recoloured goes back to the new colour.
     const targetKey = stripColourKey(target.rep);
     const from = fromMoved(storedStrip?.from, (key) => (gone.has(key) ? targetKey : undefined));
@@ -2683,7 +2975,7 @@ export default function App() {
     const same = session.shown.size === session.kept.size && [...session.shown].every(([f, rgb]) => session.kept.get(f) === rgb);
     if (same) {
       // Let go where it was: the views may still show the way there.
-      if (session.touched) setModel({ ...current });
+      if (session.touched) setColourEpoch((n) => n + 1);
       session.touched = false;
       return;
     }
@@ -2692,7 +2984,7 @@ export default function App() {
     const stored =
       session.shown.size === 0
         ? session.cuts
-        : stripStore(targetGroups, cutsKeepingGroups(buildColourStrip(next, areaWeightList, pins), session.groupOfKey), storedStrip?.pins, storedStrip?.from);
+        : stripStore(targetGroups, cutsKeepingGroups(buildColourStrip(next, areaWeights, pins), session.groupOfKey), storedStrip?.pins, storedStrip?.from);
     cutsWithColours.current.set(current.triangleColors, settings.stripByModel[stripKey] ?? null);
     cutsWithColours.current.set(next, stored);
     setSettings((prev) => {
@@ -2803,7 +3095,7 @@ export default function App() {
 
   /** The faces the card's colour picker works on — what the sliders would: the picked pieces of the group, or every face of it. */
   function groupPickFaces(): { faces: Int32Array; whole: boolean } | null {
-    if (!model || !cardGroup || !faceColourIndex) return null;
+    if (!model || !cardGroup) return null;
     if (toneScope === "piece" && cardPieces.length > 0) {
       let n = 0;
       for (const patch of cardPieces) n += patch.faces.length;
@@ -2816,7 +3108,7 @@ export default function App() {
       return { faces, whole: false };
     }
     const own = new Set(cardGroup.colours.map((colour) => colour.key));
-    const { index, keys } = faceColourIndex;
+    const { index, keys } = faceColourIndexFor(model);
     const ownUnique = new Uint8Array(keys.length);
     for (let u = 0; u < keys.length; u++) if (own.has(keys[u])) ownUnique[u] = 1;
     const faces: number[] = [];
@@ -2833,7 +3125,7 @@ export default function App() {
     const current = modelRef.current;
     if (!current) return;
     if (hex === null) {
-      if (groupPickRef.current?.touched) setModel({ ...current });
+      if (groupPickRef.current?.touched) setColourEpoch((n) => n + 1);
       groupPickRef.current = null;
       return;
     }
@@ -2931,7 +3223,7 @@ export default function App() {
     )
       return live;
     const group = cardGroup;
-    if (!cardHex || !group || !faceColourIndex || !stripData || current !== model) return null;
+    if (!cardHex || !group || !stripData || !model || current !== model) return null;
     const scope = toneScope === "piece" && cardPieces.length > 0 ? "piece" : "group";
     const groupOfKey = new Map<number, string>();
     for (const other of committedGroups) for (const colour of other.colours) groupOfKey.set(colour.key, `${other.family}:${other.index}`);
@@ -2975,7 +3267,7 @@ export default function App() {
     } else {
       const shadeOfKey = new Map<number, number>();
       group.colours.forEach((colour, i) => shadeOfKey.set(colour.key, i));
-      const { index, keys } = faceColourIndex;
+      const { index, keys } = faceColourIndexFor(model);
       const shadeOfUnique = new Int32Array(keys.length);
       for (let u = 0; u < keys.length; u++) shadeOfUnique[u] = shadeOfKey.get(keys[u]) ?? -1;
       for (let f = 0; f < index.length; f++) {
@@ -3056,7 +3348,7 @@ export default function App() {
     const shown = session.shown;
     if (sameTone(shown, session.kept)) {
       // Let go where it was: the views may still show the way there.
-      if (session.touched) setModel({ ...current });
+      if (session.touched) setColourEpoch((n) => n + 1);
       session.touched = false;
       return;
     }
@@ -3105,7 +3397,7 @@ export default function App() {
       if (piece) for (const colour of session.colours) from![keyOf(colour.key) as number] = colour.key;
       else if (session.pin !== undefined)
         for (const colour of session.colours) if (session.from[colour.key] !== undefined) from![keyOf(colour.key) as number] = session.from[colour.key];
-      const strip = buildColourStrip(next, areaWeightList, pinMap(pins));
+      const strip = buildColourStrip(next, areaWeights, pinMap(pins));
       const cuts = cutsKeepingGroups(strip, groupOfKey);
       stored = stripStore(targetGroups, cuts, livePins(pins, strip), from);
       const rep = colourOf.get(session.repKey) as RGB;
@@ -3152,13 +3444,13 @@ export default function App() {
   function rejoinPiece(): void {
     const current = modelRef.current;
     const group = cardGroup;
-    if (!current || current !== model || !group?.pinned || !faceColourIndex || !cardHex) return;
+    if (!current || current !== model || !group?.pinned || !cardHex) return;
     const pin = group.colours[0].pin;
     const from = storedStrip?.from ?? {};
     const back = new Map<number, RGB>();
     for (const colour of group.colours) if (from[colour.key] !== undefined) back.set(colour.key, rgbOfKey(from[colour.key]));
     const next = current.triangleColors.slice();
-    const { index, keys } = faceColourIndex;
+    const { index, keys } = faceColourIndexFor(current);
     const backOfUnique = keys.map((key) => back.get(key) ?? null);
     let faces = 0;
     for (let f = 0; f < index.length; f++) {
@@ -3170,7 +3462,7 @@ export default function App() {
     const pins = (storedStrip?.pins ?? []).filter((_, i) => i !== pin);
     const groupOfKey = new Map<number, string>();
     for (const other of committedGroups) if (other !== group) for (const colour of other.colours) groupOfKey.set(colour.key, `${other.family}:${other.index}`);
-    const strip = buildColourStrip(next, areaWeightList, pinMap(pins));
+    const strip = buildColourStrip(next, areaWeights, pinMap(pins));
     const cuts = cutsKeepingGroups(strip, groupOfKey);
     const stored = stripStore(targetGroups, cuts, livePins(pins, strip), storedStrip?.from);
     // The group it went back to: the one its main colour's old colour is in now.
@@ -3233,6 +3525,11 @@ export default function App() {
     setShownHex(null);
   }
 
+  /** Work on the unfolded map (a pick, a fill, a stroke there) keeps the map as it is — see `unfoldPicks`. */
+  function holdUnfolded(): void {
+    if (unfoldedRef.current && modelRef.current) unfoldHoldRef.current = modelRef.current.triangles;
+  }
+
   // Space over the views turns the pointer into a hand, as in drawing apps: the
   // left button pans the 3D views and the colour map (the right button alone did,
   // which a trackpad hardly can, and the brush had no pan at all).  Elsewhere,
@@ -3283,9 +3580,8 @@ export default function App() {
     const position = labels[faceIndex];
     const hex = hexByPosition[position] ?? rgbToHex(current.triangleColors[faceIndex]);
     let area = 0;
-    let total = 0;
+    const total = areaTotal;
     let id = faceIndex;
-    for (let i = 0; i < areaWeights.length; i++) total += areaWeights[i];
     for (let i = 0; i < faces.length; i++) {
       area += areaWeights[faces[i]];
       if (faces[i] < id) id = faces[i];
@@ -3390,6 +3686,8 @@ export default function App() {
       return;
     }
     if (fillModeRef.current) {
+      // A fill keeps the unfolded map, on the map and on the model alike (see unfoldPicks).
+      holdUnfolded();
       // The first click of a double click has filled already.
       if (!info.double) fillAt(faceIndex);
       return;
@@ -3399,6 +3697,9 @@ export default function App() {
       else setStatus(t("status.pickNothing"));
       return;
     }
+    // A pick on the unfolded map is a pick on what it shows, not a new thing to unfold; one on the model is.
+    if (info.source === "map") holdUnfolded();
+    else unfoldHoldRef.current = null;
     setBusy(t("busy.picking"));
     await yieldToUi();
     try {
@@ -3601,8 +3902,7 @@ export default function App() {
     // (by area, as the selection shows it).
     if (melt) {
       let area = 0;
-      let total = 0;
-      for (let i = 0; i < areaWeights.length; i++) total += areaWeights[i];
+      const total = areaTotal;
       for (let i = 0; i < melt.length; i++) area += areaWeights[melt[i]];
       const share = total > 0 ? area / total : 0;
       if (share > GAP_PICK_ASK_SHARE && !window.confirm(t("gap.confirmBigPick", { pct: (share * 100).toFixed(1), n: melt.length.toLocaleString() }))) return;
@@ -3693,9 +3993,8 @@ export default function App() {
     let id = faces[0];
     for (let i = 0; i < faces.length; i++) if (faces[i] < id) id = faces[i];
     const position = labels[faces[0]];
-    let total = 0;
+    const total = areaTotal;
     let area = 0;
-    for (let i = 0; i < areaWeights.length; i++) total += areaWeights[i];
     for (let i = 0; i < faces.length; i++) area += areaWeights[faces[i]];
     const place: PickedPatch = { id, faces, hex: hexByPosition[position] ?? "#000000", index: palette[position]?.index ?? 0, fraction: total > 0 ? area / total : 0, anchor: faces[0] };
     setPickedPatches([place]);
@@ -4017,11 +4316,15 @@ export default function App() {
     shareNewColours(next.triangleColors, null);
     if (options?.original && options.original !== next.triangleColors) shareNewColours(options.original, null);
     loadGenerationRef.current += 1;
+    // Work put back from the store has its file there already; anything else stores it first.
+    workFileStoredRef.current = options?.restored ? loadGenerationRef.current : -1;
+    clearSaveRetry();
     modelFileRef.current = source;
     adjacencyRef.current = null;
     atlasRef.current = null;
     faceGeometryRef.current = null;
     strokeRef.current = null;
+    forgetModelCaches();
     setAtlas(null);
     originalColoursRef.current = options?.original ?? next.triangleColors;
     lastSavedColoursRef.current = next.triangleColors;
@@ -4072,7 +4375,9 @@ export default function App() {
       countAction(`load/${kind}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      setStatus(t("status.error", { message: message === RODIN_TEXTURE_MODE_MESSAGE ? t("load.textureMode3mf") : message }));
+      // The model text is read in pieces now (11-10), so a string too long for the browser means memory ran out elsewhere.
+      const tooBig = err instanceof RangeError && /string length/i.test(message);
+      setStatus(t("status.error", { message: message === RODIN_TEXTURE_MODE_MESSAGE ? t("load.textureMode3mf") : tooBig ? t("load.tooBig3mf") : message }));
     } finally {
       setBusy(null);
     }
@@ -4081,11 +4386,26 @@ export default function App() {
   // ------------------------------------------------------------------
   // Work autosave (IndexedDB): the model file bytes + the current face colours.
   // ------------------------------------------------------------------
+  /**
+   * Stores the model file, in the save line: a colour save of the new model waits for its file (11-10).
+   * The colours and cuts stored before (the model before's, or this file's own from before) go only once the
+   * new file is down: they used to be deleted first, so a stop while a big file was written (seconds) left the
+   * old file without its colours and the new one not there.
+   */
   async function persistWorkFile(source: WorkSource, generation: number): Promise<boolean> {
+    let ok = false;
+    const run = async () => {
+      ok = await storeWorkFile(source, generation);
+    };
+    saveLineRef.current = saveLineRef.current.then(run, run);
+    await saveLineRef.current;
+    return ok;
+  }
+
+  async function storeWorkFile(source: WorkSource, generation: number): Promise<boolean> {
+    if (generation !== loadGenerationRef.current) return false;
     setAutosave({ state: "saving", at: null });
     try {
-      // The stored colours and cuts belong to the previous model; drop them before the new file lands.
-      await Promise.all([dataDelete(WORK_COLOURS_KEY), dataDelete(WORK_CUTS_KEY)]);
       const buffer = await source.file.arrayBuffer();
       if (generation !== loadGenerationRef.current) return false;
       const record: StoredWorkFile = {
@@ -4096,12 +4416,63 @@ export default function App() {
         savedAt: Date.now(),
       };
       const ok = await dataSet(WORK_FILE_KEY, record);
-      if (generation === loadGenerationRef.current) setAutosave({ state: ok ? "saved" : "failed", at: Date.now() });
+      if (ok) {
+        await Promise.all([dataDelete(WORK_COLOURS_KEY), dataDelete(WORK_CUTS_KEY)]);
+        if (generation === loadGenerationRef.current) {
+          workFileStoredRef.current = generation;
+          lastSavedCutsRef.current = null;
+        }
+      }
+      if (generation === loadGenerationRef.current) {
+        if (ok) {
+          setAutosave({ state: "saved", at: Date.now() });
+          clearSaveRetry();
+        } else saveFailed(generation);
+      }
       return ok;
     } catch {
-      if (generation === loadGenerationRef.current) setAutosave({ state: "failed", at: null });
+      saveFailed(generation);
       return false;
     }
+  }
+
+  /** The model file this work is on, as the colour and cut records name it (11-10). */
+  function workIdentity(): { name: string; size: number } | undefined {
+    const file = modelFileRef.current?.file;
+    return file ? { name: file.name, size: file.size } : undefined;
+  }
+
+  /**
+   * A save that failed is tried again by itself — in 3 s, 10 s, 30 s, then every minute — with the work as it is
+   * then (11-10: it used to wait for the next change, and with none the last change was never stored).
+   * Pressing "저장 실패" tries at once.
+   */
+  function saveFailed(generation: number): void {
+    if (generation !== loadGenerationRef.current) return;
+    setAutosave({ state: "failed", at: null });
+    const retry = saveRetryRef.current;
+    window.clearTimeout(retry.timer);
+    const delay = [3000, 10000, 30000][retry.tries] ?? 60000;
+    retry.tries += 1;
+    retry.timer = window.setTimeout(() => retrySave(generation), delay);
+  }
+  function clearSaveRetry(): void {
+    window.clearTimeout(saveRetryRef.current.timer);
+    saveRetryRef.current = { timer: 0, tries: 0 };
+  }
+  function retrySave(generation = loadGenerationRef.current): void {
+    const current = modelRef.current;
+    if (!current || generation !== loadGenerationRef.current || !rememberWorkRef.current) return;
+    lastSavedColoursRef.current = current.triangleColors;
+    void persistWorkColours(current.triangleColors, generation, cutLogRef.current.get(current.triangles) ?? []);
+  }
+  /** The save waiting out its moment, sent now (the window is being left or hidden). */
+  function flushPendingSave(): void {
+    const pending = pendingSaveRef.current;
+    if (!pending) return;
+    window.clearTimeout(pending.timer);
+    pendingSaveRef.current = null;
+    pending.run();
   }
 
   /**
@@ -4120,17 +4491,23 @@ export default function App() {
 
   async function saveWorkColours(colours: RGB[], generation: number, cuts: StoredCut[], ticket: number): Promise<void> {
     if (ticket !== saveTicketRef.current || generation !== loadGenerationRef.current) return;
+    // The model file first when it is not down for this model (its save failed): colours mean nothing without it.
+    if (workFileStoredRef.current !== generation) {
+      const source = modelFileRef.current;
+      if (!source || !(await storeWorkFile(source, generation))) return;
+    }
     setAutosave({ state: "saving", at: null });
+    const file = workIdentity();
     let ok = true;
     // The cuts are a log the colours point into (their `cuts` = how many apply): a cut
     // undone stays at the end, unused; only a log that does not start with these cuts is written.
     const saved = lastSavedCutsRef.current;
     const onDisk = cuts.length === 0 || (saved !== null && cuts.length <= saved.length && cuts.every((cut, i) => cut === saved[i]));
     if (!onDisk) {
-      const record: StoredWorkCuts = { fileName: modelFileRef.current?.file.name ?? "", cuts, savedAt: Date.now() };
+      const record: StoredWorkCuts = { fileName: file?.name ?? "", fileSize: file?.size, cuts, savedAt: Date.now() };
       if (!(await dataSet(WORK_CUTS_KEY, record))) {
         // The colours stay as they were on disk: they still match the cuts there.
-        if (generation === loadGenerationRef.current) setAutosave({ state: "failed", at: null });
+        saveFailed(generation);
         return;
       }
       lastSavedCutsRef.current = cuts;
@@ -4138,10 +4515,13 @@ export default function App() {
     if (generation !== loadGenerationRef.current) return;
     if (colours === originalColoursRef.current && cuts.length === 0) await dataDelete(WORK_COLOURS_KEY);
     else {
-      const record: StoredWorkColours = { faceCount: colours.length, colours: packColours(colours), savedAt: Date.now(), cuts: cuts.length };
+      const record: StoredWorkColours = { faceCount: colours.length, colours: packColours(colours), savedAt: Date.now(), cuts: cuts.length, file };
       ok = await dataSet(WORK_COLOURS_KEY, record);
     }
-    if (generation === loadGenerationRef.current) setAutosave({ state: ok ? "saved" : "failed", at: Date.now() });
+    if (generation !== loadGenerationRef.current) return;
+    if (!ok) return saveFailed(generation);
+    setAutosave({ state: "saved", at: Date.now() });
+    clearSaveRetry();
   }
 
   // Debounced save of the current colours whenever they change (merge, patch recolour, undo, Nomad import).
@@ -4155,8 +4535,16 @@ export default function App() {
     const cuts = cutLogRef.current.get(model.triangles) ?? [];
     // Show "saving" as soon as a change is pending, not only when the debounce fires.
     setAutosave({ state: "saving", at: null });
-    const timer = window.setTimeout(() => void persistWorkColours(colours, generation, cuts), 400);
-    return () => window.clearTimeout(timer);
+    const run = () => {
+      if (pendingSaveRef.current?.run === run) pendingSaveRef.current = null;
+      void persistWorkColours(colours, generation, cuts);
+    };
+    const timer = window.setTimeout(run, 400);
+    pendingSaveRef.current = { timer, run };
+    return () => {
+      window.clearTimeout(timer);
+      if (pendingSaveRef.current?.run === run) pendingSaveRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model, settings.rememberWork]);
 
@@ -4191,7 +4579,9 @@ export default function App() {
   // it (reading a big model holds the page for a moment and would make the
   // intro stutter).
   useEffect(() => {
-    if (workRestoredRef.current) return;
+    // After the folder's settings (11-10): this browser's "remember the work" could differ from the folder's, and
+    // the restore went by it — skipped, and the folder's work then written over by the next model opened.
+    if (!settingsSynced || workRestoredRef.current) return;
     workRestoredRef.current = true;
     if (!settings.rememberWork) {
       setStartupLoading(false);
@@ -4199,7 +4589,7 @@ export default function App() {
     }
     void restoreWork().finally(() => setStartupLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [settingsSynced]);
 
   /**
    * Puts stored work back — the model file, the confirmed cuts made again in
@@ -4213,9 +4603,13 @@ export default function App() {
     storedColours: unknown,
     storedCuts: unknown,
     from: "autosave" | "file",
-  ): Promise<{ model: MeshModel; cuts: StoredCut[]; colours: boolean } | null> {
+  ): Promise<{ model: MeshModel; cuts: StoredCut[]; colours: boolean; coloursLeft: "none" | "otherFile" | "faceCount" | null } | null> {
     const generation = loadGenerationRef.current;
     const file = new File([stored.buffer], stored.name);
+    // Colours and cuts made on another file (another window's model, a file of the same name) stay unused (11-10).
+    const fileId = { name: stored.name, size: stored.buffer.byteLength };
+    const ownColours = isStoredWorkColours(storedColours) && sameWorkFile(storedColours.file, fileId) ? storedColours : null;
+    const ownCuts = isStoredWorkCuts(storedCuts) && storedCuts.fileName === stored.name && (storedCuts.fileSize === undefined || storedCuts.fileSize === fileId.size) ? storedCuts : null;
     const nomadPalette = stored.palette ? (unpackColours(stored.palette, Math.floor(stored.palette.length / 3)) ?? undefined) : undefined;
     const loaded = await parseModelFile(file, stored.kind, nomadPalette);
     if (loadGenerationRef.current !== generation) return null;
@@ -4223,9 +4617,9 @@ export default function App() {
     let base = loaded.model;
     let original = loaded.model.triangleColors;
     let log: StoredCut[] = [];
-    const wanted = isStoredWorkColours(storedColours) ? (storedColours.cuts ?? 0) : 0;
-    if (wanted > 0 && isStoredWorkCuts(storedCuts) && storedCuts.fileName === stored.name && storedCuts.cuts.length >= wanted) {
-      for (const made of storedCuts.cuts.slice(0, wanted)) {
+    const wanted = ownColours ? (ownColours.cuts ?? 0) : 0;
+    if (wanted > 0 && ownCuts && ownCuts.cuts.length >= wanted) {
+      for (const made of ownCuts.cuts.slice(0, wanted)) {
         if (made.faces !== base.triangles.length || made.vertices !== base.vertices.length) break;
         const mesh = meshWithCut(base.vertices, base.triangles, made);
         original = Array.from(mesh.originalFace, (f) => original[f]);
@@ -4255,10 +4649,8 @@ export default function App() {
       }
       if (was && was.length === base.triangles.length) cutFacesRef.current.set(base.triangles, was);
     }
-    const colours =
-      isStoredWorkColours(storedColours) && storedColours.faceCount === base.triangles.length
-        ? unpackColours(storedColours.colours, storedColours.faceCount)
-        : null;
+    const colours = ownColours && ownColours.faceCount === base.triangles.length ? unpackColours(ownColours.colours, ownColours.faceCount) : null;
+    const coloursLeft = colours ? null : !isStoredWorkColours(storedColours) ? "none" : !ownColours ? "otherFile" : "faceCount";
     const backModel = colours ? { ...base, triangleColors: colours, stats: { ...base.stats, uniqueFaceColors: countUniqueColours(colours) } } : base;
     installModel(
       backModel,
@@ -4266,22 +4658,58 @@ export default function App() {
       { file, kind: stored.kind, palette: nomadPalette },
       from === "autosave" ? { persist: false, original, restored: true } : { persist: false, original, sameWork: true },
     );
-    return { model: backModel, cuts: log, colours: colours !== null };
+    return { model: backModel, cuts: log, colours: colours !== null, coloursLeft };
   }
 
   async function restoreWork(): Promise<void> {
-    const stored = await dataGet<unknown>(WORK_FILE_KEY);
-    if (!isStoredWorkFile(stored) || loadGenerationRef.current !== 0) return;
-    setBusy(t("busy.restoringWork"));
-    await yieldToUi();
     try {
-      const storedColours = await dataGet<unknown>(WORK_COLOURS_KEY);
-      const storedCuts = await dataGet<unknown>(WORK_CUTS_KEY);
-      const back = await putBackWork(stored, storedColours, storedCuts, "autosave");
+      const fileRead = await dataRead<unknown>(WORK_FILE_KEY);
+      if (fileRead.failed) {
+        setStatus(t("status.workRestoreUnreachable"));
+        return;
+      }
+      const stored = fileRead.value;
+      if (!isStoredWorkFile(stored)) {
+        // Broken with no copy before it: said, and left in place (another window may still read it).
+        if (fileRead.broken) setStatus(t("status.workFileBroken"));
+        return;
+      }
+      if (loadGenerationRef.current !== 0) return;
+      setBusy(t("busy.restoringWork"));
+      await yieldToUi();
+      const coloursRead = await dataRead<unknown>(WORK_COLOURS_KEY);
+      const cutsRead = await dataRead<unknown>(WORK_CUTS_KEY);
+      // The colours or cuts not read (the folder stopped answering): nothing is put back — the original colours
+      // would come up and the next autosave would write them over the stored work.
+      if (coloursRead.failed || cutsRead.failed) {
+        setStatus(t("status.workRestoreUnreachable"));
+        return;
+      }
+      // The model file's copy from before its last write is that same work only when the colours were painted on it.
+      if (fileRead.fromPrevious && !(isStoredWorkColours(coloursRead.value) && coloursRead.value.file && sameWorkFile(coloursRead.value.file, { name: stored.name, size: stored.buffer.byteLength }))) {
+        setStatus(t("status.workFileBroken"));
+        return;
+      }
+      const back = await putBackWork(stored, coloursRead.value, cutsRead.value, "autosave");
       if (!back) return;
+      // Put back from the copy before: the store's own file is broken — the next save writes it whole again.
+      if (fileRead.fromPrevious) workFileStoredRef.current = -1;
+      const storedColours = coloursRead.value;
       const savedAt = back.colours && isStoredWorkColours(storedColours) ? storedColours.savedAt : stored.savedAt;
       setAutosave({ state: "saved", at: Number.isFinite(savedAt) ? savedAt : Date.now() });
-      setStatus(t("status.workRestored", { name: stored.name, info: back.colours ? t("status.workRestoredColours") : t("status.workRestoredOriginal") }));
+      const info = back.colours
+        ? t(coloursRead.fromPrevious ? "status.workRestoredColoursPrevious" : "status.workRestoredColours")
+        : t(
+            coloursRead.broken
+              ? "status.workRestoredColoursBroken"
+              : back.coloursLeft === "otherFile"
+                ? "status.workRestoredOtherFile"
+                : back.coloursLeft === "faceCount"
+                  ? "status.workRestoredColoursUnfit"
+                  : "status.workRestoredOriginal",
+          );
+      const notes = [fileRead.fromPrevious ? t("status.workRestoredFilePrevious") : "", cutsRead.broken && !cutsRead.fromPrevious ? t("status.workRestoredCutsBroken") : ""].filter(Boolean);
+      setStatus(t("status.workRestored", { name: stored.name, info: [info, ...notes].join(" · ") }));
     } catch (err) {
       // Left in place: a failure in this window is no reason to delete what
       // another window may still be relying on.  "새로 시작" clears on purpose.
@@ -4324,11 +4752,13 @@ export default function App() {
       const ownColours = current.triangleColors === originalColoursRef.current && cuts.length === 0;
       const blob = await packWorkFile({
         file: { name: source.file.name, kind: source.kind, buffer: await source.file.arrayBuffer(), palette: source.palette ? packColours(source.palette) : undefined, savedAt: now },
-        colours: ownColours ? null : { faceCount: current.triangleColors.length, colours: packColours(current.triangleColors), savedAt: now, cuts: cuts.length },
-        cuts: cuts.length > 0 ? { fileName: source.file.name, cuts, savedAt: now } : null,
+        colours: ownColours ? null : { faceCount: current.triangleColors.length, colours: packColours(current.triangleColors), savedAt: now, cuts: cuts.length, file: { name: source.file.name, size: source.file.size } },
+        cuts: cuts.length > 0 ? { fileName: source.file.name, fileSize: source.file.size, cuts, savedAt: now } : null,
         settings,
         // The AI's part map and the consult go with the work: reopened, it goes on where it was.
         ai: { partMap: partMaps[tidyModelName] ?? null, chat: tidyLog.filter((entry) => entry.model === tidyModelName).slice(-200) },
+        // ✏️ The guide lines too.
+        guides: guideLines.length > 0 ? packGuides(guideLines, current.triangles.length) : null,
         app: `GYUROMA ${APP_VERSION}`,
         savedAt: now,
       });
@@ -4359,6 +4789,7 @@ export default function App() {
       if (!back) return;
       takeWorkSettings(work.settings, work.file.name);
       takeWorkAi(work.ai, work.file.name);
+      takeWorkGuides(work.guides, work.file.name);
       setStatus(t("status.workFileOpened", { name: file.name, at: new Date(work.savedAt).toLocaleString(lang === "ko" ? "ko-KR" : "en-GB") }));
       countAction("load/work");
       if (!rememberWorkRef.current) {
@@ -4405,6 +4836,15 @@ export default function App() {
     });
   }
 
+  /** ✏️ A work file's guide lines, back: kept under the model's name and shown (a file without any leaves the kept ones). */
+  function takeWorkGuides(guides: unknown, modelName: string): void {
+    const faceCount = guides && typeof guides === "object" ? (guides as Partial<StoredGuides>).faceCount : undefined;
+    if (typeof faceCount !== "number" || !unpackGuides(guides, faceCount)) return;
+    guideStoreRef.current = { ...guideStoreRef.current, [modelName]: guides as StoredGuides };
+    void dataSet("guide-lines", guideStoreRef.current);
+    setGuideTakenNonce((n) => n + 1);
+  }
+
   /** A work file's part map and consult, back (a preview then is on the colours already: it counts as applied). */
   function takeWorkAi(ai: WorkFileContents["ai"], modelName: string): void {
     if (!ai) return;
@@ -4440,7 +4880,7 @@ export default function App() {
     strokeRef.current = null;
     stripAheadRef.current = null;
     dragBuffers.current = [];
-    tidyStableShotsRef.current = null;
+    forgetModelCaches();
     setAtlas(null);
     originalColoursRef.current = null;
     lastSavedColoursRef.current = null;
@@ -4499,11 +4939,13 @@ export default function App() {
     return adjacency;
   }
 
-  function applyColours(current: MeshModel, next: RGB[], options?: { keepSelection?: boolean; uniqueFaceColors?: number }): void {
-    // What an edit painted shares the colour arrays too (only the faces whose array is new are looked up).
-    shareNewColours(next, current.triangleColors);
-    if (history.length >= 20) forgetOldestUndo("colours");
-    setHistory((prev) => [...prev.slice(-19), current.triangleColors]);
+  function applyColours(current: MeshModel, next: RGB[], options?: { keepSelection?: boolean; uniqueFaceColors?: number; changed?: ArrayLike<number> }): void {
+    // What an edit painted shares the colour arrays too (only the faces whose array is new are looked up — those it
+    // names when it says, 11-10: a brush stroke, instead of a look at every face).
+    shareNewColours(next, current.triangleColors, options?.changed);
+    // ⚙ Saving memory: 8 steps instead of 20 (each holds the whole colour list — 18MB on 4.6M faces).
+    for (let drop = history.length + 1 - colourUndoLimit; drop > 0; drop--) forgetOldestUndo("colours");
+    setHistory((prev) => [...prev, current.triangleColors].slice(-colourUndoLimit));
     pushUndo("colours");
     setFuture([]);
     meshRedoRef.current = [];
@@ -4512,7 +4954,11 @@ export default function App() {
     // The palette may be numbered anew: the recipe panel's undo steps no longer line
     // up.  The hand-set choices themselves follow their colours (choicesPaletteRef).
     forgetRecipeUndo();
-    if (!options?.keepSelection) clearPick();
+    if (!options?.keepSelection) {
+      // Let go by the colour put, not by hand: an unfolded map being worked on stays (see unfoldPicks).
+      letGoByColourRef.current = true;
+      clearPick();
+    }
   }
 
   // ------------------------------------------------------------------
@@ -4530,7 +4976,9 @@ export default function App() {
   const brushForRadius = useRef<number | null>(null);
   useEffect(() => {
     if (!model) return;
-    const radius = faceGeometryFor(model).radius;
+    // Its radius alone (the same half-extent faceGeometry gives) — building the face geometry here cost 110MB and
+    // ~0.3 s at every load on a 4.6M-face model (11-09; brushBounds was changed the same way before).
+    const radius = modelRadius(model);
     if (brushForRadius.current !== null && Math.abs(brushForRadius.current - radius) <= 1e-6 * radius) return;
     brushForRadius.current = radius;
     setBrushRadius(Number((radius * 0.04).toPrecision(2)));
@@ -4543,7 +4991,11 @@ export default function App() {
   // stroke whose faces the map painted as it went, in the colour they keep.
   useEffect(() => {
     const patch = strokePatchRef.current;
-    if (model && patch && patch.to === model.triangleColors && patch.exact) return;
+    if (model && patch && patch.to === model.triangleColors && patch.exact) {
+      // The views showed the stroke as painted and keep it: their preview goes, the painted span is sent (C-F, 11-09).
+      for (const handle of editedViewers()) handle.settleStroke();
+      return;
+    }
     setColoursVersion((v) => v + 1);
   }, [model?.triangleColors]);
 
@@ -4600,9 +5052,34 @@ export default function App() {
   // 🧩 The picked patches unfolded (unfold.ts, in a worker): a new pick lays them out again.  Keyed by what is
   // picked, not by the list's identity — a list made again for the same patches must not start the solve over
   // (11-05 Tkc: it never came to an end).
-  const pickKey = model ? `${model.triangles.length}|${pickedPatches.map((patch) => `${patch.id}:${patch.faces.length}`).join(",")}` : "";
-  const pickedForUnfoldRef = useRef(pickedPatches);
-  pickedForUnfoldRef.current = pickedPatches;
+  //
+  // What is unfolded follows the pick — but colour work keeps the map as it is (11-05, the owner:
+  // "나는 저 파란걸 클릭해서 저 파란 부분만 색 채우기를 할랬거든" — a click on the map's blue strip unfolded the blue
+  // patch instead): a patch picked there, a fill or a stroke (there or on the model — 11-10), and what they bring after
+  // (the pick taken again in its new colours, the pick let go by the pick bar's colour).  A pick on the 3D model, a pick let go by hand (an
+  // empty click, Esc, the pick bar's button) or the map folded back ends that.  `unfoldHoldRef` holds the model's
+  // triangles while it lasts (another model ends it too).
+  const [unfoldPicks, setUnfoldPicks] = useState<PickedPatch[]>([]);
+  const unfoldHoldRef = useRef<MeshModel["triangles"] | null>(null);
+  const letGoByColourRef = useRef(false);
+  useEffect(() => {
+    const byColour = letGoByColourRef.current;
+    letGoByColourRef.current = false;
+    const holding = unfoldHoldRef.current !== null && unfoldHoldRef.current === model?.triangles && showMap && unfoldOn && unfoldedRef.current !== null && (pickedPatches.length > 0 || byColour);
+    if (!holding) {
+      unfoldHoldRef.current = null;
+      setUnfoldPicks(pickedPatches);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pickedPatches, showMap, unfoldOn, model?.triangles]);
+  /** The guide lines where they lie on the map shown (whole or unfolded). */
+  const guideMapLines = useMemo(() => (showGuideLines && shownAtlas && guideLines.length > 0 ? guidesOnMap(guideLines, shownAtlas) : null), [guideLines, shownAtlas, showGuideLines]);
+  const pickKey = model ? `${model.triangles.length}|${unfoldPicks.map((patch) => `${patch.id}:${patch.faces.length}`).join(",")}` : "";
+  // With the faces round it, the map stays as it is while the pick is painted bigger or smaller inside what it
+  // shows — laid out again only for another pick, or when the pick has grown past it.
+  const aroundKey = model ? `${model.triangles.length}|around×${aroundWidth}|${unfoldPicks.map((patch) => patch.anchor).join(",")}` : "";
+  const pickedForUnfoldRef = useRef(unfoldPicks);
+  pickedForUnfoldRef.current = unfoldPicks;
   useEffect(() => {
     const picked = pickedForUnfoldRef.current;
     const total = picked.reduce((n, patch) => n + patch.faces.length, 0);
@@ -4614,17 +5091,73 @@ export default function App() {
       setUnfoldNote(showMap && unfoldOn && total > UNFOLD_MAX_FACES ? t("map.unfoldTooBig", { n: total.toLocaleString(), max: UNFOLD_MAX_FACES.toLocaleString() }) : null);
       return;
     }
-    const key = pickKey;
-    if (unfoldedRef.current?.key === key || unfoldRunningKeyRef.current === key) return;
+    const key = unfoldAround ? aroundKey : pickKey;
+    const shown = unfoldedRef.current;
+    const stillShown = shown?.key === key && (!unfoldAround || picked.every((patch) => patch.faces.every((f) => shown.atlas.chartOf[f] >= 0)));
+    if (stillShown || unfoldRunningKeyRef.current === key) return;
     setUnfoldNote(null);
     const timer = window.setTimeout(() => {
-      // The patches' faces, and their corners numbered afresh (positions of those vertices only).
+      // The patches' faces (and the faces round them, when wanted), their corners numbered afresh
+      // (positions of those vertices only).
       const mark = new Uint8Array(model.triangles.length);
       for (const patch of picked) for (const f of patch.faces) mark[f] = 1;
-      const faces = new Int32Array(total);
-      let count = 0;
-      for (let f = 0; f < mark.length; f++) if (mark[f]) faces[count++] = f;
-      const used = faces.subarray(0, count);
+      const own: number[] = [];
+      for (let f = 0; f < mark.length; f++) if (mark[f]) own.push(f);
+      // Unfolded before (the same faces, the same way): drawn again from what was kept, not solved again.
+      const kept = unfoldKeptRef.current;
+      if (kept.triangles !== model.triangles) {
+        kept.triangles = model.triangles;
+        kept.entries.clear();
+        kept.bytes = 0;
+      }
+      const keepKey = unfoldKeepKey(unfoldAround ? aroundWidth : 0, own);
+      const before = kept.entries.get(keepKey);
+      if (before) {
+        kept.entries.delete(keepKey);
+        kept.entries.set(keepKey, before);
+        cancelUnfold();
+        unfoldRunningKeyRef.current = null;
+        setUnfolding(null);
+        try {
+          const atlas = buildPatchAtlas(model, faceGeometryFor(model), adjacencyFor(model), before.faces, before.out, before.faces.length > 300_000 ? 3072 : 2048, before.core);
+          setUnfolded({ key, atlas, pieces: before.out.pieces, around: unfoldAround });
+          setStatus(t("status.unfoldedKept", { faces: before.faces.length.toLocaleString(), pieces: before.out.pieces }));
+        } catch (err) {
+          setUnfoldNote(t("map.unfoldFailed", { message: err instanceof Error ? err.message : String(err) }));
+        }
+        return;
+      }
+      let used: Int32Array = Int32Array.from(own);
+      let occluders = new Float64Array(0);
+      {
+        const geometry = faceGeometryFor(model);
+        const { centroids } = geometry;
+        let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+        for (const f of own) {
+          const x = centroids[f * 3], y = centroids[f * 3 + 1], z = centroids[f * 3 + 2];
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          if (y > y1) y1 = y;
+          if (z < z0) z0 = z;
+          if (z > z1) z1 = z;
+        }
+        // Out to 10 % of the pick's size, at least 3 % of the model's (a thin line gets room round it), at most 10 % —
+        // times the width the slider sets (the faces it may bring, times its square: the band's area).
+        const reach = aroundWidth * Math.min(Math.max(AROUND_SHARE * Math.hypot(x1 - x0, y1 - y0, z1 - z0), 0.03 * geometry.radius), 0.1 * geometry.radius);
+        const most = Math.min(UNFOLD_MAX_FACES, total + Math.min(AROUND_MOST_FACES, Math.max(total * 2, 60_000) * aroundWidth * aroundWidth));
+        const around = facesAround(adjacencyFor(model), centroids, own, reach, most);
+        // The pick first, then the faces round it nearest first (facesAround's order): the map draws the pick whole
+        // and each neighbour only where nothing is yet, and leaves off one that comes out over them (layOutCharts).
+        if (unfoldAround) used = around;
+        else {
+          // Not on the map, but what lies over the pick (a ribbon over the neck) is told by them (unfold.ts coveredFaces).
+          occluders = new Float64Array((around.length - own.length) * 3);
+          for (let i = own.length; i < around.length; i++) occluders.set(centroids.subarray(around[i] * 3, around[i] * 3 + 3), (i - own.length) * 3);
+        }
+      }
+      const core = own.length;
+      const count = used.length;
       const localOf = new Int32Array(model.vertices.length).fill(-1);
       const triangles = new Int32Array(count * 3);
       const order: number[] = [];
@@ -4645,16 +5178,39 @@ export default function App() {
       unfoldRunningKeyRef.current = key;
       setUnfolding(0);
       const started = performance.now();
-      unfoldInWorker(positions, triangles, (share) => {
-        if (unfoldRunningKeyRef.current === key) setUnfolding(share);
-      })
+      unfoldInWorker(
+        positions,
+        triangles,
+        core,
+        occluders,
+        (share) => {
+          if (unfoldRunningKeyRef.current === key) setUnfolding(share);
+        },
+        settings.performance.gpuUnfold,
+      )
         .then((out) => {
           if (unfoldRunningKeyRef.current !== key) return;
           unfoldRunningKeyRef.current = null;
           const size = facesKept.length > 300_000 ? 3072 : 2048;
+          // Kept for picking it again (the oldest let go past UNFOLD_KEEP_BYTES).
+          if (kept.triangles === model.triangles) {
+            const bytes = out.uv.byteLength + out.piece.byteLength + facesKept.byteLength;
+            kept.entries.set(keepKey, { faces: facesKept, out, core, bytes });
+            kept.bytes += bytes;
+            for (const [oldKey, old] of kept.entries) {
+              if (kept.bytes <= (lowMemoryOn ? UNFOLD_KEEP_BYTES_LOW : UNFOLD_KEEP_BYTES) || oldKey === keepKey) break;
+              kept.entries.delete(oldKey);
+              kept.bytes -= old.bytes;
+            }
+          }
           try {
-            setUnfolded({ key, atlas: buildPatchAtlas(model, faceGeometryFor(model), facesKept, out, size), pieces: out.pieces });
-            setStatus(t("status.unfolded", { faces: facesKept.length.toLocaleString(), pieces: out.pieces, s: ((performance.now() - started) / 1000).toFixed(1) }));
+            const atlas = buildPatchAtlas(model, faceGeometryFor(model), adjacencyFor(model), facesKept, out, size, core);
+            setUnfolded({ key, atlas, pieces: out.pieces, around: unfoldAround });
+            setStatus(
+              t("status.unfolded", { faces: facesKept.length.toLocaleString(), pieces: out.pieces, s: ((performance.now() - started) / 1000).toFixed(1) }) +
+                (out.onCard ? t("status.unfoldedOnCard") : "") +
+                (atlas.dropped ? t("status.unfoldedDropped", { n: atlas.dropped.toLocaleString() }) : ""),
+            );
           } catch (err) {
             setUnfoldNote(t("map.unfoldFailed", { message: err instanceof Error ? err.message : String(err) }));
           }
@@ -4669,7 +5225,7 @@ export default function App() {
     }, 180);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showMap, unfoldOn, pickKey]);
+  }, [showMap, unfoldOn, unfoldAround, pickKey, aroundWidth]);
 
   /** What the result view shows a face as, for the colour map (its group's colour, or the print's). */
   const mapLookRef = useRef<{ palette: PaletteEntry[]; labels: Int32Array; mode: PreviewMode; effective: Map<number, RGB> } | null>(null);
@@ -4708,12 +5264,14 @@ export default function App() {
       working: current.triangleColors.slice(),
       mask: brushMaskOnly && !healMode ? pickedMask : null,
       count: 0,
-      rgb: fillRgb(current, brushHex),
+      // The pool's own array: the faces painted with it add up by its number in the colour strip (11-10).
+      rgb: sharedRgb(fillRgb(current, brushHex)),
       hex: brushHex,
       changed: [],
       healed: healMode ? new Uint8Array(current.triangleColors.length) : null,
       relabel: healMode ? new Map() : null,
       healColours: healMode ? new Set() : null,
+      mapIsland: -1,
     };
     return true;
   }
@@ -4757,7 +5315,7 @@ export default function App() {
       !stroke.healColours || stroke.healColours.size === 1
         ? { from: current.triangleColors, to: stroke.working, faces: Int32Array.from(stroke.changed), rgb: stroke.rgb, exact: false }
         : null;
-    applyColours(current, stroke.working, { keepSelection: true, uniqueFaceColors: stripFor(stroke.working).colourCount });
+    applyColours(current, stroke.working, { keepSelection: true, uniqueFaceColors: stripFor(stroke.working).colourCount, changed: stroke.changed });
     setStatus(stroke.healColours ? t("status.healed", { n: stroke.count.toLocaleString() }) : t("status.brushed", { n: stroke.count.toLocaleString(), hex: stroke.hex }));
   }
 
@@ -4793,14 +5351,22 @@ export default function App() {
     mapRef.current?.setPointer(faceAtlasPoint(current, hit.faceIndex, hit.bary ?? EVEN_THIRDS), true);
   }
 
-  /** The map's brush: the surface under the circle, as the 3D brush paints it (faces the map shows thin or not at all included). */
+  /**
+   * The map's brush: the surface under the circle, as the 3D brush paints it (faces the map shows thin or not at all
+   * included).  On a patch unfolded on its own a stroke keeps to the piece it starts on (11-05, the owner: "따로 떼어
+   * 놓기" — the neck under the ribbon lies apart from the face, and a stroke down the face stops at the gap).
+   */
   function paintAtMap(x: number, y: number): void {
     const current = modelRef.current;
     const built = mapAtlasNow();
-    if (!current || !built || !strokeRef.current) return;
+    const stroke = strokeRef.current;
+    if (!current || !built || !stroke) return;
+    if (built.unfolded && stroke.mapIsland < 0) stroke.mapIsland = mapIslandAt(built, x, y, brushRadius * built.scale);
+    if (built.unfolded && stroke.mapIsland < 0) return;
+    const island = built.unfolded ? stroke.mapIsland : undefined;
     const geometry = faceGeometryFor(current);
-    const reach = facesUnderMapBrush(built, current, geometry, x, y, brushRadius);
-    if (healMode) paintHealed(healFaces(current, reach, facesUnderMapBrush(built, current, geometry, x, y, Math.min(healSize, brushRadius))));
+    const reach = facesUnderMapBrush(built, current, geometry, x, y, brushRadius, island);
+    if (healMode) paintHealed(healFaces(current, reach, facesUnderMapBrush(built, current, geometry, x, y, Math.min(healSize, brushRadius), island)));
     else paintFaces(reach);
   }
 
@@ -4832,9 +5398,13 @@ export default function App() {
     if (!stroke || faces.length === 0) return;
     const changed: number[] = [];
     const each: number[] = [];
+    // Each palette colour as the pool's own array (see beginStroke), looked up once a dab.
+    const pooled = new Map<number, RGB>();
     for (let i = 0; i < faces.length; i++) {
-      const rgb = palette[targets[i]]?.rgb;
-      if (!rgb) continue;
+      const own = palette[targets[i]]?.rgb;
+      if (!own) continue;
+      let rgb = pooled.get(targets[i]);
+      if (!rgb) pooled.set(targets[i], (rgb = sharedRgb(own)));
       const f = faces[i];
       const c = stroke.working[f];
       if (c[0] === rgb[0] && c[1] === rgb[1] && c[2] === rgb[2]) continue;
@@ -4882,26 +5452,95 @@ export default function App() {
     setStatus(t("status.specksDone", { n: faces.length.toLocaleString(), hex }) + keptNote);
   }
 
+  /** Where the last dab of this stroke went (model space), so the next one paints the stretch between too. */
+  const lastDabRef = useRef<[number, number, number] | null>(null);
+
   function paintAtHit(hit: ViewerHit | null, slot: number): void {
     const current = modelRef.current;
-    if (!hit || !current || !strokeRef.current) return;
+    if (!hit || !current || !strokeRef.current) {
+      // Off the model: the stroke goes on from where it comes back, not across the gap.
+      lastDabRef.current = null;
+      return;
+    }
     const viewDir = viewerRefs[slot]?.current?.viewDirection() ?? null;
     const geometry = faceGeometryFor(current);
     const centre = pointToModel(hit.point);
     const along = viewDir ? pointToModel(viewDir) : null;
-    const reach = facesInSphere(geometry, centre, brushRadius, along);
-    if (healMode) paintHealed(healFaces(current, reach, facesInSphere(geometry, centre, Math.min(healSize, brushRadius), along)));
+    // A quick stroke goes further between two dabs than the brush is wide (11-05, the owner: "조금만 선을 빨리 그으면
+    // 스페이싱이 생기는 건 개선 못 함?"): the stretch from the last dab is painted too — not over a jump of more than
+    // 16 brush widths (the pointer gone from an arm to the body, the air between not painted).
+    const last = lastDabRef.current;
+    const from = last && Math.hypot(centre[0] - last[0], centre[1] - last[1], centre[2] - last[2]) <= 16 * brushRadius ? last : centre;
+    lastDabRef.current = centre;
+    const reach = facesNearSegment(geometry, from, centre, brushRadius, along);
+    if (healMode) paintHealed(healFaces(current, reach, facesNearSegment(geometry, from, centre, Math.min(healSize, brushRadius), along)));
     else paintFaces(reach);
   }
 
   function brushStart3D(hit: ViewerHit | null, slot: number): void {
     if (!beginStroke()) return;
+    // Colour work keeps the unfolded map as it is, on the model as on the map (11-10: a stroke inside the picked
+    // patch made the pick smaller, and the map was unfolded again after every stroke — laid out anew each time).
+    holdUnfolded();
+    lastDabRef.current = null;
     paintAtHit(hit, slot);
   }
 
   function brushDrag3D(hit: ViewerHit | null, slot: number): void {
     brushHover3D(hit);
     paintAtHit(hit, slot);
+  }
+
+  // ✏️ Guide lines: a drag on the model (the views take it as a brush stroke) adds a stroke; the views and the map
+  // are drawn again once a frame while it grows.
+  function showGuidesSoon(): void {
+    if (guideRafRef.current !== null) return;
+    guideRafRef.current = window.requestAnimationFrame(() => {
+      guideRafRef.current = null;
+      setGuideLines((prev) => prev.slice());
+    });
+  }
+  function guideStart3D(hit: ViewerHit | null): void {
+    const builder = new GuideBuilder();
+    guideBuilderRef.current = builder;
+    builder.add(hit);
+    setShowGuideLines(true);
+    setGuideLines((prev) => [...prev, builder.stroke]);
+    hoverHit3D(hit);
+  }
+  function guideDrag3D(hit: ViewerHit | null): void {
+    const builder = guideBuilderRef.current;
+    if (!builder) return;
+    builder.add(hit);
+    hoverHit3D(hit);
+    showGuidesSoon();
+  }
+  function guideEnd3D(): void {
+    const builder = guideBuilderRef.current;
+    guideBuilderRef.current = null;
+    if (!builder) return;
+    if (guideRafRef.current !== null) {
+      window.cancelAnimationFrame(guideRafRef.current);
+      guideRafRef.current = null;
+    }
+    // A click (or a drag off the model) draws no line: the stroke goes.
+    if (builder.lineCount === 0) {
+      setGuideLines((prev) => prev.filter((stroke) => stroke !== builder.stroke));
+      setStatus(t("guide.nothing"));
+      return;
+    }
+    setGuideLines((prev) => prev.slice());
+    setStatus(t("guide.drawn", { n: guideLines.length }));
+  }
+  function undoGuideLine(): void {
+    guideBuilderRef.current = null;
+    setGuideLines((prev) => prev.slice(0, -1));
+    setStatus(t("guide.undone"));
+  }
+  function clearGuideLines(): void {
+    guideBuilderRef.current = null;
+    setGuideLines([]);
+    setStatus(t("guide.cleared"));
   }
 
   function mapHover(face: number | null, at?: [number, number]): void {
@@ -4985,7 +5624,9 @@ export default function App() {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey)) return;
-      const key = event.key.toLowerCase();
+      // The letter, or the key's place when the letter is not a latin one (a Korean input source gives "ㅋ").
+      const typed = event.key.toLowerCase();
+      const key = /^[a-z]$/.test(typed) ? typed : event.code === "KeyZ" ? "z" : event.code === "KeyY" ? "y" : typed;
       const isUndo = key === "z" && !event.shiftKey;
       const isRedo = (key === "z" && event.shiftKey) || key === "y";
       if (!isUndo && !isRedo) return;
@@ -4993,18 +5634,23 @@ export default function App() {
       if (typingIn(target)) return;
       event.preventDefault();
       // Not while something is being worked on (or the tidy AI answering): it would come back to a different model.
-      if (busy !== null || tidyBusy !== null) return;
+      // Nor halfway through an edit — a stroke being drawn, a band being dragged, a gap clean being reviewed, a
+      // preset waiting for its bake (11-10): the edit then finished on the colours it began with, over the undone
+      // ones, and the step undone was lost (the same guard as confirming a cut).
+      if (busy !== null || tidyBusy !== null || pendingTidy || previewCuts || gapReview || strokeRef.current) return;
       if (isUndo) undoAny();
       else redo();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [history, future, model, stripUndo, committedCuts, busy, tidyBusy]);
+  }, [history, future, model, stripUndo, committedCuts, busy, tidyBusy, pendingTidy, previewCuts, gapReview]);
 
   /** Undo has two kinds of change (strip cuts, face colours); this is their order, newest last. */
   function pushUndo(kind: UndoKind): void {
-    undoOrderRef.current = [...undoOrderRef.current.slice(-39), kind];
+    // Room for every list's steps (20 colours + 20 band cuts + 5 meshes): at 40 the oldest kinds fell out of the
+    // order while their lists still held them, and those steps could not be reached (11-10).
+    undoOrderRef.current = [...undoOrderRef.current.slice(-63), kind];
   }
   function dropUndo(kind: UndoKind): void {
     const order = undoOrderRef.current;
@@ -5144,7 +5790,7 @@ export default function App() {
     return null;
   }
 
-  // V B G I C M F pick the tool dock's tools (by physical key, so a Korean input
+  // V B G I C L M F pick the tool dock's tools (by physical key, so a Korean input
   // mode works too); ignored while typing or with a modifier held.  M and F
   // work in every step, the painting tools only where the dock is.  Enter
   // fills the picked patches (with the gap clean on: cleans the gap), unless
@@ -5179,7 +5825,9 @@ export default function App() {
         setFillMode(false);
         setEyedropper(false);
         setGapMode(false);
-      } else if (event.code === "KeyB") {
+        setLineTool(false);
+      } else if (event.code === "KeyL") setLineTool((v) => !v);
+      else if (event.code === "KeyB") {
         setBrushMode((v) => !v || healOnRef.current);
         setHealMode(false);
       } else if (event.code === "KeyH") {
@@ -5212,6 +5860,7 @@ export default function App() {
     if (JSON.stringify(tidy) === JSON.stringify(normaliseCuts(stripData, committedCuts))) return;
     setStripUndo((prev) => [...prev.slice(-19), committedCuts]);
     pushUndo("strip");
+    dropRedo();
     setToast(describeStripChange(committedGroups, groupsFromCuts(stripData, tidy)));
     setPreviewCuts(null);
     setSettings((prev) => ({
@@ -5231,9 +5880,16 @@ export default function App() {
       stripByModel: { ...prev.stripByModel, [stripKey]: stripStore(targetGroups, previous, prev.stripByModel[stripKey]?.pins, prev.stripByModel[stripKey]?.from) },
     }));
   }
+  /** A new edit: the steps undone before it are gone (a redo would put back their band cuts over this one, 11-10). */
+  function dropRedo(): void {
+    setFuture([]);
+    meshRedoRef.current = [];
+    redoOrderRef.current = [];
+  }
   function relayoutStrip(): void {
     setStripUndo((prev) => [...prev.slice(-19), committedCuts]);
     pushUndo("strip");
+    dropRedo();
     setPreviewCuts(null);
     setSettings((prev) => {
       const next = { ...prev.stripByModel };
@@ -5317,6 +5973,8 @@ export default function App() {
         // A face changed when the tidy moved it to another group; everything else keeps its colour.
         const keep = limitTidyToPicked(adjacency, options.limitTo, (f) => result.groups[f] !== labelToGroup[labels[f]]);
         const limited = model.triangleColors.map((colour, f) => (keep[f] ? next[f] : colour));
+        // Nothing moved: no step — it took one, and the steps to redo with it (11-10).
+        if (sameColourValues(model.triangleColors, limited)) return model.triangleColors;
         keepGroupsFor(model.triangleColors, limited);
         applyColours(model, limited, { keepSelection: true });
         return limited;
@@ -5339,8 +5997,12 @@ export default function App() {
       // Every group keeps its band under its one colour: left as they were, the spectrum's cuts (shares of each
       // family's area) fall elsewhere on the few colours left, and a group lands in its neighbour's band
       // (11-04: the face's tan in the protected orange's — the face turned orange).
-      keepGroupsFor(model.triangleColors, next);
-      applyColours(model, next);
+      // The same colours again (tidy pressed twice): no step, no redo lost (11-10).
+      const unchanged = sameColourValues(model.triangleColors, next);
+      if (!unchanged) {
+        keepGroupsFor(model.triangleColors, next);
+        applyColours(model, next);
+      }
       setStatus(
         t("status.mergeDone", {
           from: palette.length,
@@ -5352,7 +6014,7 @@ export default function App() {
           islands: result.stats.absorbedIslands,
         }),
       );
-      return next;
+      return unchanged ? model.triangleColors : next;
     } catch (err) {
       setStatus(t("status.error", { message: err instanceof Error ? err.message : String(err) }));
       return null;
@@ -5367,14 +6029,30 @@ export default function App() {
   // ------------------------------------------------------------------
   useEffect(() => {
     void aiStatus().then(setLocalAi);
-    void dataGet<TidyLogEntry[]>("tidy-chat").then((saved) => {
-      if (Array.isArray(saved)) setTidyLog(saved.slice(-200));
-      tidyLogLoaded.current = true;
-    });
-    void dataGet<Record<string, StoredPartMap>>("part-maps").then((saved) => {
-      if (saved && typeof saved === "object" && !Array.isArray(saved)) setPartMaps(saved);
-      partMapsLoaded.current = true;
-    });
+    // Unread — the folder not answering, a broken file with no copy before it — nothing is written over them this
+    // session (11-10: an unread log or map was taken as empty and the next save wrote over it).
+    const readable = (read: { failed: boolean; broken: boolean; value: unknown }) => !read.failed && !(read.broken && read.value === null);
+    void dataRead<TidyLogEntry[]>("tidy-chat")
+      .then((read) => {
+        if (Array.isArray(read.value)) setTidyLog(read.value.slice(-200));
+        tidyLogLoaded.current = readable(read);
+      })
+      .catch(() => undefined);
+    void dataRead<Record<string, StoredPartMap>>("part-maps")
+      .then((read) => {
+        const saved = read.value;
+        if (saved && typeof saved === "object" && !Array.isArray(saved)) setPartMaps(saved);
+        partMapsLoaded.current = readable(read);
+      })
+      .catch(() => undefined);
+    // ✏️ Guide lines kept (none yet = an empty store).
+    void dataRead<Record<string, StoredGuides>>("guide-lines")
+      .then((read) => {
+        const saved = read.value;
+        if (saved && typeof saved === "object" && !Array.isArray(saved)) guideStoreRef.current = saved;
+        if (readable(read)) setGuideStoreReady(true);
+      })
+      .catch(() => undefined);
   }, []);
   useEffect(() => {
     if (!partMapsLoaded.current) return;
@@ -5396,6 +6074,37 @@ export default function App() {
   }, [tidyBusy !== null]);
 
   const tidyModelName = sourceInfo?.fileName ?? model?.name ?? "";
+
+  // ✏️ Guide lines kept with the work (11-05, the owner: "저장되게 해줘"): by the model's name, as the part maps are.
+  // A model opened (or reloaded) takes back its lines when its faces are the same as when they were drawn; other faces
+  // (another file of that name, the faces cut anew) start with none.
+  useEffect(() => {
+    const current = modelRef.current;
+    guideBuilderRef.current = null;
+    if (!current || !guideStoreReady) {
+      guideShownForRef.current = null;
+      setGuideLines((prev) => (prev.length > 0 ? [] : prev));
+      return;
+    }
+    guideShownForRef.current = tidyModelName;
+    setGuideLines(unpackGuides(guideStoreRef.current[tidyModelName], current.triangles.length) ?? []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [model?.triangles, tidyModelName, guideStoreReady, guideTakenNonce]);
+  // Every change is kept as it is made (a line drawn, taken back, cleared) — not mid-stroke.
+  useEffect(() => {
+    const current = modelRef.current;
+    const name = guideShownForRef.current;
+    if (!current || name === null || guideBuilderRef.current) return;
+    const packed = packGuides(guideLines, current.triangles.length);
+    const had = guideStoreRef.current[name];
+    if (packed.strokes.length === 0 ? !had : had && JSON.stringify(had) === JSON.stringify(packed)) return;
+    const store = { ...guideStoreRef.current };
+    if (packed.strokes.length === 0) delete store[name];
+    else store[name] = packed;
+    guideStoreRef.current = store;
+    void dataSet("guide-lines", store);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [guideLines]);
 
   /** The newest AI change still waiting for ✅ (shown over the views too). */
   const aiPreview = useMemo(() => {
@@ -5502,8 +6211,8 @@ export default function App() {
     for (let f = 0; f < partOfFace.length; f++) if (partOfFace[f] >= 0) byPart[partOfFace[f]].push(f);
     for (const handle of editedViewers()) byPart.forEach((faces, p) => handle.setFaceColours(Int32Array.from(faces), hexToRgb(PART_TINTS[p % PART_TINTS.length])));
     return () => {
-      const current = modelRef.current;
-      if (current) setModel({ ...current });
+      // The views show the model's colours again (the part tints were painted only there).
+      setColourEpoch((n) => n + 1);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [partView, model?.triangleColors, model?.triangles, partMaps, tidyModelName]);
@@ -5575,7 +6284,8 @@ export default function App() {
   function creasesFor(current: MeshModel): { geometry: CreaseGeometry; concavity: Float32Array } {
     const held = creaseRef.current;
     if (held && held.triangles === current.triangles) return held;
-    const geometry = creaseGeometry(current.vertices, current.triangles);
+    // The face geometry's own centres and normals (the same numbers; a second copy was 110MB on 4.6M faces — 11-09).
+    const geometry = faceGeometryFor(current);
     const concavity = faceConcavity(adjacencyFor(current), geometry);
     creaseRef.current = { triangles: current.triangles, geometry, concavity };
     return creaseRef.current;
@@ -5709,6 +6419,34 @@ export default function App() {
 
   /** Loose pieces of the mesh (what "split loose pieces" would write apart). */
   const piecesRef = useRef<{ triangles: MeshModel["triangles"]; count: number } | null>(null);
+
+  /**
+   * A new model or a new start: the last model's caches go (11-09: after the AI and the part map on a 4.6M-face model
+   * they kept several hundred MB — and its triangles — alive into the next model). Each is rebuilt when needed; all
+   * of them check their mesh before use, so nothing is lost but time. The last export's file goes too: "download
+   * again" fetched the previous model's file.
+   */
+  function forgetModelCaches(): void {
+    shapeCellsRef.current = null;
+    creaseRef.current = null;
+    ownLabRef.current = null;
+    partFacesRef.current = null;
+    pitsRef.current = null;
+    focusRef.current = null;
+    autoFocusRef.current = null;
+    piecesRef.current = null;
+    strokePatchRef.current = null;
+    tidyStableShotsRef.current = null;
+    focusByEntryRef.current.clear();
+    autoFocusByEntryRef.current.clear();
+    faceColourIndexRef.current = null;
+    const kept = unfoldKeptRef.current;
+    kept.triangles = null;
+    kept.bytes = 0;
+    kept.entries.clear();
+    setLastExport(null);
+    forgetCutModel();
+  }
   function piecesOfMesh(current: MeshModel): number {
     const held = piecesRef.current;
     if (held && held.triangles === current.triangles) return held.count;
@@ -6472,8 +7210,14 @@ export default function App() {
     if (saved.historyTop !== undefined) {
       // Back to before the tidy, its own colour steps (the paint, the bake) leave the history with it: ↩ again goes
       // to what came before the tidy — not back to its result, as when the undo itself was a step (11-04).
-      const at = saved.historyTop === null ? 0 : history.lastIndexOf(saved.historyTop) + 1;
-      const drop = at > 0 || saved.historyTop === null ? history.length - at : 0;
+      // Not found: either the steps before the tidy were trimmed off the front (20 or, saving memory, 8 steps
+      // later) — then every step left came after it and goes too (11-10: they stayed, and ⌘Z brought the tidy's
+      // result back) — or the history was undone back past the tidy (its top is the model or in the future):
+      // what is left came before it, and stays.
+      const found = saved.historyTop === null ? -1 : history.lastIndexOf(saved.historyTop);
+      const behind = saved.historyTop !== null && found < 0 && (model.triangleColors === saved.historyTop || future.includes(saved.historyTop));
+      const at = found + 1;
+      const drop = behind ? 0 : history.length - at;
       if (model.triangleColors !== saved.colours) {
         setModel({ ...model, triangleColors: saved.colours, stats: { ...model.stats, uniqueFaceColors: countUniqueColours(saved.colours) } });
         forgetRecipeUndo();
@@ -7484,6 +8228,7 @@ ${lines.join("\n")}`).catch(() => null);
       };
       setTidyLog((prev) => [...prev, entry]);
       autoFocusByEntryRef.current.set(entry.id, autoFocusRef.current);
+      keepNewest(autoFocusByEntryRef.current, KEPT_ANSWER_MAPS);
       if (lines.length > 0 && sameMesh) applyPlan(changes, entry.id, t("tidy.byAiPreview"), lines, []);
     } catch (err) {
       const stop = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
@@ -7600,7 +8345,10 @@ ${lines.join("\n")}`).catch(() => null);
         dropped: dropped.length ? dropped : undefined,
       };
       setTidyLog((prev) => [...prev, entry]);
-      if (focusRef.current) focusByEntryRef.current.set(entry.id, focusRef.current);
+      if (focusRef.current) {
+        focusByEntryRef.current.set(entry.id, focusRef.current);
+        keepNewest(focusByEntryRef.current, KEPT_ANSWER_MAPS);
+      }
       if (lines.length > 0 && sameMesh) applyPlan(changes, entry.id, t("tidy.byAiPreview"), lines, dropped);
     } catch (err) {
       const stopped = controller.signal.aborted || (err instanceof DOMException && err.name === "AbortError");
@@ -7628,7 +8376,9 @@ ${lines.join("\n")}`).catch(() => null);
     const last = history[history.length - 1];
     if (!model || !last || last.length !== model.triangles.length) return;
     cutsBackWith(last);
-    setFuture((prev) => [...prev.slice(-19), model.triangleColors]);
+    // Not cut to the step limit: history and future share it, and cutting here (memory saving turned on midway)
+    // dropped the newest state and left the redo order pointing past the list (11-10).
+    setFuture((prev) => [...prev, model.triangleColors]);
     setModel({ ...model, triangleColors: last, stats: { ...model.stats, uniqueFaceColors: countUniqueColours(last) } });
     setHistory((prev) => prev.slice(0, -1));
     dropUndo("colours");
@@ -7643,7 +8393,7 @@ ${lines.join("\n")}`).catch(() => null);
     if (!model || !next || next.length !== model.triangles.length) return;
     redoOrderRef.current = redoOrderRef.current.slice(0, -1);
     cutsBackWith(next);
-    setHistory((prev) => [...prev.slice(-19), model.triangleColors]);
+    setHistory((prev) => [...prev, model.triangleColors].slice(-colourUndoLimit));
     pushUndo("colours");
     setModel({ ...model, triangleColors: next, stats: { ...model.stats, uniqueFaceColors: countUniqueColours(next) } });
     setFuture((prev) => prev.slice(0, -1));
@@ -7896,8 +8646,9 @@ ${lines.join("\n")}`).catch(() => null);
       setSettings((prev) => ({ ...prev, stripByModel: { ...prev.stripByModel, [stripKey]: stored } }));
       const originalBefore = originalColoursRef.current;
       const originalAfter = originalBefore && originalBefore.length === before.triangles.length ? Array.from(mesh.originalFace, (f) => originalBefore[f]) : null;
-      if (meshUndoRef.current.length >= MESH_UNDO_LIMIT) forgetOldestUndo("mesh");
-      meshUndoRef.current = [...meshUndoRef.current.slice(-(MESH_UNDO_LIMIT - 1)), { before, after, originalBefore, originalAfter, shown: layer }];
+      const meshLimit = lowMemoryOn ? MESH_UNDO_LIMIT_LOW : MESH_UNDO_LIMIT;
+      for (let drop = meshUndoRef.current.length + 1 - meshLimit; drop > 0; drop--) forgetOldestUndo("mesh");
+      meshUndoRef.current = [...meshUndoRef.current, { before, after, originalBefore, originalAfter, shown: layer }].slice(-meshLimit);
       meshRedoRef.current = [];
       redoOrderRef.current = [];
       setFuture([]);
@@ -8037,15 +8788,14 @@ ${lines.join("\n")}`).catch(() => null);
       const prusa = printer.slicer === "prusa";
       const { model, groups } = await exportFaces(source);
       const fileName = (e.fileName.trim() || defaultFileName).replace(/\.3mf$/i, "") + ".3mf";
-      const result = await buildPrusa3mfBlob({
+      const options: ExportOptions = {
+        // ⚙ "fast": deflate 1 — the compression itself is quicker (the whole export a little), the file ~8% bigger.
+        compressionLevel: settings.performance.exportCompression === "fast" ? 1 : 6,
         slicer: printer.slicer,
         bambuPrinter: printer.bambuProject,
         fileName,
         templateArrayBuffer: template?.buffer ?? null,
         templateInfo: template?.info ?? null,
-        model,
-        // Each face in its group's colour exactly, matched with no accent rule: the group shown is the group printed.
-        adjustedColors: groupColours(groups, model.triangleColors),
         palette,
         physicalSlots: slots,
         virtualPlan: plan,
@@ -8068,9 +8818,28 @@ ${lines.join("\n")}`).catch(() => null);
         printPresetSupportWord: t("exp.supportPresetSuffix"),
         includePrinterConfig: prusa && e.includePrinterConfig && templateFitsPrinter(printer, template?.info.printerModel),
         effectiveRgbByPaletteIndex: effectiveByIndex,
+      };
+      // Each face in its group's colour exactly, matched with no accent rule: the group shown is the group printed.
+      const adjustedColors = groupColours(groups, model.triangleColors);
+      const showProgress = (fraction: number) => setBusy(t("busy.exportingPct", { pct: Math.round(fraction * 100) }));
+      // ⚙ Off the main thread (the window stays live; 17–20 s frozen on 4.6M faces before — 11-09), unless turned
+      // off or the worker cannot run — then here, as before.
+      let result: Awaited<ReturnType<typeof buildPrusa3mfBlob>> | null = null;
+      if (settings.performance.exportWorker && canExportInWorker()) {
+        try {
+          result = await exportInWorker(model, adjustedColors, options, showProgress);
+        } catch (err) {
+          if (!(err instanceof ExportWorkerUnavailable)) throw err;
+          console.warn("3MF export worker unavailable — writing it on the main thread", err);
+        }
+      }
+      result ??= await buildPrusa3mfBlob({
+        ...options,
+        model,
+        adjustedColors,
         // A big model takes a while to write: the busy line counts it up, and the screen gets a turn between pieces.
         onProgress: async (fraction) => {
-          setBusy(t("busy.exportingPct", { pct: Math.round(fraction * 100) }));
+          showProgress(fraction);
           await new Promise((resolve) => setTimeout(resolve, 0));
         },
       });
@@ -8293,10 +9062,14 @@ ${lines.join("\n")}`).catch(() => null);
     }, 700);
     return () => window.clearTimeout(timer);
   }, [step, guideMode, intro, about, gatherOpen, isBusy]);
-  // While the app works the pointer is "working", not "not allowed" over the buttons it waits with.
+  // While the app works the pointer spins (styles.css), not "not allowed" over the buttons it waits with.
   useEffect(() => {
     document.body.classList.toggle("is-busy", isBusy);
   }, [isBusy]);
+  // Work going on behind (the colour map unfolding a patch, in a worker): the pointer says so too.
+  useEffect(() => {
+    document.body.classList.toggle("is-working", unfolding !== null);
+  }, [unfolding]);
   const canFillPick =
     !isBusy && pickedPatches.length > 0 && Boolean(pickTarget) && !(pickTarget !== "__new__" && pickedHexes.length === 1 && pickTarget === pickedHexes[0]);
   fillPickRef.current = canFillPick ? applyPickColour : null;
@@ -8343,8 +9116,14 @@ ${lines.join("\n")}`).catch(() => null);
     flat: paneLook.flat[slot === 0 ? 0 : 1],
     formLines: formLines && paneLook.flat[slot === 0 ? 0 : 1],
     softEdges: paneLook.soft[slot === 0 ? 0 : 1],
+    pixelRatio: settings.performance.pixelRatio === "auto" ? undefined : settings.performance.pixelRatio,
+    releaseWhenHidden: lowMemoryOn,
+    colourEpoch,
     cornerVertex,
-    brush: brushMode,
+    // ✏️ The guide line tool draws as the brush paints (left drag, right button turns): the views take it as a brush.
+    brush: brushMode || lineTool,
+    crosshair: lineTool,
+    guides: showGuideLines && guideLines.length > 0 ? guideLines : null,
     eyedropper,
     hand,
     background,
@@ -8371,17 +9150,17 @@ ${lines.join("\n")}`).catch(() => null);
     onPick: (face: number | null, info: PickInfo) => void handlePick(face, info),
     onHoverFace: hoverFace,
     onHoverHit: hoverHit3D,
-    onBrushHover: brushHover3D,
-    onBrushStart: (hit: ViewerHit | null) => brushStart3D(hit, slot),
-    onBrushDrag: (hit: ViewerHit | null) => brushDrag3D(hit, slot),
-    onBrushEnd: endStroke,
+    onBrushHover: (hit: ViewerHit | null) => (lineToolRef.current ? hoverHit3D(hit) : brushHover3D(hit)),
+    onBrushStart: (hit: ViewerHit | null) => (lineToolRef.current ? guideStart3D(hit) : brushStart3D(hit, slot)),
+    onBrushDrag: (hit: ViewerHit | null) => (lineToolRef.current ? guideDrag3D(hit) : brushDrag3D(hit, slot)),
+    onBrushEnd: () => (lineToolRef.current || guideBuilderRef.current ? guideEnd3D() : endStroke()),
   });
   const autosaveLabel = !settings.rememberWork
     ? t("autosave.off")
     : autosave.state === "saving"
       ? t("autosave.saving")
       : autosave.state === "failed"
-        ? t("autosave.failed")
+        ? t(storageMode === "folder" ? "autosave.failedFolder" : "autosave.failed")
         : autosave.state === "saved"
           ? t("autosave.saved", {
               time: new Date(autosave.at ?? Date.now()).toLocaleTimeString(lang === "ko" ? "ko-KR" : "en-GB", { hour: "2-digit", minute: "2-digit" }),
@@ -8438,8 +9217,27 @@ ${lines.join("\n")}`).catch(() => null);
   const resultMode: PreviewMode = compareStep ? (previewMode === "source" ? "palette" : previewMode) : step === 4 ? "print" : singleMode;
   // The colour map paints what the result view shows (it used to show the faces' own colours, like the original view).
   mapLookRef.current = { palette, labels, mode: resultMode, effective: effectiveByIndex };
+  /** What the colour map was last painted for in full: the palette, the look, and (print) the printed colours. */
+  const mapPaintedRef = useRef<{ paletteKey: string; mode: PreviewMode; effective: string } | null>(null);
   useEffect(() => {
+    const held = labelsRef.current;
+    const effective = resultMode === "print" ? [...effectiveByIndex].map(([i, rgb]) => `${i}:${rgb[0]},${rgb[1]},${rgb[2]}`).join(";") : "";
+    const now = { paletteKey: held?.paletteKey ?? "", mode: resultMode, effective };
+    const last = mapPaintedRef.current;
+    mapPaintedRef.current = now;
+    // An exact brush stroke and nothing else: the map painted its faces as the stroke went, in the colour they keep —
+    // all 3072² of it painted again after every stroke was ~0.1 s on 4.6M faces (C-A, 11-09).
+    const patch = strokePatchRef.current;
+    const strokeOnly =
+      model !== null && patch !== null && patch.exact && patch.to === model.triangleColors && held?.stroke === patch && held.labels === labels &&
+      last !== null && last.paletteKey === now.paletteKey && last.mode === now.mode && last.effective === now.effective;
+    if (strokeOnly && patch) {
+      // The palette look shows the brush colour itself; the print and source looks another — those faces again.
+      if (resultMode !== "palette") mapRef.current?.repaintFaces(patch.faces);
+      return;
+    }
     setColoursVersion((v) => v + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [palette, labels, resultMode, effectiveByIndex]);
   /**
    * The cut pieces for the result view.  Right after a change the last cut
@@ -8507,6 +9305,13 @@ ${lines.join("\n")}`).catch(() => null);
     auto: t("exp.coordAuto"),
   };
   const layerChoices = [...new Set([0.1, 0.15, 0.2, 0.25, ...(layerHeightMm ? [layerHeightMm] : [])])].sort((a, b) => a - b);
+  // The stage toolbar keeps to one line: when it would wrap, the view direction shows as its cube alone and 04's
+  // preview layer heights as a short list (one line = 10 + 30 + 10 px).
+  const mapBrush = useMemo(
+    () => ({ active: brushMode, radiusPx: shownAtlas ? brushRadius * shownAtlas.scale : 4, hex: brushHex, innerPx: healMode && shownAtlas ? healSize * shownAtlas.scale : undefined }),
+    [brushMode, shownAtlas, brushRadius, brushHex, healMode, healSize],
+  );
+  const [toolbarNarrow, stageToolbarRef] = useNarrowRow(`${step}|${lang}|${exportView}|${model ? 1 : 0}`, 60);
 
   // Step 03's side panels do not depend on hover; building them only when
   // their data changes keeps a mouse-over from re-rendering them.  Their
@@ -8574,8 +9379,17 @@ ${lines.join("\n")}`).catch(() => null);
           <div className="file-chip" title={sourceInfo.fileName}>
             <b>{sourceInfo.fileName}</b>
             <span className="mono">{t("top.faces", { n: model.triangles.length.toLocaleString() })}</span>
-            <span className={`save-dot ${saveDot}`} aria-hidden="true" />
-            <span className="save-text">{autosaveLabel}</span>
+            <span className={`save-dot ${saveDot}`} role="img" aria-label={autosaveLabel} title={autosaveLabel} />
+            {/* Narrower windows show the dot alone; a failure keeps short words (its whole sentence in the tooltip). */}
+            {saveDot === "failed" ? (
+              <button type="button" className="save-text failed save-retry" title={autosaveLabel} onClick={() => retrySave()}>
+                {t("autosave.failedShort")}
+              </button>
+            ) : (
+              <span className="save-text" title={autosaveLabel}>
+                {autosaveLabel}
+              </span>
+            )}
             <button type="button" className="chip-btn save-file" disabled={isBusy || workFileSave === "saving"} title={t("load.saveWorkHint")} onClick={() => void saveWorkFile()}>
               <Icon name="download" size={12} stroke={1.6} />
               <span>{workFileSave === "saving" ? t("load.saving") : workFileSave === "saved" ? t("load.saved") : t("top.saveWork")}</span>
@@ -8585,11 +9399,11 @@ ${lines.join("\n")}`).catch(() => null);
         <StepNav steps={stepInfo} current={step} onChange={changeStep} />
         <div className="top-actions">
           {/* how many steps ⌘Z can still take back (colour changes and strip cuts), and ⇧⌘Z bring again */}
-          <button type="button" className="icon-btn with-count" data-guide="undo" aria-label={t("app.undo")} title={`${t("top.undo")} · ${t("top.stepsLeft", { n: history.length + stripUndo.length + meshUndoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || (history.length === 0 && stripUndo.length === 0 && meshUndoRef.current.length === 0)} onClick={undoAny}>
+          <button type="button" className="icon-btn with-count" data-guide="undo" aria-label={t("app.undo")} title={`${t("top.undo")} · ${t("top.stepsLeft", { n: history.length + stripUndo.length + meshUndoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || pendingTidy !== null || (history.length === 0 && stripUndo.length === 0 && meshUndoRef.current.length === 0)} onClick={undoAny}>
             <Icon name="undo" />
             {history.length + stripUndo.length + meshUndoRef.current.length > 0 && <span className="step-count mono">{history.length + stripUndo.length + meshUndoRef.current.length}</span>}
           </button>
-          <button type="button" className="icon-btn with-count" aria-label={t("app.redo")} title={`${t("top.redo")} · ${t("top.stepsLeft", { n: future.length + meshRedoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || (future.length === 0 && meshRedoRef.current.length === 0)} onClick={redo}>
+          <button type="button" className="icon-btn with-count" aria-label={t("app.redo")} title={`${t("top.redo")} · ${t("top.stepsLeft", { n: future.length + meshRedoRef.current.length })}`} disabled={isBusy || tidyBusy !== null || pendingTidy !== null || (future.length === 0 && meshRedoRef.current.length === 0)} onClick={redo}>
             <Icon name="redo" />
             {future.length > 0 && <span className="step-count mono">{future.length}</span>}
           </button>
@@ -8599,7 +9413,15 @@ ${lines.join("\n")}`).catch(() => null);
             <span>{t("guide.open")}</span>
           </button>
           <Menu trigger={<Icon name="help" />} label={t("top.glossary")} title={t("top.glossary")} className="glossary" guide="glossary">
-            <Glossary />
+            {(close) => (
+              <>
+                <button type="button" className="menu-item guidebook-open" onClick={() => { setBookOpen(true); close(); }}>
+                  {t("guidebook.open")}
+                </button>
+                <div className="menu-sep" />
+                <Glossary />
+              </>
+            )}
           </Menu>
           <Menu trigger={<Icon name="settings" />} label={t("top.settings")} title={t("top.settings")} guide="settings">
             {(close) => (
@@ -8645,9 +9467,14 @@ ${lines.join("\n")}`).catch(() => null);
                   {t("app.defaults")}
                 </button>
                 <div className="menu-sep" />
+                <button type="button" className="menu-item" onClick={() => { setPerfOpen(true); close(); }}>
+                  {t("app.performance")}
+                </button>
+                <div className="menu-sep" />
                 <button type="button" className="menu-item" onClick={() => { setAbout(true); close(); }}>
                   {t("app.about")}
                 </button>
+                <div className="menu-label support">{t("app.support")}</div>
                 {supportLinks(lang).map((link) => (
                   <a key={link.id} className="menu-item" href={link.href} target="_blank" rel="noopener noreferrer" onClick={close}>
                     <span>{t(link.id === "toonation" ? "support.toonation" : "support.paypal")}</span>
@@ -8708,8 +9535,12 @@ ${lines.join("\n")}`).catch(() => null);
                 highlight={tidyHighlight}
               />
             )}
+            {/* 03's own job first — the filaments in the printer — then the tidy and its consult (11-09: the slots
+                were ~780px down the panel). */}
+            {step === 3 && mixPanels}
             {(step === 2 || step === 3) && model && (
               <TidyPanel
+                place={step === 3 ? 3 : 2}
                 scope={tidyScope}
                 onScope={setTidyScope}
                 area={tidyArea}
@@ -8807,7 +9638,6 @@ ${lines.join("\n")}`).catch(() => null);
                 }
               />
             )}
-            {step === 3 && mixPanels}
             {step === 4 && (
               <>
               <ExportSection
@@ -8856,12 +9686,14 @@ ${lines.join("\n")}`).catch(() => null);
                   report: nomadReport,
                 }}
                 onOpenGather={() => setGatherOpen(true)}
+                footHost={exportFootHost}
               />
               {WITH_CLAUDE && model && (
                 <section className="pane-section tidy" aria-label={t("tidy.exportConsult")}>
                   <ConsultBox
                     title={t("tidy.exportConsult")}
                     sub={t("tidy.exportSub")}
+                    foldKey="4"
                     inputId="export-consult-input"
                     ai={aiAvailable}
                     log={tidyLog.filter((entry) => entry.model === tidyModelName && entry.scope === "export")}
@@ -8900,6 +9732,8 @@ ${lines.join("\n")}`).catch(() => null);
               <span className="hint">{t("strip.cleanupFoot")}</span>
             </div>
           )}
+          {/* 04's export button, under the scrolling content like 02's (ExportSection puts it here). */}
+          {step === 4 && <div className="sidebar-foot-host" ref={setExportFootHost} />}
         </aside>
         <div
           className={`splitter${splitterDragging === "left" ? " dragging" : ""}`}
@@ -8917,7 +9751,8 @@ ${lines.join("\n")}`).catch(() => null);
 
         <section ref={stageRef} className="stage" aria-label={t("view.compareAria")} style={{ "--matrix-h": `${(matrixShare * 100).toFixed(2)}%` } as CSSProperties}>
           <GyupaLoader label={busy} />
-          <div className="stage-toolbar">
+          <PointerNote text={busy ?? (unfolding !== null ? t("map.unfolding", { pct: Math.round(unfolding * 100) }) : null)} />
+          <div className={`stage-toolbar${toolbarNarrow ? " narrow" : ""}`} ref={stageToolbarRef}>
             {compareStep ? (
               <>
                 <Segmented
@@ -8951,14 +9786,30 @@ ${lines.join("\n")}`).catch(() => null);
                     { value: "layers", label: t("layers.view") },
                   ]}
                 />
-                {exportView === "layers" && (
-                  <Segmented
-                    label={t("layers.height")}
-                    value={shownLayerHeight}
-                    onChange={setPreviewLayerHeight}
-                    options={layerChoices.map((h) => ({ value: h, label: <span className="mono">{h.toFixed(2)}</span>, title: h === layerHeightMm ? t("layers.heightSet") : t("layers.heightTry") }))}
-                  />
-                )}
+                {exportView === "layers" &&
+                  (toolbarNarrow ? (
+                    <select
+                      className="compact mono layer-height-pick"
+                      aria-label={t("layers.height")}
+                      title={t("layers.height")}
+                      value={shownLayerHeight}
+                      onChange={(e) => setPreviewLayerHeight(Number(e.target.value))}
+                    >
+                      {layerChoices.map((h) => (
+                        <option key={h} value={h}>
+                          {h.toFixed(2)}
+                          {h === layerHeightMm ? " ✓" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <Segmented
+                      label={t("layers.height")}
+                      value={shownLayerHeight}
+                      onChange={setPreviewLayerHeight}
+                      options={layerChoices.map((h) => ({ value: h, label: <span className="mono">{h.toFixed(2)}</span>, title: h === layerHeightMm ? t("layers.heightSet") : t("layers.heightTry") }))}
+                    />
+                  ))}
 
               </>
             ) : (
@@ -8979,11 +9830,11 @@ ${lines.join("\n")}`).catch(() => null);
                 triggerClassName="text-btn"
                 align="right"
                 label={t("view.dirMenu")}
-                title={t("view.dirMenu")}
+                title={`${t("view.dirMenu")} · ${viewLabels.find(([name]) => name === view)?.[1] ?? ""}`}
                 trigger={
                   <>
                     <Icon name="cube" size={14} stroke={1.4} />
-                    {viewLabels.find(([name]) => name === view)?.[1]} ▾
+                    <span className="dir-name">{viewLabels.find(([name]) => name === view)?.[1]} ▾</span>
                   </>
                 }
               >
@@ -9391,6 +10242,21 @@ ${lines.join("\n")}`).catch(() => null);
                 </div>
               )}
             </div>
+            {model && lineTool && (
+              <div className="brush-size-overlay guide-line-bar" title={t("guide.hint")}>
+                <span className="guide-line-swatch" aria-hidden="true" />
+                <span>{guideLines.length > 0 ? t("guide.count", { n: guideLines.length }) : t("guide.empty")}</span>
+                <button type="button" className="link-btn" disabled={guideLines.length === 0} onClick={undoGuideLine}>
+                  ↩ {t("guide.undo")}
+                </button>
+                <button type="button" className="link-btn" disabled={guideLines.length === 0} onClick={clearGuideLines}>
+                  {t("guide.clear")}
+                </button>
+                <label className="link-btn check">
+                  <input type="checkbox" checked={showGuideLines} onChange={(e) => setShowGuideLines(e.target.checked)} /> {t("guide.show")}
+                </label>
+              </div>
+            )}
             {model && brushMode && (
               <div className="brush-size-overlay" title={t("brush.keys")}>
                 <span>{t("brush.sizeShort")}</span>
@@ -9454,24 +10320,56 @@ ${lines.join("\n")}`).catch(() => null);
                 colourOf={colourOfFace}
                 coloursVersion={coloursVersion}
                 masks={atlasMasks}
-                brush={{ active: brushMode, radiusPx: shownAtlas ? brushRadius * shownAtlas.scale : 4, hex: brushHex, innerPx: healMode && shownAtlas ? healSize * shownAtlas.scale : undefined }}
+                brush={mapBrush}
                 eyedropper={eyedropper}
                 hand={hand}
                 background={background}
                 onPick={(face, info) => void handlePick(face, info)}
                 onHover={mapHover}
-                onBrushStart={() => void beginStroke()}
+                onBrushStart={() => {
+                  holdUnfolded();
+                  void beginStroke();
+                }}
                 onBrushPaintAt={paintAtMap}
                 onBrushEnd={endStroke}
-                label={unfolded ? t("map.unfoldLabel", { n: unfolded.pieces }) : t("map.label")}
-                hint={t(unfolded ? "map.unfoldHint" : unfoldOn && pickedPatches.length === 0 ? "map.unfoldPickHint" : "map.hint")}
+                guides={guideMapLines}
+                label={unfolded ? t(unfolded.around ? "map.unfoldAroundLabel" : "map.unfoldLabel", { n: unfolded.pieces }) : t("map.label")}
+                hint={t(unfolded ? (unfolded.around ? "map.unfoldAroundHint" : "map.unfoldHint") : unfoldOn && unfoldPicks.length === 0 ? "map.unfoldPickHint" : "map.hint")}
                 emptyLabel={t("map.empty")}
                 buildingLabel={t("busy.atlas")}
-                busyLabel={unfolding !== null ? t("map.unfolding", { pct: Math.round(unfolding * 100) }) : (unfoldNote ?? undefined)}
+                busyLabel={unfolding !== null ? t("map.unfolding", { pct: Math.round(unfolding * 100) }) : undefined}
+                note={unfoldNote ?? undefined}
                 tools={
-                  <button type="button" className="link-btn" aria-pressed={unfoldOn} title={t("map.unfoldHintToggle")} onClick={() => setUnfoldOn(!unfoldOn)}>
-                    🧩 {t("map.unfold")}
-                  </button>
+                  // The button says what it does now (11-05, the owner: 펼친 채로는 '되돌아가는' 버튼인데 이름이 '펼치기'):
+                  // a pick shown unfolded folds back to the whole map, else it unfolds.
+                  <>
+                    {unfoldOn && unfoldPicks.length > 0 ? (
+                      <button type="button" className="link-btn" title={t("map.foldHint")} onClick={() => setUnfoldOn(false)}>
+                        ↩ {t("map.fold")}
+                      </button>
+                    ) : (
+                      <button type="button" className="link-btn" aria-pressed={unfoldOn} title={t(unfoldOn ? "map.unfoldOnHint" : "map.unfoldHintToggle")} onClick={() => setUnfoldOn(!unfoldOn)}>
+                        🧩 {t(unfoldOn ? "map.unfoldOn" : "map.unfold")}
+                      </button>
+                    )}
+                    {unfoldOn && (
+                      <label className="link-btn check" title={t("map.unfoldAroundHintToggle")}>
+                        <input type="checkbox" checked={unfoldAround} onChange={(e) => setUnfoldAround(e.target.checked)} /> {t("map.unfoldAround")}
+                      </label>
+                    )}
+                    {unfoldOn && unfoldAround && (
+                      <label className="link-btn around-width" title={t("map.aroundWidthHint")}>
+                        {t("map.aroundWidth")}
+                        <input type="range" min={0} max={AROUND_WIDTHS.length - 1} step={1} value={aroundWidthShown} onPointerDown={holdAroundWidth} onChange={(e) => moveAroundWidth(Number(e.target.value))} />
+                        <b>×{AROUND_WIDTHS[aroundWidthShown]}</b>
+                      </label>
+                    )}
+                    {guideLines.length > 0 && (
+                      <label className="link-btn check" title={t("guide.mapToggleHint")}>
+                        <input type="checkbox" checked={showGuideLines} onChange={(e) => setShowGuideLines(e.target.checked)} /> ✏️ {t("guide.mapToggle", { n: guideLines.length })}
+                      </label>
+                    )}
+                  </>
                 }
               />
             )}
@@ -9642,7 +10540,7 @@ ${lines.join("\n")}`).catch(() => null);
           )}
           {showDock && (
             <div className="tool-dock" role="toolbar" aria-label={t("tool.aria")}>
-              <button type="button" aria-pressed={!brushMode && !fillMode && !eyedropper && !gapMode} title={t("pick.hint")} onClick={() => { setBrushMode(false); setHealMode(false); setFillMode(false); setEyedropper(false); setGapMode(false); }}>
+              <button type="button" aria-pressed={!brushMode && !fillMode && !eyedropper && !gapMode && !lineTool} title={t("pick.hint")} onClick={() => { setBrushMode(false); setHealMode(false); setFillMode(false); setEyedropper(false); setGapMode(false); setLineTool(false); }}>
                 <Icon name="select" size={17} stroke={1.4} />
                 <span>
                   {t("tool.select")} <span className="key">V</span>
@@ -9684,6 +10582,12 @@ ${lines.join("\n")}`).catch(() => null);
                 <Icon name="gap" size={17} stroke={1.4} />
                 <span>
                   {t("tool.gap")} <span className="key">C</span>
+                </span>
+              </button>
+              <button type="button" aria-pressed={lineTool} title={t("guide.hint")} onClick={() => setLineTool((v) => !v)}>
+                <Icon name="guide" size={17} stroke={1.4} />
+                <span>
+                  {t("tool.guide")} <span className="key">L</span>
                 </span>
               </button>
               <span className="dock-sep" aria-hidden="true" />
@@ -9779,15 +10683,15 @@ ${lines.join("\n")}`).catch(() => null);
 
       <footer className={`statusbar${isBusy ? " busy" : ""}`} role="status" aria-live="polite">
         <span className="status-dot" aria-hidden="true" />
-        <span className="label">{isBusy ? busy : t("status.label")}</span>
+        <span className="label">{isBusy ? busy : ""}</span>
         <span className="message" title={status}>{status}</span>
         {memoryMb !== null && (
           <span className={`memory-use${memoryMb > 2500 ? " warn" : ""}`} title={t("status.memoryHint")}>
             {t("status.memory", { gb: (memoryMb / 1000).toFixed(memoryMb >= 1000 ? 1 : 2) })}
           </span>
         )}
-        <span className="storage-mode" title={t(storageMode === "folder" ? "storage.folderHint" : "storage.browserHint")}>
-          {t(storageMode === "folder" ? "storage.folder" : "storage.browser")}
+        <span className={`storage-mode${storageWarn ? " warn" : ""}`} title={t(storageMode === "folder" ? "storage.folderHint" : storageWarn ? "storage.browserWarnHint" : "storage.browserHint")}>
+          {t(storageMode === "folder" ? "storage.folder" : storageWarn ? "storage.browserWarn" : "storage.browser")}
         </span>
         <a className="license-link" href={SOURCE_URL} target="_blank" rel="noopener noreferrer" title={t("license.hint")}>
           {t("license.short")}
@@ -9800,6 +10704,16 @@ ${lines.join("\n")}`).catch(() => null);
       <GatherDialog open={gatherOpen} onClose={() => setGatherOpen(false)} />
       <GuideTour mode={guideMode} onMode={setGuideMode} step={step} onStep={changeStep} />
       {intro && <Intro onDone={endIntro} hold={startupLoading} />}
+      {bookOpen && <GuideBook onClose={closeBook} />}
+      {perfOpen && (
+        <PerformanceDialog
+          value={settings.performance}
+          onChange={(next) => patchSettings("performance", next)}
+          onClose={closePerf}
+          lowMemoryOn={lowMemoryOn}
+          faces={model ? model.triangles.length : null}
+        />
+      )}
       {about && <Intro onDone={endAbout} about={{ note: `${t("app.subtitle")} · ${t("top.version", { v: APP_VERSION })} · ${t("license.short")}` }} />}
     </div>
     </LangContext.Provider>

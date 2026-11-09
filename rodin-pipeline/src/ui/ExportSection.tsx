@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import { MAX_PAINTABLE_EXTRUDER_ID } from "@core/paintCodes";
 import type { Template3mfInfo } from "@core/template3mf";
 import { combineTurns, sameTurn, turnMode, turnRows, type FixedCoordinateMode } from "@core/orientation";
@@ -72,6 +74,134 @@ export function faceOnBed(mode: ExportSettings["coordinateMode"], base: FixedCoo
   return faceChoices(base).find((face) => sameTurn(face.mode, mode))?.label ?? null;
 }
 
+/** The printer list, in its groups (most used first). */
+function PrinterPicker({ value, disabled, onChange, label }: { value: string; disabled: boolean; onChange: (id: string) => void; label: string }) {
+  const t = useT();
+  return (
+    <select className="printer-select" value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)} aria-label={label}>
+      {PRINTER_GROUPS.map((group) => (
+        <optgroup key={group.key} label={t(group.key)}>
+          {PRINTERS.filter(group.match).map((entry) => (
+            <option key={entry.id} value={entry.id}>
+              {printerLabel(entry, t)}
+            </option>
+          ))}
+        </optgroup>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * "이 프린터로 내보낼까요?" (11-10): the printer decides the file's format, and a file for the XL opened in Bambu Studio
+ * all in one colour because the picker still said XL from the print before. So the export button asks first: the
+ * printer named large, where its file opens, its slots, and the picker right there to change it. A change shows what
+ * it changed in the plan; a printer the plan does not fit cannot be exported to from here either.
+ */
+function ExportConfirm({
+  printer,
+  openHint,
+  facts,
+  slots,
+  fileLabel,
+  failures,
+  blocked,
+  notice,
+  busy,
+  onChoosePrinter,
+  onConfirm,
+  onClose,
+}: {
+  printer: Printer;
+  openHint: string;
+  facts: string[];
+  slots: Array<{ label: string; hex: string; name: string }>;
+  fileLabel: string;
+  failures: string[];
+  blocked: boolean;
+  notice: { changes: string[]; undo: () => void } | null;
+  busy: boolean;
+  onChoosePrinter: (id: string) => void;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const t = useT();
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return createPortal(
+    <div
+      className="dialog-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t("exp.confirmTitle")}
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="export-confirm">
+        <header className="export-confirm-head">
+          <div>
+            <h2>{t("exp.confirmTitle")}</h2>
+            <p className="muted">{t("exp.confirmSub")}</p>
+          </div>
+          <button type="button" className="icon-btn" aria-label={t("exp.confirmCancel")} title={t("exp.confirmCancel")} onClick={onClose}>
+            <Icon name="close" />
+          </button>
+        </header>
+        <div className="export-confirm-printer">
+          <b className="export-confirm-name">{printerLabel(printer, t)}</b>
+          <span className="export-confirm-facts">{[openHint, ...facts].join(" · ")}</span>
+          {slots.length > 0 && (
+            <span className="slot-check-list">
+              {slots.map((slot) => (
+                <span key={slot.label} className="slot-check-item" title={slot.name}>
+                  <i style={{ background: slot.hex }} aria-hidden="true" />
+                  {slot.label}
+                </span>
+              ))}
+            </span>
+          )}
+          <span className="export-confirm-file">{fileLabel}</span>
+        </div>
+        <label className="export-confirm-switch">
+          <span>{t("exp.confirmOther")}</span>
+          <PrinterPicker value={printer.id} disabled={busy} onChange={onChoosePrinter} label={t("exp.confirmOther")} />
+        </label>
+        {notice && (
+          <div className="note printer-notice" role="status">
+            <span>
+              {t("exp.printerChanged")} {notice.changes.join(" · ")}
+            </span>
+            <button type="button" className="btn small" onClick={notice.undo}>
+              {t("exp.printerUndo")}
+            </button>
+          </div>
+        )}
+        {failures.map((failure) => (
+          <div key={failure} className="warn">
+            {failure}
+          </div>
+        ))}
+        <footer className="export-confirm-foot">
+          <button type="button" className="btn ghost" onClick={onClose}>
+            {t("exp.confirmCancel")}
+          </button>
+          <button type="button" className="btn primary" data-export-confirm="" autoFocus disabled={busy || blocked} onClick={onConfirm}>
+            <Icon name="download" size={14} stroke={1.7} />
+            {t("exp.confirmGo")}
+          </button>
+        </footer>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 export function ExportSection({
   settings,
   orientationBase,
@@ -99,6 +229,7 @@ export function ExportSection({
   slotColours,
   slotsAreDefault,
   onOpenGather,
+  footHost,
 }: {
   settings: ExportSettings;
   /** How the loaded file stands by itself (OBJ Y-up, 3MF as is): what the face choices count from. */
@@ -155,8 +286,15 @@ export function ExportSection({
   slotsAreDefault?: boolean;
   /** Opens 모아 뽑기 (several finished files on one bed). */
   onOpenGather: () => void;
+  /**
+   * Where the export button goes: the panel's foot under its scrolling content, so it is always in view (at the end
+   * of the content it was off screen even at 1920×1080 — 11-09). Inline until the foot is there.
+   */
+  footHost?: HTMLElement | null;
 }) {
   const t = useT();
+  // The export button asks which printer first (ExportConfirm).
+  const [asking, setAsking] = useState(false);
   const set = (patch: Partial<ExportSettings>) => onChange({ ...settings, ...patch });
   const faces = faceChoices(orientationBase);
   const choices: string[] = ["blender-y-up", "keep", "stand-up", "auto", "x-up", ...faces.map((face) => face.mode)];
@@ -194,6 +332,14 @@ export function ExportSection({
   const appName = printer.app || t("exp.printerAnyApp");
   // The bed follows the printer; a hand-typed one is pointed out (catch-all entries have no bed of their own).
   const bedEdited = printer.name !== "" && !(prusa && templateFits) && (settings.bedX !== printer.bed.x || settings.bedY !== printer.bed.y);
+  // Where the file opens, said under the export button and in its question.
+  const openHint = prusa ? t("exp.openHint") : bambuProject ? t("exp.openHintBambu") : printer.app ? t("exp.openHintApp", { app: printer.app }) : t("exp.openHintAny");
+  const confirmFacts: string[] = [];
+  if (fdm && check) {
+    confirmFacts.push(t("exp.confirmSlots", { p: check.physicalCount }));
+    if (check.virtualIds.length > 0) confirmFacts.push(t(bambuProject ? "exp.confirmMixesBambu" : "exp.confirmMixes", { m: check.virtualIds.length }));
+  }
+  if (colourFormat) confirmFacts.push(FORMAT_LABEL[colourFormat]);
   return (
     <>
       <section className="pane-section" aria-label={t("exp.printerTitle")}>
@@ -203,17 +349,7 @@ export function ExportSection({
             <HelpTip text={t("exp.printerHint")} />
           </span>
         </div>
-        <select className="printer-select" value={printer.id} disabled={busy} onChange={(e) => onChoosePrinter(e.target.value)} aria-label={t("exp.printerTitle")}>
-          {PRINTER_GROUPS.map((group) => (
-            <optgroup key={group.key} label={t(group.key)}>
-              {PRINTERS.filter(group.match).map((entry) => (
-                <option key={entry.id} value={entry.id}>
-                  {printerLabel(entry, t)}
-                </option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
+        <PrinterPicker value={printer.id} disabled={busy} onChange={onChoosePrinter} label={t("exp.printerTitle")} />
         <div className="printer-facts muted">
           {fdm
             ? t("exp.printerFactsFdm", {
@@ -623,6 +759,8 @@ export function ExportSection({
           </button>
         </div>
       </section>
+      {(() => {
+        const foot = (
       <div className="sidebar-foot">
         {outcome && (
           <div className={`export-outcome ${outcome.kind}`} role={outcome.kind === "error" ? "alert" : "status"}>
@@ -630,12 +768,12 @@ export function ExportSection({
             <pre>{outcome.message}</pre>
           </div>
         )}
-        <button type="button" className="btn primary big" disabled={busy || !ok} onClick={onExport} title={t("exp.downloadHint")}>
+        <button type="button" className="btn primary big" disabled={busy || !ok} onClick={() => setAsking(true)} title={t("exp.downloadHint")}>
           <Icon name="download" size={14} stroke={1.7} />
           {colourFormat ? t("exp.exportColour", { format: FORMAT_LABEL[colourFormat] }) : t("top.export")}
         </button>
         <span className="hint">
-          {settings.fileName || defaultFileName} · {prusa ? t("exp.openHint") : bambuProject ? t("exp.openHintBambu") : printer.app ? t("exp.openHintApp", { app: printer.app }) : t("exp.openHintAny")}
+          {settings.fileName || defaultFileName} · {openHint}
         </span>
         {lastExport && (
           <button type="button" className="text-link download-again" onClick={onDownloadAgain} title={t("exp.downloadAgainHint")}>
@@ -643,6 +781,28 @@ export function ExportSection({
           </button>
         )}
       </div>
+        );
+        return footHost ? createPortal(foot, footHost) : foot;
+      })()}
+      {asking && (
+        <ExportConfirm
+          printer={printer}
+          openHint={openHint}
+          facts={confirmFacts}
+          slots={fdm && slotColours ? slotColours : []}
+          fileLabel={settings.fileName || defaultFileName}
+          failures={check?.failures ?? []}
+          blocked={!ok}
+          notice={printerNotice}
+          busy={busy}
+          onChoosePrinter={onChoosePrinter}
+          onConfirm={() => {
+            setAsking(false);
+            onExport();
+          }}
+          onClose={() => setAsking(false)}
+        />
+      )}
     </>
   );
 }

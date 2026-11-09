@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useRef } from "react";
+import { forwardRef, useEffect, useRef, useState } from "react";
 import { rgbToHex } from "@core/colour";
 import { MAX_PAINTABLE_EXTRUDER_ID } from "@core/paintCodes";
 import { colourDistance, rgbToLab } from "@core/prusaFdmMixer";
@@ -180,11 +180,32 @@ export const MappingMatrix = forwardRef<HTMLDivElement, {
     if (pointedKey) rootRef.current?.querySelector(".matrix-row .pin-mark")?.closest(".matrix-row")?.scrollIntoView({ block: "nearest" });
   }, [pointedKey]);
   const slotRgb = new Map(slots.map((slot) => [slot.slot, slot.filament.effectiveRgb]));
+  // The table's own width: narrower than its full columns, it goes compact instead of scrolling sideways
+  // (11-09: at 1280 it ran 210px past its 626px and cut off the right-hand columns).
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const element = rootRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setWidth(element.clientWidth));
+    observer.observe(element);
+    setWidth(element.clientWidth);
+    return () => observer.disconnect();
+  }, []);
   // Narrower filament columns as the tool count grows, so 8–16 tools still fit.
   const slotWidth = slots.length <= 5 ? 52 : slots.length <= 8 ? 44 : 38;
-  const columns = `30px 168px repeat(${slots.length}, ${slotWidth}px) 64px 48px 56px minmax(120px, 1fr) 56px`;
+  // Every column but the cycle's is fixed, so all rows (each its own grid) line up; the cycle's takes the rest.
+  // Full: 30 + 168 + slots + 64 + 48 + 56 + 120 + 56, row padding 24, a scrollbar 10.
+  const fullWidth = 30 + 168 + slots.length * slotWidth + 64 + 48 + 56 + 120 + 56 + 24 + 10;
+  const compact = width > 0 && width < fullWidth;
+  // Compact: the same columns, tighter — the output chip (E/VE) stays, it is what the slicer shows.
+  const compactSlot = slots.length <= 5 ? 40 : slots.length <= 8 ? 36 : 32;
+  // The cycle's number and one 5px bar per layer.
+  const cycleMin = Math.min(120, 34 + 5 * summary.longestCycle);
+  const columns = compact
+    ? `22px 124px repeat(${slots.length}, ${compactSlot}px) 34px 38px 48px minmax(${cycleMin}px, 1fr) 44px`
+    : `30px 168px repeat(${slots.length}, ${slotWidth}px) 64px 48px 56px minmax(120px, 1fr) 56px`;
   return (
-    <div className="matrix" ref={rootRef}>
+    <div className={`matrix${compact ? " compact" : ""}`} ref={rootRef}>
       <div className="matrix-head">
         <span className="pane-title">
           {t("matrix.title")}
@@ -219,19 +240,23 @@ export const MappingMatrix = forwardRef<HTMLDivElement, {
           <span className="row-no" title={t("matrix.colNoTitle", { n: rows.length })}>
             #
           </span>
-          <span>{t("matrix.colGroup")}</span>
+          <span title={t("matrix.colGroup")}>{t("matrix.colGroup")}</span>
           {slots.map((slot) => (
             <span key={slot.slot} className="slot-head" title={slot.filament.name}>
               <span className="dot" style={{ background: rgbToHex(slot.filament.effectiveRgb) }} />E{slot.slot}
             </span>
           ))}
-          <span>{t("matrix.colPredicted")}</span>
+          <span title={t("matrix.colPredicted")}>{t("matrix.colPredicted")}</span>
           <span className="num">ΔE</span>
           <span className="match-head" title={t("matrix.colMatchTitle")}>
             {t("matrix.colMatch")}
           </span>
-          <span className="cycle-head">{t("matrix.colCycle")}</span>
-          <span className="num">{t("matrix.colOutput")}</span>
+          <span className="cycle-head" title={t("matrix.colCycle")}>
+            {t("matrix.colCycle")}
+          </span>
+          <span className="num" title={t("matrix.colOutput")}>
+            {t("matrix.colOutput")}
+          </span>
         </div>
         {rows.map((row, order) => {
           const isSelected = row.paletteIndex === selected;

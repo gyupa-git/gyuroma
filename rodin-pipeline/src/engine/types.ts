@@ -116,6 +116,22 @@ export interface FilamentListEntry {
   hex: string;
 }
 
+/** ⚙ Speed and memory: each switch is read where it acts (App, MeshViewer, the unfold worker, the 3MF writer). */
+export interface PerformanceSettings {
+  /** The colour map's unfolding on the graphics card (WebGPU) when the browser has one; off = the processor. */
+  gpuUnfold: boolean;
+  /** How sharp the 3D views are drawn: "auto" = the screen's own, up to 2×; lower draws fewer pixels (faster). */
+  pixelRatio: "auto" | 1 | 1.5 | 2;
+  /** Highlights blink twice as they appear (off: they just show). */
+  highlightPulse: boolean;
+  /** Fewer undo steps and smaller caches; "auto" = for models of 2 million faces or more. */
+  lowMemory: "auto" | "on" | "off";
+  /** The 3MF's compression: "small" (deflate 6) or "fast" (deflate 1: Tkc 4.6M faces 19 → 17 s, the file 62 → 67MB — 11-09). */
+  exportCompression: "small" | "fast";
+  /** The 3MF written on a processor core of its own (a worker): the window stays live while it is written. */
+  exportWorker: boolean;
+}
+
 export interface PipelineSettings {
   version: 1;
   /** Imported filament list (Filament-DB style: name; type; #hex). */
@@ -135,6 +151,8 @@ export interface PipelineSettings {
   merge: MergeSettings;
   mix: MixSettings;
   export: ExportSettings;
+  /** ⚙ Speed and memory (11-09): only switches that change something. */
+  performance: PerformanceSettings;
   mergeFlags: Record<string, MergeFlag>;
   /** Palette index -> physical extruder forced by the user. */
   manualPhysical: Record<string, number>;
@@ -216,6 +234,7 @@ export const DEFAULT_SETTINGS: PipelineSettings = {
     physicalDirectDeltaE: 6,
     autoPhysicalDirect: true,
   },
+  performance: { gpuUnfold: true, pixelRatio: "auto", highlightPulse: true, lowMemory: "auto", exportCompression: "small", exportWorker: true },
   export: {
     printerId: "prusa-xl5",
     colourFormat: null,

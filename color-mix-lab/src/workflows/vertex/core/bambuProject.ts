@@ -236,8 +236,9 @@ export interface BambuProjectObject {
   faceCount: number;
 }
 
+/** Composed (NFC) first, as in export3mf.ts: decomposed Korean showed as "????" in Bambu Studio. */
 function xmlEscape(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+  return value.normalize("NFC").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
 
 function hex8(value: number): string {

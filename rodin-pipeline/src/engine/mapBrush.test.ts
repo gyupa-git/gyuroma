@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildFaceAdjacency } from "@core/meshAdjacency";
 import type { MeshModel, RGB } from "@core/types";
-import { buildFaceAtlas, faceAtAtlasPixel, faceAtlasCentre, faceAtlasPoint, facesInAtlasCircle, facesUnderMapBrush, type FaceAtlas } from "./atlas";
+import { buildFaceAtlas, buildPatchAtlas, faceAtAtlasPixel, faceAtlasCentre, faceAtlasPoint, facesInAtlasCircle, facesUnderMapBrush, mapIslandAt, type FaceAtlas } from "./atlas";
 import { faceGeometry, triangleAreaWeights, type FaceGeometry } from "./mesh";
 
 /** A small deterministic generator (mulberry32), so the meshes are the same on every run. */
@@ -69,6 +69,56 @@ function flatPlane(n: number, size: number): MeshModel {
     }
   }
   return model("flat plane", vertices, triangles);
+}
+
+/** Two flat squares one over the other, `gap` apart and facing the same way: a ribbon and the arm behind it. */
+function stackedPlanes(n: number, size: number, gap: number): MeshModel {
+  const top = flatPlane(n, size);
+  const under = flatPlane(n, size);
+  const offset = top.vertices.length;
+  return model(
+    "stacked planes",
+    [...top.vertices, ...under.vertices.map(([x, y, z]): [number, number, number] => [x, y - gap, z])],
+    [...top.triangles, ...under.triangles.map(([a, b, c]): [number, number, number] => [a + offset, b + offset, c + offset])],
+  );
+}
+
+/**
+ * What unfold.ts gives for faces that already lie flat at y = 0: each corner at its own x, z, one piece.
+ * `moved` puts a face somewhere else on the sheet (as a band folded over when flattened).
+ */
+function flatUnfold(mesh: MeshModel, faces: Int32Array, moved?: (face: number, x: number, z: number) => [number, number] | null): { uv: Float32Array; piece: Int32Array; pieces: number } {
+  const uv = new Float32Array(faces.length * 6);
+  faces.forEach((f, i) => {
+    mesh.triangles[f].forEach((v, k) => {
+      const [x, , z] = mesh.vertices[v];
+      const [u, w] = moved?.(f, x, z) ?? [x, z];
+      uv[i * 6 + k * 2] = u;
+      uv[i * 6 + k * 2 + 1] = w;
+    });
+  });
+  return { uv, piece: new Int32Array(faces.length), pieces: 1 };
+}
+
+const range = (from: number, to: number) => Int32Array.from({ length: to - from }, (_v, i) => from + i);
+
+/** Map pixels whose centres lie strictly inside a face's triangle on the map. */
+function pixelsInside(atlas: FaceAtlas, f: number): number[] {
+  const uv = atlas.faceUv;
+  const [x0, y0, x1, y1, x2, y2] = Array.from(uv.subarray(f * 6, f * 6 + 6));
+  const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+  const out: number[] = [];
+  for (let py = Math.floor(Math.min(y0, y1, y2)); py <= Math.ceil(Math.max(y0, y1, y2)); py++) {
+    for (let px = Math.floor(Math.min(x0, x1, x2)); px <= Math.ceil(Math.max(x0, x1, x2)); px++) {
+      const cx = px + 0.5;
+      const cy = py + 0.5;
+      const w0 = ((x1 - cx) * (y2 - cy) - (x2 - cx) * (y1 - cy)) / area;
+      const w1 = ((x2 - cx) * (y0 - cy) - (x0 - cx) * (y2 - cy)) / area;
+      const w2 = 1 - w0 - w1;
+      if (w0 > 0.01 && w1 > 0.01 && w2 > 0.01) out.push(py * atlas.size + px);
+    }
+  }
+  return out;
 }
 
 function build(mesh: MeshModel, size: number): { atlas: FaceAtlas; geometry: FaceGeometry; adjacency: ReturnType<typeof buildFaceAdjacency> } {
@@ -181,5 +231,136 @@ describe("facesUnderMapBrush", () => {
     }
     expect(fullTotal).toBeGreaterThanOrEqual(flatTotal);
     expect(fullTotal).toBeLessThanOrEqual(flatTotal * 1.25 + 8);
+  });
+});
+
+describe("the brush on a patch unfolded on its own", () => {
+  it("paints only faces on the map, never the surface behind the patch", () => {
+    // 11-05, the owner: painting in the hole of the white ribbon, the arm behind it took the colour ("포탈도 아니고").
+    const mesh = stackedPlanes(30, 30, 0.05);
+    const ribbon = range(0, mesh.triangles.length / 2);
+    const geometry = faceGeometry(mesh);
+    const atlas = buildPatchAtlas(mesh, geometry, buildFaceAdjacency(mesh.triangles, mesh.vertices.length), ribbon, flatUnfold(mesh, ribbon), 128);
+    const spots = brushSpots(atlas, ribbon.length, 8);
+    expect(spots.length).toBeGreaterThanOrEqual(6);
+    for (const f of spots) {
+      const [cx, cy] = faceAtlasCentre(atlas, f);
+      const painted = facesUnderMapBrush(atlas, mesh, geometry, cx, cy, 2);
+      expect(painted.length).toBeGreaterThan(10);
+      for (const p of painted) expect(atlas.chartOf[p]).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("keeps to the surface joined to its middle where the map lays two places side by side", () => {
+    // Two squares apart on the model laid edge to edge on the map (an island come round against itself).
+    const mesh = stackedPlanes(20, 20, 3);
+    const half = mesh.triangles.length / 2;
+    const all = range(0, mesh.triangles.length);
+    const geometry = faceGeometry(mesh);
+    const adjacency = buildFaceAdjacency(mesh.triangles, mesh.vertices.length);
+    const atlas = buildPatchAtlas(mesh, geometry, adjacency, all, flatUnfold(mesh, all, (f, x, z) => (f >= half ? [x + 20, z] : null)), 128);
+    // Near the first square's edge that meets the second.
+    let edge = -1;
+    for (let f = 0; f < half; f++) if (geometry.centroids[f * 3] > 9 && Math.abs(geometry.centroids[f * 3 + 2]) < 1) edge = f;
+    const [cx, cy] = faceAtlasCentre(atlas, edge);
+    const painted = facesUnderMapBrush(atlas, mesh, geometry, cx, cy, 3);
+    expect(painted.length).toBeGreaterThan(20);
+    for (const f of painted) expect(f).toBeLessThan(half);
+    // The circle does reach over the seam on the map.
+    expect(facesInAtlasCircle(atlas, cx, cy, 3 * atlas.scale).some((f) => f >= half)).toBe(true);
+  });
+
+  it("keeps a stroke to the piece it started on", () => {
+    // Two pieces of the map (islands) side by side: a stroke from the first over the second paints only the first.
+    const mesh = stackedPlanes(20, 20, 3);
+    const half = mesh.triangles.length / 2;
+    const all = range(0, mesh.triangles.length);
+    const geometry = faceGeometry(mesh);
+    const adjacency = buildFaceAdjacency(mesh.triangles, mesh.vertices.length);
+    const unfolded = flatUnfold(mesh, all);
+    unfolded.pieces = 2;
+    for (let i = half; i < all.length; i++) unfolded.piece[i] = 1;
+    const atlas = buildPatchAtlas(mesh, geometry, adjacency, all, unfolded, 256);
+    const [ax, ay] = faceAtlasCentre(atlas, 5);
+    const first = mapIslandAt(atlas, ax, ay, 4);
+    expect(first).toBe(atlas.chartOf[5]);
+    // Dabs along the stroke, now over the second piece.
+    const [bx, by] = faceAtlasCentre(atlas, half + 5);
+    const there = facesUnderMapBrush(atlas, mesh, geometry, bx, by, 2, first);
+    for (const f of there) expect(atlas.chartOf[f]).toBe(first);
+    expect(facesUnderMapBrush(atlas, mesh, geometry, bx, by, 2).some((f) => f >= half)).toBe(true);
+  });
+
+  it("takes a face too small to own a pixel where its centre is, so a painted area has no stipple", () => {
+    const mesh = flatPlane(120, 12);
+    const all = range(0, mesh.triangles.length);
+    const geometry = faceGeometry(mesh);
+    const atlas = buildPatchAtlas(mesh, geometry, buildFaceAdjacency(mesh.triangles, mesh.vertices.length), all, flatUnfold(mesh, all), 64);
+    let pixelless = 0;
+    for (let f = 0; f < all.length; f++) if (atlas.pixelOffsets[f + 1] === atlas.pixelOffsets[f]) pixelless++;
+    expect(pixelless).toBeGreaterThan(all.length / 4);
+    const [cx, cy] = [atlas.extent[0] / 2, atlas.extent[1] / 2];
+    const r = 2 * atlas.scale;
+    const painted = facesUnderMapBrush(atlas, mesh, geometry, cx, cy, 2);
+    const inside = new Set(painted);
+    let due = 0;
+    for (let f = 0; f < all.length; f++) {
+      const [x, y] = faceAtlasCentre(atlas, f);
+      const d = Math.hypot(x - cx, y - cy);
+      // Every face whose centre is in the circle, a pixel of its own or not (none left out: no stipple); at the rim a
+      // one-pixel face goes by its pixel's centre, up to a pixel off its own.
+      if (d <= r - 1) {
+        due++;
+        expect(inside.has(f)).toBe(true);
+      }
+      // Nothing far off joins.
+      if (inside.has(f)) expect(d).toBeLessThanOrEqual(r + 1.5);
+    }
+    expect(due).toBeGreaterThan(200);
+  });
+});
+
+describe("a patch unfolded with the faces round it", () => {
+  // A 20 × 20 square: the pick is its left half, the faces round it the right half, nearest first.  Laid flat
+  // as they are, except a band folded over — the far columns over the pick, the next ones over nearer band.
+  const mesh = flatPlane(20, 20);
+  const geometry = faceGeometry(mesh);
+  const adjacency = buildFaceAdjacency(mesh.triangles, mesh.vertices.length);
+  const centreX = (f: number) => geometry.centroids[f * 3];
+  const pick = Array.from(range(0, mesh.triangles.length)).filter((f) => centreX(f) < 0);
+  const band = Array.from(range(0, mesh.triangles.length)).filter((f) => centreX(f) > 0).sort((a, b) => centreX(a) - centreX(b));
+  const faces = Int32Array.from([...pick, ...band]);
+  const overPick = (f: number) => centreX(f) > 8;
+  const overBand = (f: number) => centreX(f) > 6 && centreX(f) < 8;
+  const unfolded = flatUnfold(mesh, faces, (f, x, z) => (overPick(f) ? [-x, z] : overBand(f) ? [12 - x, z] : null));
+
+  it("draws the pick whole and leaves off the map a band folded over it or over nearer band", () => {
+    const atlas = buildPatchAtlas(mesh, geometry, adjacency, faces, unfolded, 128, pick.length);
+    for (const f of pick) expect(atlas.chartOf[f]).toBeGreaterThanOrEqual(0);
+    let gone = 0;
+    for (const f of band) {
+      const off = atlas.chartOf[f] < 0;
+      // Folded over: off the map.  Lying flat beside the pick (touching it along an edge too): on it.
+      expect(off).toBe(overPick(f) || overBand(f));
+      if (off) gone++;
+    }
+    expect(gone).toBe(band.filter((f) => overPick(f) || overBand(f)).length);
+    expect(atlas.dropped).toBe(gone);
+    // Every pixel of the map belongs to a face on it, and the pick keeps every pixel inside it.
+    for (let i = 0; i < atlas.idMap.length; i++) if (atlas.idMap[i] >= 0) expect(atlas.chartOf[atlas.idMap[i]]).toBeGreaterThanOrEqual(0);
+    let checked = 0;
+    for (const f of pick) {
+      for (const p of pixelsInside(atlas, f)) {
+        expect(atlas.idMap[p]).toBe(f);
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(1000);
+  });
+
+  it("keeps everything when the faces are all the pick", () => {
+    const atlas = buildPatchAtlas(mesh, geometry, adjacency, faces, unfolded, 128);
+    for (const f of faces) expect(atlas.chartOf[f]).toBeGreaterThanOrEqual(0);
+    expect(atlas.dropped ?? 0).toBe(0);
   });
 });

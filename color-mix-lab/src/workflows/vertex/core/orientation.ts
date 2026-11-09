@@ -76,9 +76,23 @@ function parseTurn(mode: string): TurnRows | null {
   return values as unknown as TurnRows;
 }
 
+/**
+ * The last "turn:…" read and its rows: an export turns every vertex (and the thumbnail every face corner) by the
+ * same mode, and reading the string each time added ~17 s to a 4.6M-face export (11-09). Frozen: shared by all.
+ */
+let lastTurnMode = "";
+let lastTurnRows: TurnRows = IDENTITY;
+
 /** The turn a mode applies (anything unreadable stays as it is). */
 export function turnRows(mode: FixedCoordinateMode): TurnRows {
-  if (mode.startsWith("turn:")) return parseTurn(mode) ?? IDENTITY;
+  if (mode.startsWith("turn:")) {
+    if (mode !== lastTurnMode) {
+      const parsed = parseTurn(mode);
+      lastTurnRows = parsed ? (Object.freeze(parsed) as TurnRows) : IDENTITY;
+      lastTurnMode = mode;
+    }
+    return lastTurnRows;
+  }
   return TURNS[mode as keyof typeof TURNS] ?? IDENTITY;
 }
 

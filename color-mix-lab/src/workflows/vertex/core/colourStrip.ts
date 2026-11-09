@@ -1,4 +1,5 @@
 import { labChroma, labHueDegrees, rgbToLab, type LAB } from "./prusaFdmMixer";
+import { POOL_ID, poolSize } from "./rgbPool";
 import type { PaletteEntry, RGB } from "./types";
 
 /**
@@ -79,20 +80,77 @@ export function colourKey(rgb: RGB): number {
  * together: a piece split off keeps a band of its own wherever its lightness
  * falls, instead of mixing into the band that lightness belongs to.
  */
-export function buildColourStrip(colours: ArrayLike<RGB>, weights?: ArrayLike<number>, pins?: ReadonlyMap<number, number>): ColourStripData {
-  const byKey = new Map<number, { rgb: RGB; weight: number }>();
+type Pooled = RGB & { [POOL_ID]?: number };
+
+/**
+ * Each colour's faces' weights added up in face order, the colours in the order first met.  Colours from the
+ * shared pool (all of them, once the app has shared them) add up in plain arrays by their POOL_ID — no key worked
+ * out and no map per face (11-10: Tkc 4.7M faces, 16k colours); a colour that is not from the pool sends it all to
+ * the map.  Either way each colour adds its weights in face order: the sums are the same to the last bit.
+ */
+function colourSums(colours: ArrayLike<RGB>, weights?: ArrayLike<number>): { entries: Array<{ key: number; rgb: RGB; weight: number }>; total: number } {
+  const size = poolSize();
+  const sums = new Float64Array(size);
+  const seen = new Uint8Array(size);
+  const order: number[] = [];
+  const firsts: RGB[] = [];
   let total = 0;
+  let pooled = size > 0;
+  let lastRgb: RGB | undefined;
+  let lastId = -1;
+  for (let i = 0; pooled && i < colours.length; i++) {
+    const w = weights ? weights[i] : 1;
+    if (!(w > 0)) continue;
+    total += w;
+    const rgb = colours[i];
+    // Neighbouring faces mostly share a colour: the last face's array is the same entry.
+    if (rgb === lastRgb) {
+      sums[lastId] += w;
+      continue;
+    }
+    const id = (rgb as Pooled)[POOL_ID];
+    if (id === undefined || id >= size) {
+      pooled = false;
+      break;
+    }
+    if (seen[id] === 0) {
+      seen[id] = 1;
+      order.push(id);
+      firsts.push(rgb);
+      sums[id] = w;
+    } else sums[id] += w;
+    lastRgb = rgb;
+    lastId = id;
+  }
+  if (pooled) return { entries: order.map((id, k) => ({ key: colourKey(firsts[k]), rgb: firsts[k], weight: sums[id] })), total };
+
+  const byKey = new Map<number, { key: number; rgb: RGB; weight: number }>();
+  total = 0;
+  let lastEntry: { key: number; rgb: RGB; weight: number } | undefined;
+  lastRgb = undefined;
   for (let i = 0; i < colours.length; i++) {
     const w = weights ? weights[i] : 1;
     if (!(w > 0)) continue;
     total += w;
-    const key = colourKey(colours[i]);
-    const entry = byKey.get(key);
+    const rgb = colours[i];
+    if (lastEntry !== undefined && rgb === lastRgb) {
+      lastEntry.weight += w;
+      continue;
+    }
+    const key = colourKey(rgb);
+    let entry = byKey.get(key);
     if (entry) entry.weight += w;
-    else byKey.set(key, { rgb: colours[i], weight: w });
+    else byKey.set(key, (entry = { key, rgb, weight: w }));
+    lastRgb = rgb;
+    lastEntry = entry;
   }
+  return { entries: [...byKey.values()], total };
+}
+
+export function buildColourStrip(colours: ArrayLike<RGB>, weights?: ArrayLike<number>, pins?: ReadonlyMap<number, number>): ColourStripData {
+  const { entries, total } = colourSums(colours, weights);
   const families: StripFamily[] = FAMILY_NAMES.map((name, family) => ({ family, name, colours: [], weight: 0 }));
-  for (const [key, entry] of byKey) {
+  for (const { key, ...entry } of entries) {
     const lab = rgbToLab(entry.rgb);
     const family = familyOf(lab);
     const colour: StripColour = { key, rgb: entry.rgb, lab, weight: total > 0 ? entry.weight / total : 0, family };
@@ -102,7 +160,7 @@ export function buildColourStrip(colours: ArrayLike<RGB>, weights?: ArrayLike<nu
     families[family].weight += colour.weight;
   }
   for (const family of families) family.colours.sort((a, b) => (a.pin ?? -1) - (b.pin ?? -1) || b.lab.L - a.lab.L);
-  return { families: families.filter((family) => family.colours.length > 0), colourCount: byKey.size };
+  return { families: families.filter((family) => family.colours.length > 0), colourCount: entries.length };
 }
 
 /** Cut positions per family: fractions (0, 1) of the family's area, ascending. */

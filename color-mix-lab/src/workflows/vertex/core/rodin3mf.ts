@@ -196,6 +196,199 @@ export function parseModelXml(xml: string): ParsedModelFile {
   return { objects, buildItems };
 }
 
+/** `\b` after a tag name, as the regular expressions above read it: the next character is not a word character. */
+function wordEnds(text: string, at: number): boolean {
+  if (at >= text.length) return true;
+  const c = text.charCodeAt(at);
+  return !((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95);
+}
+
+/**
+ * parseModelXml, read as the text comes (11-10): a model XML is never held as one string — the browser caps a string
+ * at ~537M characters, and a 4.6M-face 3MF (규로마's own export of one) is ~547M, so it could not be opened again.
+ * Fed in pieces (push), it gives what parseModelXml gives for the whole text (rodin3mfStream.test checks it on the
+ * same inputs cut every which way): the same tags at the same places — an object counts only once its </object>
+ * came, the first <mesh> of an object is its mesh (and only whole, before the </object>), components anywhere in
+ * the object, items in the first whole <build>, attributes as parseAttributes reads them.
+ */
+export class ModelXmlReader {
+  private carry = "";
+  private readonly objects = new Map<string, ParsedObject>();
+  private buildItems: ParsedBuildItem[] = [];
+  private object: { attrs: Record<string, string>; mesh: ParsedMesh | null; meshDone: boolean; components: ParsedComponent[] } | null = null;
+  private mesh: ParsedMesh | null = null;
+  /** In the first <build> (items wait for its </build>); after it, builds are not read. */
+  private build: ParsedBuildItem[] | null = null;
+  private buildDone = false;
+
+  push(text: string): void {
+    const s = this.carry + text;
+    let pos = 0;
+    for (;;) {
+      const lt = s.indexOf("<", pos);
+      if (lt < 0) {
+        pos = s.length;
+        break;
+      }
+      // Not enough to read the name, or no '>' yet: wait for more text.
+      if (s.length - lt < 12) {
+        pos = lt;
+        break;
+      }
+      const used = this.tag(s, lt);
+      if (used === -1) {
+        pos = lt;
+        break;
+      }
+      pos = used;
+    }
+    this.carry = s.slice(pos);
+  }
+
+  /** Reads the tag at `lt`: the index to go on from, or -1 when its '>' has not come yet. */
+  private tag(s: string, lt: number): number {
+    const is = (name: string) => s.startsWith(name, lt + 1) && wordEnds(s, lt + 1 + name.length);
+    const closes = (name: string) => s.startsWith(`/${name}>`, lt + 1);
+    const attrsOf = () => {
+      const gt = s.indexOf(">", lt);
+      return gt < 0 ? null : { attrs: s.slice(lt + 1, gt), next: gt + 1 };
+    };
+    // The first whole <build> anywhere in the text (as /<build\b…<\/build>/ finds it), whatever else is open.
+    if (this.build) {
+      if (closes("build")) {
+        this.buildItems = this.build;
+        this.build = null;
+        this.buildDone = true;
+        return lt + "</build>".length;
+      }
+      if (is("item")) {
+        const t = attrsOf();
+        if (!t) return -1;
+        const ia = parseAttributes(t.attrs.slice("item".length));
+        if (ia.objectid) this.build.push({ objectId: ia.objectid, path: ia["p:path"] ?? null, transform: parseTransform(ia.transform) });
+        return t.next;
+      }
+    } else if (!this.buildDone && is("build")) {
+      const t = attrsOf();
+      if (!t) return -1;
+      this.build = [];
+      return t.next;
+    }
+    const object = this.object;
+    if (object) {
+      if (closes("object")) {
+        // A mesh still open at the object's end was never whole: no mesh (as the regular expression finds none).
+        const mesh = this.mesh ? null : object.mesh;
+        this.mesh = null;
+        const id = object.attrs.id ?? String(this.objects.size + 1);
+        this.objects.set(id, { id, name: object.attrs.name ?? `object_${id}`, mesh, components: object.components });
+        this.object = null;
+        return lt + "</object>".length;
+      }
+      if (this.mesh) {
+        if (closes("mesh")) {
+          object.mesh = this.mesh;
+          object.meshDone = true;
+          this.mesh = null;
+          return lt + "</mesh>".length;
+        }
+        if (is("vertex")) {
+          const t = attrsOf();
+          if (!t) return -1;
+          const a = parseAttributes(t.attrs.slice("vertex".length));
+          const x = Number(a.x);
+          const y = Number(a.y);
+          const z = Number(a.z);
+          this.mesh.vertices.push([Number.isFinite(x) ? x : 0, Number.isFinite(y) ? y : 0, Number.isFinite(z) ? z : 0]);
+          return t.next;
+        }
+        if (is("triangle")) {
+          const t = attrsOf();
+          if (!t) return -1;
+          const a = parseAttributes(t.attrs.slice("triangle".length));
+          const mesh = this.mesh;
+          const v1 = Number(a.v1);
+          const v2 = Number(a.v2);
+          const v3 = Number(a.v3);
+          if (![v1, v2, v3].every((v) => Number.isInteger(v) && v >= 0 && v < mesh.vertices.length)) return t.next;
+          mesh.triangles.push([v1, v2, v3]);
+          let code: string | undefined = a["slic3rpe:mmu_segmentation"];
+          if (code === undefined) code = a.paint_color;
+          if (code !== undefined) mesh.paintedAttributeCount++;
+          if (a.pid !== undefined || a.p1 !== undefined) mesh.textureAttributeCount++;
+          mesh.codes.push(code ?? "");
+          return t.next;
+        }
+      } else if (!object.meshDone && is("mesh")) {
+        const t = attrsOf();
+        if (!t) return -1;
+        this.mesh = { vertices: [], triangles: [], codes: [], paintedAttributeCount: 0, textureAttributeCount: 0 };
+        return t.next;
+      }
+      if (is("component")) {
+        const t = attrsOf();
+        if (!t) return -1;
+        const ca = parseAttributes(t.attrs.slice("component".length));
+        if (ca.objectid) object.components.push({ objectId: ca.objectid, path: ca["p:path"] ?? null, transform: parseTransform(ca.transform) });
+        return t.next;
+      }
+      return lt + 1;
+    }
+    if (is("object")) {
+      const t = attrsOf();
+      if (!t) return -1;
+      this.object = { attrs: parseAttributes(t.attrs.slice("object".length)), mesh: null, meshDone: false, components: [] };
+      return t.next;
+    }
+    return lt + 1;
+  }
+
+  /** All the text given: what was read (a tag cut off at the very end, never closed, is not). */
+  end(): ParsedModelFile {
+    // The tail may still hold whole tags shorter than the wait above (e.g. "</build>" at the very end).
+    const tail = this.carry;
+    this.carry = "";
+    let pos = 0;
+    for (;;) {
+      const lt = tail.indexOf("<", pos);
+      if (lt < 0) break;
+      const used = this.tag(tail, lt);
+      if (used === -1) break;
+      pos = used;
+    }
+    return { objects: this.objects, buildItems: this.buildItems };
+  }
+}
+
+/** JSZip's internal stream helper, as far as it is used here. */
+interface ZipPieces {
+  on(event: "data", listener: (chunk: unknown) => void): ZipPieces;
+  on(event: "error", listener: (error: unknown) => void): ZipPieces;
+  on(event: "end", listener: () => void): ZipPieces;
+  resume(): ZipPieces;
+}
+
+/** A model XML read in pieces with ModelXmlReader: the zip entry inflated and decoded as it comes, never whole. */
+async function readZipModel(zip: JSZip, path: string): Promise<ParsedModelFile | null> {
+  const file = zip.file(normalizeZipPath(path));
+  if (!file) return null;
+  const reader = new ModelXmlReader();
+  const decoder = new TextDecoder("utf-8");
+  // JSZip's own piece-by-piece reader (what its async() runs on; not in its type declarations).
+  const stream = (file as unknown as { internalStream(type: "uint8array"): ZipPieces }).internalStream("uint8array");
+  await new Promise<void>((resolve, reject) => {
+    stream
+      .on("data", (chunk) => reader.push(decoder.decode(chunk as Uint8Array, { stream: true })))
+      .on("error", reject)
+      .on("end", () => {
+        reader.push(decoder.decode());
+        resolve();
+      })
+      .resume();
+  });
+  return reader.end();
+}
+
 function normalizeZipPath(path: string): string {
   return path.replace(/^\/+/, "");
 }
@@ -374,11 +567,12 @@ export async function loadRodin3mf(
       ? source
       : await source.arrayBuffer();
   const zip = await JSZip.loadAsync(buffer);
-  const mainXml = await readZipText(zip, RODIN_MODEL_PATH);
-  if (mainXml === null) throw new Error(`${RODIN_MODEL_PATH} not found. Is this a 3MF project?`);
+  // Read as it inflates: a big model's XML is more text than the browser holds in one string (11-10).
+  const main = await readZipModel(zip, RODIN_MODEL_PATH);
+  if (main === null) throw new Error(`${RODIN_MODEL_PATH} not found. Is this a 3MF project?`);
 
   const files = new Map<string, ParsedModelFile>();
-  files.set(RODIN_MODEL_PATH, parseModelXml(mainXml));
+  files.set(RODIN_MODEL_PATH, main);
 
   // Resolve components/build items that live in other model files
   // (Bambu Studio stores split objects in 3D/Objects/*.model).
@@ -392,9 +586,8 @@ export async function loadRodin3mf(
   while (pending.length > 0) {
     const path = normalizeZipPath(pending.pop()!);
     if (files.has(path)) continue;
-    const xml = await readZipText(zip, path);
-    if (xml === null) continue;
-    const parsed = parseModelXml(xml);
+    const parsed = await readZipModel(zip, path);
+    if (parsed === null) continue;
     files.set(path, parsed);
     collectPaths(parsed);
   }

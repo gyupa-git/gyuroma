@@ -636,6 +636,25 @@ describe("Bambu-family slicers", () => {
     expect(zip.file("Metadata/plate_1.png")).not.toBeNull();
   });
 
+  it("writes a Korean name composed (NFC): decomposed letters showed as ???? in Bambu Studio (11-10)", async () => {
+    const decomposed = "무대 커튼".normalize("NFD");
+    const { plan, palette } = planWithGaps();
+    const model = { ...modelForPalette(palette), name: `${decomposed}.3mf` };
+    const jamo = /[ᄀ-ᇿ]/;
+    const prusa = await readZip((await buildPrusa3mfBlob(exportOptions({ model, adjustedColors: model.triangleColors, virtualPlan: plan, palette, fileName: `${decomposed}_colormix` }))).blob);
+    const prusaXml = await prusa.file("3D/3dmodel.model")!.async("text");
+    expect(prusaXml).toContain("무대 커튼");
+    expect(jamo.test(prusaXml)).toBe(false);
+    const bambu = await readZip(
+      (await buildPrusa3mfBlob(exportOptions({ slicer: "bambu", bambuPrinter: "h2d", model, adjustedColors: model.triangleColors, virtualPlan: plan, palette, fileName: `${decomposed}_colormix` }))).blob,
+    );
+    for (const path of ["3D/3dmodel.model", "Metadata/model_settings.config"]) {
+      const text = await bambu.file(path)!.async("text");
+      expect(text).toContain("무대 커튼");
+      expect(jamo.test(text)).toBe(false);
+    }
+  });
+
   it("a two-nozzle Bambu printer gets a flush matrix per nozzle", async () => {
     const result = await buildPrusa3mfBlob(exportOptions({ slicer: "bambu", bambuPrinter: "h2d" }));
     const config = JSON.parse(await (await readZip(result.blob)).file("Metadata/project_settings.config")!.async("text"));

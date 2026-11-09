@@ -31,6 +31,8 @@ export interface WorkFileContents {
   settings: unknown;
   /** What the AI found and said about this model (its part map, the consult) — so the work goes on where it was. */
   ai?: { partMap: unknown; chat: unknown[] } | null;
+  /** ✏️ The guide lines drawn on the model (engine/guides.ts StoredGuides); read back as it was written, checked when taken. */
+  guides?: unknown;
   savedAt: number;
   /** The app and version that wrote it. */
   app: string;
@@ -47,6 +49,8 @@ interface WorkFileHeader {
   gzip: boolean;
   settings: unknown;
   ai?: { partMap: unknown; chat: unknown[] } | null;
+  /** Added 11-05: a file without it (older) has no guide lines; an older app reading a newer file leaves them. */
+  guides?: unknown;
 }
 
 /** Why a file could not be read as a work file. */
@@ -83,6 +87,7 @@ export async function packWorkFile(contents: Omit<WorkFileContents, "savedAt"> &
     gzip: packed !== null,
     settings: contents.settings,
     ai: contents.ai ?? null,
+    guides: contents.guides ?? null,
   };
   const headerBytes = new TextEncoder().encode(JSON.stringify(header));
   const lead = new Uint8Array(12);
@@ -123,6 +128,7 @@ export async function readWorkFile(blob: Blob): Promise<WorkFileContents> {
     cuts: isStoredWorkCuts(cuts) ? cuts : null,
     settings: header.settings,
     ai: header.ai && typeof header.ai === "object" ? { partMap: header.ai.partMap ?? null, chat: Array.isArray(header.ai.chat) ? header.ai.chat : [] } : null,
+    guides: header.guides ?? null,
     savedAt: Number(header.savedAt) || 0,
     app: String(header.app ?? ""),
   };

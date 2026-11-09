@@ -271,34 +271,63 @@ export function smoothVertexNormals(model: MeshModel): Float32Array {
   return normals;
 }
 
-/** The faces around every vertex (offsets into `faces`), and the triangles and vertex positions as flat arrays. */
+/**
+ * The corners at every vertex: `corners[offsets[v] .. offsets[v + 1]]` are the corner numbers (face · 3 + k) that sit
+ * on vertex v. One table for each corner list (cornerVertex), shared by the 3D views' soft borders and the highlight
+ * outlines (11-09: each built its own, ~120MB twice over on 4.6M faces).
+ */
+export interface VertexCorners {
+  cornerVertex: Int32Array;
+  offsets: Int32Array;
+  corners: Int32Array;
+}
+const vertexCornersCache = new WeakMap<Int32Array, VertexCorners>();
+export function vertexCornersFor(cornerVertex: Int32Array): VertexCorners {
+  const known = vertexCornersCache.get(cornerVertex);
+  if (known) return known;
+  let vertexCount = 0;
+  for (let c = 0; c < cornerVertex.length; c++) if (cornerVertex[c] >= vertexCount) vertexCount = cornerVertex[c] + 1;
+  const offsets = new Int32Array(vertexCount + 1);
+  for (let c = 0; c < cornerVertex.length; c++) offsets[cornerVertex[c] + 1]++;
+  for (let v = 0; v < vertexCount; v++) offsets[v + 1] += offsets[v];
+  const next = offsets.slice(0, vertexCount);
+  const corners = new Int32Array(cornerVertex.length);
+  for (let c = 0; c < cornerVertex.length; c++) corners[next[cornerVertex[c]]++] = c;
+  const table = { cornerVertex, offsets, corners };
+  vertexCornersCache.set(cornerVertex, table);
+  return table;
+}
+
+/** The corners around every vertex, the triangles as a flat corner list, and the vertex positions (model space). */
 interface VertexFaces {
   offsets: Int32Array;
-  faces: Int32Array;
+  /** Corner numbers: the face is `corner / 3 | 0`. */
+  corners: Int32Array;
   triangles: Int32Array;
   positions: Float32Array;
 }
 
 const vertexFacesCache = new WeakMap<MeshModel["triangles"], VertexFaces>();
 
-/** Built once per model (a few tens of ms for a million faces) and kept with it. */
-function vertexFaces(model: MeshModel): VertexFaces {
+/**
+ * Built once per model and kept with it. `cornerVertex`: the model's own flat corner list when the caller has it
+ * (the App's, which the views use too) — then its vertex table is shared, not built again.
+ */
+function vertexFaces(model: MeshModel, cornerVertex?: Int32Array): VertexFaces {
   const cached = vertexFacesCache.get(model.triangles);
   if (cached) return cached;
   const faceCount = model.triangles.length;
-  const triangles = new Int32Array(faceCount * 3);
-  const offsets = new Int32Array(model.vertices.length + 1);
-  for (let f = 0; f < faceCount; f++) {
-    const tri = model.triangles[f];
-    for (let k = 0; k < 3; k++) {
-      triangles[f * 3 + k] = tri[k];
-      offsets[tri[k] + 1]++;
+  let triangles = cornerVertex && cornerVertex.length === faceCount * 3 ? cornerVertex : null;
+  if (!triangles) {
+    triangles = new Int32Array(faceCount * 3);
+    for (let f = 0; f < faceCount; f++) {
+      const tri = model.triangles[f];
+      triangles[f * 3] = tri[0];
+      triangles[f * 3 + 1] = tri[1];
+      triangles[f * 3 + 2] = tri[2];
     }
   }
-  for (let v = 0; v < model.vertices.length; v++) offsets[v + 1] += offsets[v];
-  const faces = new Int32Array(faceCount * 3);
-  const next = offsets.slice(0, -1);
-  for (let i = 0; i < triangles.length; i++) faces[next[triangles[i]]++] = Math.floor(i / 3);
+  const { offsets, corners } = vertexCornersFor(triangles);
   const positions = new Float32Array(model.vertices.length * 3);
   for (let v = 0; v < model.vertices.length; v++) {
     const vertex = model.vertices[v];
@@ -306,7 +335,7 @@ function vertexFaces(model: MeshModel): VertexFaces {
     positions[v * 3 + 1] = vertex[1];
     positions[v * 3 + 2] = vertex[2];
   }
-  const out = { offsets, faces, triangles, positions };
+  const out = { offsets, corners, triangles, positions };
   vertexFacesCache.set(model.triangles, out);
   return out;
 }
@@ -316,8 +345,8 @@ function vertexFaces(model: MeshModel): VertexFaces {
  * normals, for the outline shell) plus the seam where a highlighted face
  * meets a non-highlighted one.
  */
-export function highlightGeometry(model: MeshModel, mask: Uint8Array, normals?: Float32Array): HighlightGeometry {
-  const { offsets, faces, triangles, positions } = vertexFaces(model);
+export function highlightGeometry(model: MeshModel, mask: Uint8Array, normals?: Float32Array, cornerVertex?: Int32Array): HighlightGeometry {
+  const { offsets, corners, triangles, positions } = vertexFaces(model, cornerVertex);
   let faceCount = 0;
   for (let i = 0; i < mask.length; i++) if (mask[i]) faceCount++;
   const fill = new Float32Array(faceCount * 9);
@@ -348,7 +377,7 @@ export function highlightGeometry(model: MeshModel, mask: Uint8Array, normals?: 
       if (a === b) continue;
       let shared = false;
       for (let j = offsets[a]; j < offsets[a + 1]; j++) {
-        const g = faces[j];
+        const g = (corners[j] / 3) | 0;
         if (g === i || !mask[g]) continue;
         if (triangles[g * 3] === b || triangles[g * 3 + 1] === b || triangles[g * 3 + 2] === b) {
           shared = true;
@@ -423,8 +452,8 @@ function lookupOf(cut: HighlightCut, faceCount: number, vertexCount: number) {
  * region's and its face is in the region or touches it (the line gave it a
  * piece of the face next door).
  */
-export function highlightGeometryCut(model: MeshModel, mask: Uint8Array, cut: HighlightCut, labels: ArrayLike<number>, normals?: Float32Array): HighlightGeometry {
-  const { offsets, faces, triangles, positions } = vertexFaces(model);
+export function highlightGeometryCut(model: MeshModel, mask: Uint8Array, cut: HighlightCut, labels: ArrayLike<number>, normals?: Float32Array, cornerVertex?: Int32Array): HighlightGeometry {
+  const { offsets, corners, triangles, positions } = vertexFaces(model, cornerVertex);
   const vertexCount = model.vertices.length;
   const faceCount = model.triangles.length;
   const { replaced, addedNormalFrom } = lookupOf(cut, faceCount, vertexCount);
@@ -434,7 +463,7 @@ export function highlightGeometryCut(model: MeshModel, mask: Uint8Array, cut: Hi
   const touches = (face: number) => {
     for (let k = 0; k < 3; k++) {
       const v = triangles[face * 3 + k];
-      for (let j = offsets[v]; j < offsets[v + 1]; j++) if (mask[faces[j]]) return true;
+      for (let j = offsets[v]; j < offsets[v + 1]; j++) if (mask[(corners[j] / 3) | 0]) return true;
     }
     return false;
   };
@@ -496,7 +525,7 @@ export function highlightGeometryCut(model: MeshModel, mask: Uint8Array, cut: Hi
       let shared = false;
       let cutNext = false;
       for (let j = offsets[a]; j < offsets[a + 1]; j++) {
-        const g = faces[j];
+        const g = (corners[j] / 3) | 0;
         if (g === i) continue;
         if (triangles[g * 3] !== b && triangles[g * 3 + 1] !== b && triangles[g * 3 + 2] !== b) continue;
         if (replaced[g]) cutNext = true;
@@ -638,22 +667,104 @@ export function facesInSphere(
   radius: number,
   viewDir: [number, number, number] | null,
 ): Int32Array {
+  return facesNearSegment(geometry, point, point, radius, viewDir);
+}
+
+/**
+ * Faces whose centroid lies within `radius` of the segment from `a` to `b`: a brush dragged from one dab to the
+ * next, the stretch between painted too (11-05, the owner: a quick stroke came out a dotted line — the pointer
+ * had gone further than the brush is wide between two dabs).  Back-facing faces skipped as facesInSphere does.
+ */
+export function facesNearSegment(
+  geometry: FaceGeometry,
+  a: [number, number, number],
+  b: [number, number, number],
+  radius: number,
+  viewDir: [number, number, number] | null,
+): Int32Array {
   const { centroids, normals } = geometry;
-  const n = centroids.length / 3;
+  const grid = gridOf(geometry);
   const r2 = radius * radius;
+  const dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+  const len2 = dx * dx + dy * dy + dz * dz;
   const out: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const dx = centroids[i * 3] - point[0];
-    if (dx > radius || dx < -radius) continue;
-    const dy = centroids[i * 3 + 1] - point[1];
-    if (dy > radius || dy < -radius) continue;
-    const dz = centroids[i * 3 + 2] - point[2];
-    if (dx * dx + dy * dy + dz * dz > r2) continue;
-    if (viewDir) {
-      const dot = normals[i * 3] * viewDir[0] + normals[i * 3 + 1] * viewDir[1] + normals[i * 3 + 2] * viewDir[2];
-      if (dot > 0.25) continue;
+  const lo = (v: number, d: number) => Math.max(0, Math.floor((v - grid.min[d]) / grid.cell));
+  const hi = (v: number, d: number, n: number) => Math.min(n - 1, Math.floor((v - grid.min[d]) / grid.cell));
+  const x0 = lo(Math.min(a[0], b[0]) - radius, 0), x1 = hi(Math.max(a[0], b[0]) + radius, 0, grid.nx);
+  const y0 = lo(Math.min(a[1], b[1]) - radius, 1), y1 = hi(Math.max(a[1], b[1]) + radius, 1, grid.ny);
+  const z0 = lo(Math.min(a[2], b[2]) - radius, 2), z1 = hi(Math.max(a[2], b[2]) + radius, 2, grid.nz);
+  for (let z = z0; z <= z1; z++)
+    for (let y = y0; y <= y1; y++)
+      for (let x = x0; x <= x1; x++) {
+        const c = (z * grid.ny + y) * grid.nx + x;
+        for (let k = grid.start[c]; k < grid.start[c + 1]; k++) {
+          const i = grid.faces[k];
+          const px = centroids[i * 3] - a[0], py = centroids[i * 3 + 1] - a[1], pz = centroids[i * 3 + 2] - a[2];
+          // The nearest point of the segment to the centroid.
+          const t = len2 > 0 ? Math.max(0, Math.min(1, (px * dx + py * dy + pz * dz) / len2)) : 0;
+          const ex = px - t * dx, ey = py - t * dy, ez = pz - t * dz;
+          if (ex * ex + ey * ey + ez * ez > r2) continue;
+          if (viewDir) {
+            const dot = normals[i * 3] * viewDir[0] + normals[i * 3 + 1] * viewDir[1] + normals[i * 3 + 2] * viewDir[2];
+            if (dot > 0.25) continue;
+          }
+          out.push(i);
+        }
+      }
+  return Int32Array.from(out).sort();
+}
+
+/** Faces sorted into cubes by centroid, so a brush looks only near itself (a 4.6 M-face model was gone through whole for every dab). */
+interface FaceGrid {
+  min: [number, number, number];
+  cell: number;
+  nx: number;
+  ny: number;
+  nz: number;
+  /** CSR: faces of cube c are faces[start[c] .. start[c + 1]). */
+  start: Int32Array;
+  faces: Int32Array;
+}
+
+const faceGrids = new WeakMap<FaceGeometry, FaceGrid>();
+
+/** The geometry's grid, made on first use (about 16 faces a cube). */
+function gridOf(geometry: FaceGeometry): FaceGrid {
+  const known = faceGrids.get(geometry);
+  if (known) return known;
+  const { centroids } = geometry;
+  const n = centroids.length / 3;
+  const min: [number, number, number] = [Infinity, Infinity, Infinity];
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < n; i++)
+    for (let d = 0; d < 3; d++) {
+      const v = centroids[i * 3 + d];
+      if (v < min[d]) min[d] = v;
+      if (v > max[d]) max[d] = v;
     }
-    out.push(i);
+  if (n === 0) for (let d = 0; d < 3; d++) min[d] = max[d] = 0;
+  const extent = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2], 1e-9);
+  // A flat model's thin side counts as a thousandth of its size, so the cubes do not shrink to nothing.
+  const sides = [0, 1, 2].map((d) => Math.max(max[d] - min[d], extent / 1000));
+  const cell = Math.cbrt((sides[0] * sides[1] * sides[2]) / Math.max(1, Math.min(n / 16, 4_000_000)));
+  const nx = Math.max(1, Math.floor(sides[0] / cell) + 1);
+  const ny = Math.max(1, Math.floor(sides[1] / cell) + 1);
+  const nz = Math.max(1, Math.floor(sides[2] / cell) + 1);
+  const cellOf = new Int32Array(n);
+  const start = new Int32Array(nx * ny * nz + 1);
+  for (let i = 0; i < n; i++) {
+    const x = Math.min(nx - 1, Math.floor((centroids[i * 3] - min[0]) / cell));
+    const y = Math.min(ny - 1, Math.floor((centroids[i * 3 + 1] - min[1]) / cell));
+    const z = Math.min(nz - 1, Math.floor((centroids[i * 3 + 2] - min[2]) / cell));
+    const c = (z * ny + y) * nx + x;
+    cellOf[i] = c;
+    start[c + 1]++;
   }
-  return Int32Array.from(out);
+  for (let c = 0; c < nx * ny * nz; c++) start[c + 1] += start[c];
+  const fill = start.slice(0, nx * ny * nz);
+  const faces = new Int32Array(n);
+  for (let i = 0; i < n; i++) faces[fill[cellOf[i]]++] = i;
+  const grid = { min, cell, nx, ny, nz, start, faces };
+  faceGrids.set(geometry, grid);
+  return grid;
 }

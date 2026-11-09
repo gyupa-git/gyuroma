@@ -13,6 +13,7 @@ import {
   stripPalette,
 } from "../colourStrip";
 import { rgbToLab } from "../prusaFdmMixer";
+import { sharedRgbOf } from "../rgbPool";
 
 /** A figure: four greens from light to dark, two skin tones, a white, a black, a tiny magenta. */
 const FACES: RGB[] = [
@@ -111,5 +112,81 @@ describe("palette from the strip", () => {
     expect(palette.reduce((sum, entry) => sum + entry.count, 0)).toBe(FACES.length);
     // The representative of a group is a colour the model actually has.
     for (const entry of palette) expect(FACES.some((face) => face.join() === entry.rgb.join())).toBe(true);
+  });
+});
+
+describe("buildColourStrip — the last tuple's entry is reused (11-10)", () => {
+  /** The strip as built before 11-10: every face looked up by its key. */
+  function reference(colours: ArrayLike<RGB>, weights?: ArrayLike<number>, pins?: ReadonlyMap<number, number>) {
+    const byKey = new Map<number, { rgb: RGB; weight: number }>();
+    let total = 0;
+    for (let i = 0; i < colours.length; i++) {
+      const w = weights ? weights[i] : 1;
+      if (!(w > 0)) continue;
+      total += w;
+      const c = colours[i];
+      const key = (c[0] << 16) | (c[1] << 8) | c[2];
+      const entry = byKey.get(key);
+      if (entry) entry.weight += w;
+      else byKey.set(key, { rgb: c, weight: w });
+    }
+    const families = ["neutral", "red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink"].map((name, family) => ({ family, name, colours: [] as Array<Record<string, unknown>>, weight: 0 }));
+    for (const [key, entry] of byKey) {
+      const lab = rgbToLab(entry.rgb);
+      const family = familyOf(lab);
+      const colour: Record<string, unknown> = { key, rgb: entry.rgb, lab, weight: total > 0 ? entry.weight / total : 0, family };
+      const pin = pins?.get(key);
+      if (pin !== undefined) colour.pin = pin;
+      families[family].colours.push(colour);
+      families[family].weight += colour.weight as number;
+    }
+    for (const f of families) f.colours.sort((a, b) => ((a.pin as number) ?? -1) - ((b.pin as number) ?? -1) || (b.lab as { L: number }).L - (a.lab as { L: number }).L);
+    return { families: families.filter((f) => f.colours.length > 0), colourCount: byKey.size };
+  }
+
+  it("gives the same strip to the last bit — shared and unshared tuples, runs, odd weights, pins", () => {
+    let s = 7;
+    const rand = () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    const pool: RGB[] = Array.from({ length: 40 }, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256)] as RGB);
+    for (let round = 0; round < 6; round++) {
+      const n = 5000 + round * 3000;
+      const colours: RGB[] = [];
+      let current = pool[0];
+      for (let i = 0; i < n; i++) {
+        if (rand() < 0.15) current = pool[Math.floor(rand() * pool.length)];
+        // Some faces carry an equal colour in a tuple of their own (not pooled), some the pooled one.
+        colours.push(rand() < 0.2 ? ([...current] as RGB) : current);
+      }
+      const weights = new Float64Array(n);
+      for (let i = 0; i < n; i++) weights[i] = rand() < 0.03 ? (rand() < 0.5 ? 0 : Number.NaN) : rand() * 3e-4;
+      const pins = new Map<number, number>([[(pool[3][0] << 16) | (pool[3][1] << 8) | pool[3][2], 0]]);
+      expect(buildColourStrip(colours, weights, pins)).toEqual(reference(colours, weights, pins));
+      expect(buildColourStrip(colours)).toEqual(reference(colours));
+      expect(buildColourStrip(colours, Float32Array.from(weights))).toEqual(reference(colours, Float32Array.from(weights)));
+    }
+  });
+
+  it("gives the same strip from the shared pool's arrays (added up by their number), and with one stray array among them", () => {
+    let s = 11;
+    const rand = () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    const values = Array.from({ length: 60 }, () => [Math.floor(rand() * 256), Math.floor(rand() * 256), Math.floor(rand() * 256)] as const);
+    for (let round = 0; round < 4; round++) {
+      const n = 8000 + round * 5000;
+      const colours: RGB[] = [];
+      let v = values[0];
+      for (let i = 0; i < n; i++) {
+        if (rand() < 0.2) v = values[Math.floor(rand() * values.length)];
+        colours.push(sharedRgbOf(v[0], v[1], v[2]));
+      }
+      const weights = new Float64Array(n);
+      for (let i = 0; i < n; i++) weights[i] = rand() < 0.02 ? 0 : rand() * 1e-3;
+      const pins = new Map<number, number>([[(values[5][0] << 16) | (values[5][1] << 8) | values[5][2], 1]]);
+      expect(buildColourStrip(colours, weights, pins)).toEqual(reference(colours, weights, pins));
+      expect(buildColourStrip(colours)).toEqual(reference(colours));
+      // One array not from the pool (the same value as a pooled one): the map does it all, the same strip.
+      const mixed = colours.slice();
+      mixed[Math.floor(n / 2)] = [...mixed[Math.floor(n / 2)]] as RGB;
+      expect(buildColourStrip(mixed, weights, pins)).toEqual(reference(mixed, weights, pins));
+    }
   });
 });

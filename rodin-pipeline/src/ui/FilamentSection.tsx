@@ -913,7 +913,14 @@ function FilamentCard({
         </span>
         <span className="slot-text">
           <span className="slot-name">
-            <span className="mono slot-no">E{index + 1}</span> <b>{name || t("fil.unnamed")}</b>
+            {/* "E1 E1": the name is the slot's number (the default) — said once. */}
+            {name && name !== `E${index + 1}` ? (
+              <>
+                <span className="mono slot-no">E{index + 1}</span> <b>{name}</b>
+              </>
+            ) : (
+              <b className="mono">E{index + 1}</b>
+            )}
           </span>
           <span className="slot-sub">
             <span className="mono">{hex.toUpperCase()}</span> · {fromList ? fromList.type || t("fil.fromShelf") : t("fil.typed")}

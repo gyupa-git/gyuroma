@@ -1,10 +1,15 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 import type { RGB } from "@core/types";
 import type { ViewName } from "../engine/types";
 import { pieceAt } from "../engine/cutPick";
-import { CORNER_BYTES, FACE_BYTES, linearToSrgbByte, SRGB_TO_LINEAR, type ColourBuffer } from "../engine/mesh";
+import { faceRuns } from "../engine/faceRuns";
+import { guideSegments, type GuideStroke } from "../engine/guides";
+import { CORNER_BYTES, FACE_BYTES, linearToSrgbByte, SRGB_TO_LINEAR, vertexCornersFor, type ColourBuffer, type VertexCorners } from "../engine/mesh";
 import { SRGB_LINEAR_GLSL, withSrgbColours } from "./colourShader";
 import { backgroundStyle, DEFAULT_BACKGROUND, type ViewBackground } from "./background";
 
@@ -99,6 +104,12 @@ export interface MeshViewerHandle {
   setBrushCursor(cursor: BrushCursor | null): void;
   /** Mark the spot under the colour map's pointer on the surface (a ring of constant screen size); null hides it. */
   setPointerMark(mark: PointerMark | null): void;
+  /**
+   * A stroke kept as painted (its colours are the ones shown — the App's buffer was patched in place, so no new
+   * colours come): the model's colour buffers send the painted span and the stroke preview goes; the cut pieces come
+   * back (11-09: the preview stayed, drawn every frame and growing stroke by stroke, and the cut waited on it).
+   */
+  settleStroke(): void;
   /** Unit vector the camera looks along. */
   viewDirection(): [number, number, number];
   /** Pan so that `point` sits at the screen centre (orientation and distance unchanged). */
@@ -138,6 +149,19 @@ export interface MeshViewerProps {
   flat?: boolean;
   /** Thin lines where the surface folds, turns away or passes in front (the shape over flat colours; the colours untouched). */
   formLines?: boolean;
+  /** ⚙ How many drawing pixels per screen pixel (unset: the screen's own, up to 2). Lower is lighter to draw. */
+  pixelRatio?: number;
+  /**
+   * ⚙ Saving memory: while its pane is hidden, the model's buffers leave the graphics card (277MB a view on 4.6M
+   * faces — 11-09); they go up again when it shows (the arrays stay here, so nothing is worked out again).
+   */
+  releaseWhenHidden?: boolean;
+  /**
+   * Bumped to show `colours` again as they are, when nothing new came: a preview (slider, colour picker, part
+   * view) closed without applying — the views drop what it painted (11-09: the App renewed the whole model for this,
+   * ~0.5–0.8 s on 4.6M faces).
+   */
+  colourEpoch?: number;
   /** Brush mode: left-drag paints (rotate with the right button, zoom with the wheel). */
   brush?: boolean;
   /** Next click samples a colour instead of picking/painting. */
@@ -190,6 +214,10 @@ export interface MeshViewerProps {
    * faces they come from (those are still what a click or the brush takes).
    */
   cut?: ViewerCut | null;
+  /** ✏️ Guide lines drawn on the surface (engine/guides.ts): shown, half see-through, over the model; null hides them. */
+  guides?: readonly GuideStroke[] | null;
+  /** With the brush on: a crosshair for the pointer instead of the brush circle (the guide line tool draws with it). */
+  crosshair?: boolean;
 }
 
 export interface ViewerCut {
@@ -552,27 +580,7 @@ function greyColours(faceCount: number): ColourBuffer {
 }
 
 /** Corners of every vertex (a vertex → corners table), shared by the viewers of one model. */
-interface VertexCorners {
-  cornerVertex: Int32Array;
-  offsets: Int32Array;
-  corners: Int32Array;
-}
-const vertexCornersCache = new WeakMap<Int32Array, VertexCorners>();
-function vertexCornersFor(cornerVertex: Int32Array): VertexCorners {
-  const known = vertexCornersCache.get(cornerVertex);
-  if (known) return known;
-  let vertexCount = 0;
-  for (let c = 0; c < cornerVertex.length; c++) if (cornerVertex[c] >= vertexCount) vertexCount = cornerVertex[c] + 1;
-  const offsets = new Int32Array(vertexCount + 1);
-  for (let c = 0; c < cornerVertex.length; c++) offsets[cornerVertex[c] + 1]++;
-  for (let v = 0; v < vertexCount; v++) offsets[v + 1] += offsets[v];
-  const next = offsets.slice(0, vertexCount);
-  const corners = new Int32Array(cornerVertex.length);
-  for (let c = 0; c < cornerVertex.length; c++) corners[next[cornerVertex[c]]++] = c;
-  const table = { cornerVertex, offsets, corners };
-  vertexCornersCache.set(cornerVertex, table);
-  return table;
-}
+// The vertex → corners table (soft borders) is engine/mesh.ts vertexCornersFor: the highlight outlines share it.
 
 /**
  * Soft colours: RGBA bytes a corner, sRGB like the colour buffer (alpha unused) — the mean is taken in linear
@@ -874,6 +882,8 @@ function seamMaterial(colour: THREE.Color, opacity: number, viewport: { value: n
     depthTest: true,
     depthWrite: false,
     side: THREE.DoubleSide,
+    // One pass: see-through and double-sided, three.js would draw it twice (back faces, then front) — 11-09.
+    forceSinglePass: true,
   });
 }
 
@@ -938,6 +948,10 @@ interface ViewerState {
   focusMask: Uint8Array | null;
   /** Faces painted since the colours last arrived, drawn over the model. */
   stroke: StrokePreview | null;
+  /** The faces the current stroke touched (painted, or softened round them), each once: what settleStroke sends. */
+  strokeFaces: { list: Int32Array; count: number } | null;
+  /** One byte per face, set for the faces in `strokeFaces` (cleared when the stroke goes; kept for the next). */
+  strokeMark: Uint8Array | null;
   /** The pieces of the faces cut along the border lines, drawn in their place. */
   cut: CutPieces | null;
   /** The colours the mesh was built with (the colour effect has nothing to do for these). */
@@ -950,6 +964,9 @@ interface ViewerState {
   cursorInner: THREE.LineLoop;
   /** The spot under the colour map's pointer, marked on the surface (see setPointerMark). */
   pointerMark: THREE.Group;
+  /** ✏️ The guide lines, when there are any (a line a few pixels wide whatever the zoom). */
+  guideLines: LineSegments2 | null;
+  guideMaterial: LineMaterial;
   pickMaterial: THREE.ShaderMaterial;
   pickTarget: THREE.WebGLRenderTarget | null;
   /** Viewport height in CSS pixels, shared by every outline material. */
@@ -957,6 +974,8 @@ interface ViewerState {
   /** Width / height of the view, shared by the seam materials. */
   outlineAspect: { value: number };
   needsRender: boolean;
+  /** Its pane is hidden (display:none): not drawn until shown again (11-09: it drew the whole model for nothing). */
+  hidden: boolean;
   raf: number | null;
   pulseRaf: number | null;
   bounds: { center: THREE.Vector3; radius: number } | null;
@@ -1001,6 +1020,33 @@ function strokePreviewGeometry(source: THREE.BufferGeometry, capacity: number, o
   }
   geometry.setDrawRange(0, count * 3);
   return geometry;
+}
+
+/** Notes faces whose colours changed in the model's arrays during the stroke, each once (settleStroke sends them). */
+function noteStrokeFaces(state: ViewerState, faces: ArrayLike<number>): void {
+  const count = state.faceCount;
+  if (!state.strokeMark || state.strokeMark.length !== count) state.strokeMark = new Uint8Array(count);
+  const mark = state.strokeMark;
+  const touched = (state.strokeFaces ??= { list: new Int32Array(1024), count: 0 });
+  for (let i = 0; i < faces.length; i++) {
+    const f = faces[i];
+    if (!(f >= 0 && f < count) || mark[f]) continue;
+    mark[f] = 1;
+    if (touched.count === touched.list.length) {
+      const grown = new Int32Array(touched.list.length * 2);
+      grown.set(touched.list);
+      touched.list = grown;
+    }
+    touched.list[touched.count++] = f;
+  }
+}
+
+/** Lets go of the stroke's faces: their marks are cleared for the next stroke (the list itself stays readable). */
+function forgetStrokeFaces(state: ViewerState): void {
+  const touched = state.strokeFaces;
+  const mark = state.strokeMark;
+  if (touched && mark) for (let i = 0; i < touched.count; i++) mark[touched.list[i]] = 0;
+  state.strokeFaces = null;
 }
 
 /** Copies faces (their new colours already in the model's arrays) into the stroke preview. */
@@ -1070,6 +1116,7 @@ function dropStrokePreview(state: ViewerState, flush: boolean): void {
   state.scene.remove(preview.mesh);
   preview.mesh.geometry.dispose();
   state.stroke = null;
+  forgetStrokeFaces(state);
   delete state.renderer.domElement.dataset.painted;
   if (!flush || !state.geometry) return;
   for (const name of ["color", "softColor"]) {
@@ -1421,6 +1468,8 @@ function requestRender(state: ViewerState): void {
   if (state.raf !== null) return;
   state.raf = window.requestAnimationFrame(() => {
     state.raf = null;
+    // Hidden: the frame waits (needsRender stays) — showing the pane resizes it, and that asks for the frame.
+    if (state.hidden) return;
     if (!state.needsRender) return;
     state.needsRender = false;
     // The paint is drawn with whatever material shows those faces now.
@@ -1531,6 +1580,8 @@ function overlayMaterialsFor(state: ViewerState, id: string): OverlayMaterials {
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
       side: THREE.DoubleSide,
+      // One colour: one pass does (see-through double-sided materials are drawn twice otherwise).
+      forceSinglePass: true,
     });
     fill.toneMapped = false;
     const white = new THREE.Color(0xffffff);
@@ -1669,6 +1720,42 @@ function startPulse(state: ViewerState): void {
 }
 
 /** Face under a client-space point via an id render pass, plus the exact surface point. */
+/** Screen pixels between the dabs laid along a stroke's way, and the most dabs laid in one frame. */
+const DAB_SPACING_PX = 6;
+const MOST_DABS_A_FRAME = 12;
+
+/**
+ * Where to dab along a stroke's way, between the last dab and the pointer now (not counting either): every
+ * DAB_SPACING_PX along the path the pointer took — spaced wider when the way is long, so a frame never lays more
+ * than MOST_DABS_A_FRAME (each is a pick on the GPU).
+ */
+function dabsAlong(from: [number, number] | null, way: Array<[number, number]>, toX: number, toY: number): Array<[number, number]> {
+  if (!from) return [];
+  const points: Array<[number, number]> = [from, ...way];
+  const last = points[points.length - 1];
+  if (last[0] !== toX || last[1] !== toY) points.push([toX, toY]);
+  let length = 0;
+  for (let i = 1; i < points.length; i++) length += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+  const count = Math.min(MOST_DABS_A_FRAME, Math.floor(length / DAB_SPACING_PX));
+  if (count < 1) return [];
+  const step = length / (count + 1);
+  const out: Array<[number, number]> = [];
+  let walked = 0;
+  let next = step;
+  for (let i = 1; i < points.length && out.length < count; i++) {
+    const [ax, ay] = points[i - 1];
+    const [bx, by] = points[i];
+    const piece = Math.hypot(bx - ax, by - ay);
+    while (piece > 0 && next <= walked + piece && out.length < count) {
+      const t = (next - walked) / piece;
+      out.push([ax + (bx - ax) * t, ay + (by - ay) * t]);
+      next += step;
+    }
+    walked += piece;
+  }
+  return out;
+}
+
 function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHit | null {
   const { renderer, mesh, geometry, camera } = state;
   if (!mesh || !geometry) return null;
@@ -1704,6 +1791,8 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   }
   state.overlayGroup.visible = false;
   state.cursorGroup.visible = false;
+  const guidesShown = state.guideLines?.visible ?? false;
+  if (state.guideLines) state.guideLines.visible = false;
   if (state.stroke) state.stroke.mesh.visible = false;
   const cutShown = state.cut?.mesh.visible ?? false;
   if (state.cut) state.cut.mesh.visible = false;
@@ -1722,6 +1811,7 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   }
   state.overlayGroup.visible = true;
   state.cursorGroup.visible = true;
+  if (state.guideLines) state.guideLines.visible = guidesShown;
   if (state.stroke) state.stroke.mesh.visible = true;
   if (state.cut) state.cut.mesh.visible = cutShown;
   const id = pixel[0] + pixel[1] * 256 + pixel[2] * 65536;
@@ -1743,6 +1833,12 @@ function gpuPick(state: ViewerState, clientX: number, clientY: number): ViewerHi
   const piece = run && state.cut && pieceColours && pieceColours[run[0] * FACE_BYTES + 3] > 0 ? pieceAt(state.cut.positions, run[0], run[1], [point.x, point.y, point.z]) : undefined;
   return { faceIndex: id, point: [point.x, point.y, point.z], normal: [normal.x, normal.y, normal.z], piece, bary: barycentric(point, a, b, c) };
 }
+
+/** ✏️ Guide lines: colour, width on screen, see-through-ness, and how much nearer the eye than the surface (0.997 = 0.3 % of the distance). */
+const GUIDE_COLOUR = 0x3de0ff;
+const GUIDE_WIDTH_PX = 2.5;
+const GUIDE_OPACITY = 0.78;
+const GUIDE_NEARER = 0.997;
 
 function makeCursorLine(): THREE.LineLoop {
   const segments = 64;
@@ -1767,7 +1863,7 @@ function makeCursorLine(): THREE.LineLoop {
 function makePointerMark(): THREE.Group {
   const group = new THREE.Group();
   const piece = (geometry: THREE.BufferGeometry, color: number, opacity: number, order: number) => {
-    const material = new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
+    const material = new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthTest: false, depthWrite: false, side: THREE.DoubleSide, forceSinglePass: true });
     material.toneMapped = false;
     const mesh = new THREE.Mesh(geometry, material);
     mesh.renderOrder = order;
@@ -1790,12 +1886,16 @@ function fitPointerMark(state: ViewerState): void {
 }
 
 export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function MeshViewer(
-  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, formLines = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null },
+  { positions, colours, view, fitNonce, overlays, onPick, label, labelTools, emptyLabel, className, flat = false, formLines = false, brush = false, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd, focus, callouts, layers, softEdges = true, cornerVertex = null, cut = null, guides = null, crosshair = false, pixelRatio, releaseWhenHidden = false, colourEpoch = 0 },
   ref,
 ) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const calloutLayerRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<ViewerState | null>(null);
+  /** Bumped when a stroke settles without new colours: the cut pieces are put back. */
+  const [settled, setSettled] = useState(0);
+  const releaseWhenHiddenRef = useRef(releaseWhenHidden);
+  releaseWhenHiddenRef.current = releaseWhenHidden;
   const callbacksRef = useRef({ onPick, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd });
   callbacksRef.current = { onPick, onHoverFace, onHoverHit, onBrushHover, onBrushStart, onBrushDrag, onBrushEnd };
   const flatRef = useRef(flat);
@@ -1812,6 +1912,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
   eyedropperRef.current = eyedropper;
   const handRef = useRef(hand);
   handRef.current = hand;
+  const crosshairRef = useRef(crosshair);
+  crosshairRef.current = crosshair;
 
   /**
    * Recolour faces in place, `colourOf(i)` giving face `faces[i]` its linear
@@ -1860,6 +1962,9 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       }
       shown = Int32Array.from(around);
     }
+    // The faces whose colours changed in the arrays (all of them — solo / x-ray leave some out of the preview).
+    noteStrokeFaces(state, faces);
+    if (shown !== faces) noteStrokeFaces(state, shown);
     hideCutPieces(state, faces);
     addToStrokePreview(state, shown);
     // Test hook: how many faces the stroke preview holds.
@@ -1914,6 +2019,30 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         } else {
           inner.visible = false;
         }
+        requestRender(state);
+      },
+      settleStroke() {
+        const state = stateRef.current;
+        if (!state?.stroke) return;
+        const touched = state.strokeFaces;
+        dropStrokePreview(state, false);
+        if (state.geometry && touched && touched.count > 0) {
+          // Only the faces the stroke touched go up again (the arrays hold their painted colours already), as runs —
+          // its lowest-to-highest span could be most of the model (11-10). A stroke over an eighth of it sends all.
+          const runs = touched.count > state.faceCount / 8 ? null : faceRuns(touched.list.subarray(0, touched.count));
+          for (const name of ["color", "softColor"]) {
+            const attribute = state.geometry.getAttribute(name) as THREE.BufferAttribute | undefined;
+            if (!attribute) continue;
+            const perFace = 3 * attribute.itemSize;
+            attribute.clearUpdateRanges();
+            if (runs) for (const [lo, hi] of runs) attribute.addUpdateRange(lo * perFace, (hi - lo + 1) * perFace);
+            attribute.needsUpdate = true;
+          }
+          // Test hook: how many runs and faces went up.
+          state.renderer.domElement.dataset.settled = runs ? `${runs.length}:${runs.reduce((sum, [lo, hi]) => sum + hi - lo + 1, 0)}` : "all";
+        }
+        // The cut pieces waited for the stroke to end (their effect skips while a preview stands).
+        setSettled((n) => n + 1);
         requestRender(state);
       },
       setPointerMark(mark) {
@@ -1978,7 +2107,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const host = hostRef.current;
     if (!host) return;
     // Transparent canvas: the host element behind it carries the (checkerboard) background.
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    // Nothing reads this canvas back (the AI pictures have their own renderer), so its buffer need not be kept.
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: false });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.NoToneMapping;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -2004,6 +2134,19 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const pointerMark = makePointerMark();
     cursorGroup.add(pointerMark);
     scene.add(cursorGroup);
+    // ✏️ Guide lines: cyan, half see-through, hidden where the surface is in front of them.
+    const guideMaterial = new LineMaterial({ color: GUIDE_COLOUR, linewidth: GUIDE_WIDTH_PX, transparent: true, opacity: GUIDE_OPACITY, depthWrite: false, worldUnits: false });
+    guideMaterial.toneMapped = false;
+    // Drawn a hair nearer the eye than the surface it lies on, along the line of sight (the same pixels, only nearer):
+    // a lift along the face normals hid it under models whose faces are wound inward.
+    guideMaterial.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader.replace(
+        "vec4 end = modelViewMatrix * vec4( instanceEnd, 1.0 );",
+        `vec4 end = modelViewMatrix * vec4( instanceEnd, 1.0 );\n\t\t\tstart.xyz *= ${GUIDE_NEARER.toFixed(4)};\n\t\t\tend.xyz *= ${GUIDE_NEARER.toFixed(4)};`,
+      );
+    };
+    guideMaterial.customProgramCacheKey = () => "guide-nearer";
+    guideMaterial.resolution.set(Math.max(1, host.clientWidth), Math.max(1, host.clientHeight));
 
     const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 1000);
     camera.up.set(0, 0, 1);
@@ -2027,6 +2170,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       focusMesh: null,
       focusMask: null,
       stroke: null,
+      strokeFaces: null,
+      strokeMark: null,
       cut: null,
       coloursBuilt: null,
       callouts: [],
@@ -2034,11 +2179,14 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       cursorLine,
       cursorInner,
       pointerMark,
+      guideLines: null,
+      guideMaterial,
       pickMaterial: makePickMaterial(),
       pickTarget: null,
       outlineViewport: { value: 1 },
       outlineAspect: { value: 1 },
       needsRender: false,
+      hidden: false,
       raf: null,
       pulseRaf: null,
       bounds: null,
@@ -2058,6 +2206,12 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     let brushDown = false;
     let pendingMove: { x: number; y: number; drag: boolean } | null = null;
     let moveRaf: number | null = null;
+    // A brush stroke's way across the screen since the last frame, and where its last dab went: a quick stroke
+    // left dabs far apart, a dotted line (11-05, the owner: "조금만 선을 빨리 그으면 스페이싱이 생기는 건 개선 못 함?").
+    // The way is dabbed every few pixels, each dab on the surface under it (the 3D stretch between two dabs
+    // alone cut under a round body and missed it with a small brush).
+    let strokeWay: Array<[number, number]> = [];
+    let lastDab: [number, number] | null = null;
     // Outside the brush the pointer reports the face under it, at most once a
     // frame and only when it changes; a drag (rotating) reports null once.
     let hoverFace: number | null = null;
@@ -2087,11 +2241,17 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         return;
       }
       hoverFace = null;
+      if (move.drag) {
+        const way = strokeWay;
+        strokeWay = [];
+        for (const [x, y] of dabsAlong(lastDab, way, move.x, move.y)) callbacksRef.current.onBrushDrag?.(gpuPick(state, x, y));
+        lastDab = [move.x, move.y];
+      }
       // Labels the brush comes to thin out, so the paint under them shows.
       const bounds = renderer.domElement.getBoundingClientRect();
       fadeCalloutsNear(state, move.x - bounds.left, move.y - bounds.top);
       // Only the brush circle is shown while the pointer is on the surface.
-      if (!eyedropperRef.current) renderer.domElement.style.cursor = hit ? "none" : "crosshair";
+      if (!eyedropperRef.current) renderer.domElement.style.cursor = hit && !crosshairRef.current ? "none" : "crosshair";
       if (move.drag) callbacksRef.current.onBrushDrag?.(hit);
       else callbacksRef.current.onBrushHover?.(hit);
     };
@@ -2103,6 +2263,8 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       }
       if (brushRef.current && event.button === 0 && !event.altKey && !eyedropperRef.current) {
         brushDown = true;
+        strokeWay = [];
+        lastDab = [event.clientX, event.clientY];
         renderer.domElement.setPointerCapture(event.pointerId);
         callbacksRef.current.onBrushStart?.(gpuPick(state, event.clientX, event.clientY));
         return;
@@ -2120,12 +2282,21 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         }
       }
       pendingMove = { x: event.clientX, y: event.clientY, drag: brushDown };
+      if (brushDown) {
+        // Every place the pointer went, not only the last of the frame (the browser keeps the ones between too).
+        const between = event.getCoalescedEvents?.() ?? [];
+        for (const e of between.length > 0 ? between : [event]) strokeWay.push([e.clientX, e.clientY]);
+      }
       if (moveRaf === null) moveRaf = window.requestAnimationFrame(flushMove);
     };
     const onPointerUp = (event: PointerEvent) => {
       if (brushDown && event.button === 0) {
         brushDown = false;
+        // The last bit of the way, up to where the button came up.
+        if (pendingMove?.drag) flushMove();
         pendingMove = null;
+        strokeWay = [];
+        lastDab = null;
         callbacksRef.current.onBrushEnd?.();
         return;
       }
@@ -2167,10 +2338,19 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     const resize = () => {
       const width = host.clientWidth;
       const height = host.clientHeight;
+      const wasHidden = state.hidden;
+      state.hidden = width === 0 || height === 0;
+      // Just hidden, saving memory: the graphics card lets go of the model (three.js sends it again at the next draw).
+      if (state.hidden && !wasHidden && releaseWhenHiddenRef.current) {
+        state.geometry?.dispose();
+        state.focusMesh?.geometry.dispose();
+        state.pickTarget?.dispose();
+        state.pickTarget = null;
+      }
       // A hidden viewer (another step's) keeps its size, and an unchanged size
       // is left alone: each setSize makes a new drawing buffer, a sixth of a
       // second on a big canvas, and step changes used to do it twice per viewer.
-      if (width === 0 || height === 0) return;
+      if (state.hidden) return;
       const current = renderer.getSize(new THREE.Vector2());
       if (current.x !== width || current.y !== height) {
         renderer.setSize(width, height, false);
@@ -2178,6 +2358,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
         camera.updateProjectionMatrix();
         state.outlineViewport.value = height;
         state.outlineAspect.value = width / height;
+        state.guideMaterial.resolution.set(width, height);
       }
       requestRender(state);
     };
@@ -2219,6 +2400,17 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     };
   }, []);
 
+  // ⚙ Sharpness: fewer drawing pixels per screen pixel draw faster (setPixelRatio sizes the buffer again; the pick
+  // and form-line targets follow it at their next use).
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    const want = pixelRatio ?? Math.min(window.devicePixelRatio || 1, 2);
+    if (state.renderer.getPixelRatio() === want) return;
+    state.renderer.setPixelRatio(want);
+    requestRender(state);
+  }, [pixelRatio]);
+
   // Brush mode: the left button paints, so rotate with the right button instead.
   // The hand (space held): the left button pans, whatever tool is on.
   useEffect(() => {
@@ -2237,6 +2429,33 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     }
     if (hand && brush) callbacksRef.current.onBrushHover?.(null);
   }, [brush, eyedropper, hand]);
+
+  // ✏️ The guide lines, laid on the surface shown (a hair off it, so it does not cover them).
+  useEffect(() => {
+    const state = stateRef.current;
+    if (!state) return;
+    if (state.guideLines) {
+      state.scene.remove(state.guideLines);
+      state.guideLines.geometry.dispose();
+      state.guideLines = null;
+    }
+    if (guides && guides.length > 0 && positions) {
+      // On the surface itself: the material draws it nearer the eye (a lift along the normals goes inward on a
+      // model whose faces are wound inward).
+      const segments = guideSegments(guides, positions, 0);
+      if (segments.length > 0) {
+        const geometry = new LineSegmentsGeometry();
+        geometry.setPositions(segments);
+        const lines = new LineSegments2(geometry, state.guideMaterial);
+        lines.renderOrder = 2;
+        // The segments change as a line is drawn: bounds worked out once would cull a new part.
+        lines.frustumCulled = false;
+        state.scene.add(lines);
+        state.guideLines = lines;
+      }
+    }
+    requestRender(state);
+  }, [guides, positions]);
 
   // Geometry from positions.
   useEffect(() => {
@@ -2495,7 +2714,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
       soft.needsUpdate = true;
     }
     requestRender(state);
-  }, [colours]);
+  }, [colours, colourEpoch]);
 
   // The faces cut along the border lines: their pieces in their place.  After
   // the colours above (which come without the marks), and again with them.
@@ -2508,7 +2727,7 @@ export const MeshViewer = forwardRef<MeshViewerHandle, MeshViewerProps>(function
     dropCut(state, colours);
     if (cut && cut.parentFace.length > 0 && !state.layerUniforms) showCut(state, cut);
     requestRender(state);
-  }, [cut, colours, positions, layers]);
+  }, [cut, colours, positions, layers, settled, colourEpoch]);
 
   // Highlight overlays.  A highlight passed again (the same object) stays as
   // it is: rebuilding all of them on every hover re-uploaded a selection of

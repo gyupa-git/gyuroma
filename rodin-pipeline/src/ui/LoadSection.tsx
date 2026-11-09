@@ -181,7 +181,7 @@ export function LoadSection({
             <div className="swatch-row" style={{ marginTop: 6 }}>
               {rodin.paletteHex.map((hex, i) => {
                 const used = rodin.usedPaletteNumbers.includes(i + 1);
-                return <Swatch key={`${hex}-${i}`} hex={hex} title={`E${i + 1} ${hex}${used ? "" : ` ${t("load.unused")}`}`} size={20} />;
+                return <Swatch key={`${hex}-${i}`} hex={hex} title={`E${i + 1} ${hex}${used ? "" : ` ${t("load.unused")}`}`} size={18} />;
               })}
             </div>
           )}
@@ -205,7 +205,7 @@ export function LoadSection({
           </div>
         </div>
       )}
-      <label className="inline remember-work" style={{ gap: 8 }}>
+      <label className="check-line remember-work">
         <input type="checkbox" checked={rememberWork} onChange={(e) => onRememberWork(e.target.checked)} />
         <span className="muted">{t("load.rememberWork")}</span>
       </label>
@@ -267,7 +267,7 @@ export function LoadSection({
             disabled={busy}
             onFile={onTemplateFile}
           />
-          <label className="inline" style={{ gap: 8 }}>
+          <label className="check-line">
             <input type="checkbox" checked={rememberTemplate} onChange={(e) => onRememberTemplate(e.target.checked)} />
             <span className="muted">{t("load.rememberTemplate")}</span>
           </label>

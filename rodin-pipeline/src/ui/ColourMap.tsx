@@ -1,6 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, type ReactNode } from "react";
 import type { RGB } from "@core/types";
-import { faceAtAtlasPixel, paintAtlasImage, paintAtlasOutline, paintAtlasOverlay, type AtlasMasks, type FaceAtlas } from "../engine/atlas";
+import { faceAtAtlasPixel, paintAtlasImage, paintAtlasOutline, repaintAtlasMasks, type AtlasMaskPaint, type AtlasMasks, type FaceAtlas } from "../engine/atlas";
 import type { PickInfo } from "./MeshViewer";
 import { DEFAULT_BACKGROUND, fillBackground, type ViewBackground } from "./background";
 import { GyupaSpin } from "./GyupaLoader";
@@ -48,8 +48,12 @@ export interface ColourMapProps {
   buildingLabel: string;
   /** Work going on over the map (a patch being unfolded): the working face and this line. */
   busyLabel?: string;
+  /** A word over the map with no work behind it (why the pick is not unfolded): no working face. */
+  note?: string;
   /** Small controls beside the label (they take clicks; the label does not). */
   tools?: ReactNode;
+  /** ✏️ Guide lines drawn on the model, where they lie on this map: x, y pairs in atlas pixels, one array a piece (engine/guides.ts). */
+  guides?: readonly Float32Array[] | null;
 }
 
 interface ViewTransform {
@@ -78,7 +82,7 @@ function outlineWidthFor(scale: number): number {
 }
 
 export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function ColourMap(
-  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, label, hint, emptyLabel, buildingLabel, busyLabel, tools },
+  { atlas, building, colourOf, coloursVersion, masks, brush, eyedropper = false, hand = false, background = DEFAULT_BACKGROUND, onPick, onHover, onBrushStart, onBrushPaintAt, onBrushEnd, label, hint, emptyLabel, buildingLabel, busyLabel, note, tools, guides = null },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -86,6 +90,8 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
   const baseRef = useRef<{ canvas: HTMLCanvasElement; image: ImageData } | null>(null);
   const overlayRef = useRef<{ canvas: HTMLCanvasElement; image: ImageData; any: boolean } | null>(null);
   const outlineRef = useRef<{ canvas: HTMLCanvasElement; image: ImageData; any: boolean; width: number } | null>(null);
+  /** What the highlight was last painted for (repaintAtlasMasks): reset whenever the images are new. */
+  const maskPaintRef = useRef<AtlasMaskPaint | null>(null);
   const masksRef = useRef(masks);
   masksRef.current = masks;
   /** When the current highlight appeared, for the opening flash. */
@@ -112,6 +118,8 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
   backgroundRef.current = background;
   const atlasRef = useRef(atlas);
   atlasRef.current = atlas;
+  const guidesRef = useRef(guides);
+  guidesRef.current = guides;
 
   const draw = useCallback(() => {
     rafRef.current = null;
@@ -160,6 +168,33 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         }
       }
       ctx.restore();
+      // ✏️ Guide lines: the same cyan as on the model, half see-through over a faint dark edge so they read on any
+      // colour and the paint under them still shows.  Their width stays the same on screen as the map zooms.
+      const guideLines = guidesRef.current;
+      if (guideLines && guideLines.length > 0) {
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        for (const [width, colour] of [
+          [4.5, "rgba(0, 0, 0, 0.32)"],
+          [2.2, "rgba(61, 224, 255, 0.78)"],
+        ] as const) {
+          ctx.lineWidth = width;
+          ctx.strokeStyle = colour;
+          ctx.beginPath();
+          for (const line of guideLines) {
+            for (let i = 0; i + 1 < line.length; i += 2) {
+              const x = line[i] * view.scale + view.tx;
+              const y = line[i + 1] * view.scale + view.ty;
+              if (i === 0) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+            }
+          }
+          ctx.stroke();
+        }
+        ctx.lineCap = "butt";
+        ctx.lineJoin = "miter";
+      }
+      canvas.dataset.guides = guideLines ? String(guideLines.length) : "0";
       const drawCursor = (position: [number, number], dashed: boolean) => {
         const cx = position[0] * view.scale + view.tx;
         const cy = position[1] * view.scale + view.ty;
@@ -222,6 +257,10 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     if (rafRef.current !== null) return;
     rafRef.current = window.requestAnimationFrame(draw);
   }, [draw]);
+
+  useEffect(() => {
+    requestDraw();
+  }, [guides, requestDraw]);
 
   // The hand's cursor stands over the tool's own (brush, eyedropper, fill); the brush circle goes while it is held.
   useEffect(() => {
@@ -332,6 +371,7 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
       baseRef.current = null;
       overlayRef.current = null;
       outlineRef.current = null;
+      maskPaintRef.current = null;
       requestDraw();
       return;
     }
@@ -348,6 +388,8 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
       outlineCanvas.width = atlas.size;
       outlineCanvas.height = atlas.size;
       outlineRef.current = { canvas: outlineCanvas, image: new ImageData(atlas.size, atlas.size), any: false, width: 0 };
+      // New, empty images: the next highlight is painted in full.
+      maskPaintRef.current = null;
     }
     const base = baseRef.current;
     paintAtlasImage(atlas, callbacksRef.current.colourOf, base.image.data);
@@ -361,20 +403,56 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
   }, [atlas, coloursVersion, fitView, requestDraw]);
 
   // Selection overlay: the flash fill, and the outline at the width this zoom needs.
+  // Once a frame at most, with the masks as they stand then: a stroke in a pick changes them several times over
+  // (the pick taken again, the hover cleared …) and each was painted (11-09).
+  const masksFrameRef = useRef<number | null>(null);
   useEffect(() => {
-    const overlay = overlayRef.current;
-    const outline = outlineRef.current;
-    if (!atlas || !overlay || !outline) return;
-    overlay.any = paintAtlasOverlay(atlas, masks, overlay.image.data);
-    overlay.canvas.getContext("2d")?.putImageData(overlay.image, 0, 0);
-    outline.width = outlineWidthFor(viewRef.current.scale);
-    outline.any = paintAtlasOutline(atlas, masks, outline.image.data, outline.width);
-    outline.canvas.getContext("2d")?.putImageData(outline.image, 0, 0);
-    startedAtRef.current = performance.now();
-    requestDraw();
-    if (pulseTimerRef.current !== null) window.clearTimeout(pulseTimerRef.current);
-    pulseTimerRef.current = overlay.any ? window.setTimeout(pulse, PULSE_INTERVAL_MS) : null;
+    if (masksFrameRef.current !== null) return;
+    masksFrameRef.current = window.requestAnimationFrame(() => {
+      masksFrameRef.current = null;
+      const overlay = overlayRef.current;
+      const outline = outlineRef.current;
+      const current = atlasRef.current;
+      if (!current || !overlay || !outline) return;
+      // Only around the faces whose highlight changed, when it can (a stroke in a pick: ~150 ms for the whole 3072
+      // map and two 37.7MB images sent on 4.6M faces — 11-09); byte for byte the same as painting it all.
+      outline.width = outlineWidthFor(viewRef.current.scale);
+      const t0 = performance.now();
+      const result = repaintAtlasMasks(maskPaintRef.current, current, masksRef.current, overlay.image.data, outline.image.data, outline.width);
+      // Test hook (tools/headless): the last highlight paints — ms and how much was painted.
+      const canvas = canvasRef.current;
+      if (canvas) {
+        const boxes = result.rect === null || result.rect === "full" ? [] : Array.isArray(result.rect) ? result.rect : [result.rect];
+        const done = `${Math.round(performance.now() - t0)}ms:${result.rect === null ? "none" : result.rect === "full" ? "full" : `${boxes.length}x${Math.round(boxes.reduce((a, b) => a + b.w * b.h, 0) / 1000)}k`}`;
+        canvas.dataset.maskPaints = `${canvas.dataset.maskPaints ? `${canvas.dataset.maskPaints.split(" ").slice(-7).join(" ")} ` : ""}${done}`;
+      }
+      maskPaintRef.current = result.paint;
+      overlay.any = result.any;
+      outline.any = result.any;
+      if (result.rect === null) return;
+      if (result.rect === "full") {
+        overlay.canvas.getContext("2d")?.putImageData(overlay.image, 0, 0);
+        outline.canvas.getContext("2d")?.putImageData(outline.image, 0, 0);
+      } else {
+        const overlayContext = overlay.canvas.getContext("2d");
+        const outlineContext = outline.canvas.getContext("2d");
+        for (const { x, y, w, h } of Array.isArray(result.rect) ? result.rect : [result.rect]) {
+          overlayContext?.putImageData(overlay.image, 0, 0, x, y, w, h);
+          outlineContext?.putImageData(outline.image, 0, 0, x, y, w, h);
+        }
+      }
+      startedAtRef.current = performance.now();
+      requestDraw();
+      if (pulseTimerRef.current !== null) window.clearTimeout(pulseTimerRef.current);
+      pulseTimerRef.current = overlay.any ? window.setTimeout(pulse, PULSE_INTERVAL_MS) : null;
+    });
   }, [atlas, masks, requestDraw, pulse]);
+  useEffect(
+    () => () => {
+      if (masksFrameRef.current !== null) window.cancelAnimationFrame(masksFrameRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     requestDraw();
@@ -417,8 +495,21 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
     };
     let down: { x: number; y: number; button: number; moved: boolean; painting: boolean; hand: boolean } | null = null;
     let lastClick: { face: number; time: number } | null = null;
+    // The last dab of the stroke: a quick drag went further between two pointer moves than the brush is wide and
+    // came out a dotted line (11-05) — the stretch between is dabbed too, half a brush apart.
+    let lastDab: [number, number] | null = null;
     const paintAt = (position: [number, number]) => {
       if (!atlasRef.current) return;
+      const from = lastDab;
+      lastDab = position;
+      if (from) {
+        const spacing = Math.max(1, brushRef.current.radiusPx * 0.5);
+        const steps = Math.min(64, Math.floor(Math.hypot(position[0] - from[0], position[1] - from[1]) / spacing));
+        for (let k = 1; k <= steps; k++) {
+          const t = k / (steps + 1);
+          callbacksRef.current.onBrushPaintAt?.(from[0] + (position[0] - from[0]) * t, from[1] + (position[1] - from[1]) * t);
+        }
+      }
       callbacksRef.current.onBrushPaintAt?.(position[0], position[1]);
     };
     const onPointerDown = (event: PointerEvent) => {
@@ -429,6 +520,7 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
       if (hand) canvas.style.cursor = "grabbing";
       if (painting) {
         callbacksRef.current.onBrushStart?.();
+        lastDab = null;
         paintAt(toAtlas(event));
       }
     };
@@ -525,11 +617,17 @@ export const ColourMap = forwardRef<ColourMapHandle, ColourMapProps>(function Co
         {atlas && <span className="muted"> · {hint}</span>}
         {tools && <span className="pane-tools">{tools}</span>}
       </div>
-      {busyLabel && (
+      {busyLabel ? (
         <div className="colour-map-busy" role="status">
           <GyupaSpin size={14} />
           {busyLabel}
         </div>
+      ) : (
+        note && (
+          <div className="colour-map-busy note" role="status">
+            {note}
+          </div>
+        )
       )}
       <div className="colour-map-host" ref={containerRef}>
         <canvas ref={canvasRef} />

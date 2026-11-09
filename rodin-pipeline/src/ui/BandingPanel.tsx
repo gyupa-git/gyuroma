@@ -131,7 +131,7 @@ export function BandingPanel({
               </span>
               <span role="cell" className="band-lines">
                 <span>{stripeText(output)}</span>
-                {output.kind === "virtual" && <SequenceBar sequence={output.sequence} slotRgb={slotRgb} layerPx={3} height={5} />}
+                {output.kind === "virtual" && <SequenceBar sequence={output.sequence} slotRgb={slotRgb} layerPx={4} height={9} />}
               </span>
               <span role="cell" className="num mono">
                 {output.cycle > 1 ? `${(output.cycle * layerHeight).toFixed(1)}mm` : "—"}

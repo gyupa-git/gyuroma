@@ -42,8 +42,9 @@ function fmt(value: number): string {
   return Number(value.toFixed(6)).toString();
 }
 
+/** Composed (NFC) first, as in export3mf.ts: decomposed Korean shows as "????" in some programs. */
 function xmlEscape(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  return value.normalize("NFC").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
 /**

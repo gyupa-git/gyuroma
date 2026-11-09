@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { AttachedImage } from "./attachImage";
 import { ConsultBox } from "./ConsultBox";
 import { TIDY_CONSULT_PRESETS, TIDY_PRESETS, type ChangeLine, type TidyConsultPreset, type TidyLogEntry, type TidyPreset, type TidyScope } from "../engine/tidy";
@@ -73,7 +73,10 @@ export function TidyPanel({
   focusBusy = null,
   connection,
   disabled,
+  place = 2,
 }: {
+  /** The step it is shown in (02 or 03): each keeps its own folding (11-09: folding it in 03 folded 02's too). */
+  place?: 2 | 3;
   scope: TidyScope;
   onScope: (scope: TidyScope) => void;
   area: TidyArea;
@@ -122,13 +125,18 @@ export function TidyPanel({
   disabled: boolean;
 }) {
   const t = useT();
-  const [open, setOpen] = useState(() => {
+  // 02 keeps the key it always had; 03 its own.
+  const openKey = place === 3 ? "rodin-pipeline-tidy-open-3" : "rodin-pipeline-tidy-open";
+  const readOpen = () => {
     try {
-      return window.localStorage.getItem("rodin-pipeline-tidy-open") !== "0";
+      return window.localStorage.getItem(openKey) !== "0";
     } catch {
       return true;
     }
-  });
+  };
+  const [open, setOpen] = useState(readOpen);
+  // The same panel goes on from 02 to 03.
+  useEffect(() => setOpen(readOpen()), [openKey]);
   // The preset under the pointer or focus, previewed before it is pressed.
   const [previewId, setPreviewId] = useState<TidyPreset["id"] | null>(null);
   const preview = previewId ? previewPreset(previewId) : null;
@@ -136,7 +144,7 @@ export function TidyPanel({
   const toggleOpen = () => {
     setOpen((v) => {
       try {
-        window.localStorage.setItem("rodin-pipeline-tidy-open", v ? "0" : "1");
+        window.localStorage.setItem(openKey, v ? "0" : "1");
       } catch {
         // ignore
       }
@@ -288,6 +296,7 @@ export function TidyPanel({
             <ConsultBox
               title={t("tidy.consult")}
               sub={t("tidy.consultSub")}
+              foldKey={String(place)}
               inputId="tidy-input"
               ai={ai}
               log={log}
